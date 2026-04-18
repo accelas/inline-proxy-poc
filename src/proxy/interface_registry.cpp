@@ -9,13 +9,10 @@ bool InterfaceRegistry::ConfigureIngressListener(int listener_fd) {
         return false;
     }
 
-    bool all_replayed = true;
     for (const auto& name : wan_interfaces_) {
-        if (!bpf_loader_.AttachIngress(name)) {
-            all_replayed = false;
-        }
+        (void)bpf_loader_.AttachIngress(name);
     }
-    return all_replayed;
+    return true;
 }
 
 bool InterfaceRegistry::HasPrefix(std::string_view name, std::string_view prefix) {
@@ -55,9 +52,9 @@ void InterfaceRegistry::AppendList(std::string& out,
 
 bool InterfaceRegistry::RecordInterface(std::string_view name) {
     if (HasPrefix(name, "wan_")) {
-        (void)bpf_loader_.AttachIngress(name);
+        const bool attached = bpf_loader_.AttachIngress(name);
         AppendUnique(wan_interfaces_, name);
-        return true;
+        return attached;
     }
     if (HasPrefix(name, "lan_")) {
         AppendUnique(lan_interfaces_, name);

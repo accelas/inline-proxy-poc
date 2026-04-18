@@ -47,7 +47,7 @@ TEST(InterfaceRegistryTest, ConfiguresIngressListenerOnLoader) {
 TEST(InterfaceRegistryTest, ReplaysRecordedWanInterfacesWhenListenerIsConfigured) {
     inline_proxy::InterfaceRegistry registry;
 
-    EXPECT_TRUE(registry.RecordInterface("wan_missing0"));
+    EXPECT_FALSE(registry.RecordInterface("wan_missing0"));
     EXPECT_NE(std::find(registry.wan_interfaces().begin(), registry.wan_interfaces().end(), "wan_missing0"),
               registry.wan_interfaces().end());
 
@@ -60,7 +60,7 @@ TEST(InterfaceRegistryTest, ReplaysRecordedWanInterfacesWhenListenerIsConfigured
     addr.sin_port = 0;
     ASSERT_EQ(::bind(listener_fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)), 0);
 
-    EXPECT_FALSE(registry.ConfigureIngressListener(listener_fd));
+    EXPECT_TRUE(registry.ConfigureIngressListener(listener_fd));
     EXPECT_EQ(registry.bpf_loader().listener_socket_fd(), listener_fd);
     EXPECT_NE(registry.bpf_loader().listener_port(), 0U);
     EXPECT_FALSE(registry.bpf_loader().IsIngressAttached("wan_missing0"));
@@ -82,10 +82,10 @@ TEST(InterfaceRegistryTest, RejectsInvalidIngressListenerConfiguration) {
     ::close(pipe_fds[1]);
 }
 
-TEST(InterfaceRegistryTest, RecordsWanInterfaceEvenWhenIngressAttachFailsAndStillRemovesIt) {
+TEST(InterfaceRegistryTest, ReturnsFailureWhenWanIngressAttachFailsButRetainsInterfaceForRetry) {
     inline_proxy::InterfaceRegistry registry;
 
-    EXPECT_TRUE(registry.RecordInterface("wan_eth0"));
+    EXPECT_FALSE(registry.RecordInterface("wan_eth0"));
     EXPECT_NE(std::find(registry.wan_interfaces().begin(), registry.wan_interfaces().end(), "wan_eth0"),
               registry.wan_interfaces().end());
     EXPECT_NE(registry.SummaryText().find("wan_eth0"), std::string::npos);
@@ -98,7 +98,7 @@ TEST(InterfaceRegistryTest, RecordsWanInterfaceEvenWhenIngressAttachFailsAndStil
 TEST(InterfaceRegistryTest, KeepsWanInterfaceWhenDetachFailsAfterLoaderHadBeenAttached) {
     inline_proxy::InterfaceRegistry registry;
 
-    EXPECT_TRUE(registry.RecordInterface("wan_eth1"));
+    EXPECT_FALSE(registry.RecordInterface("wan_eth1"));
     auto& loader = const_cast<inline_proxy::BpfLoader&>(registry.bpf_loader());
     loader.MarkIngressAttachedForTesting("wan_eth1");
 
