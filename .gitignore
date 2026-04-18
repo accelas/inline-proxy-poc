@@ -31,3 +31,4 @@
 
 # Git worktrees
 .worktrees/
+.worktree/
