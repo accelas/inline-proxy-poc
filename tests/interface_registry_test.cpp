@@ -3,6 +3,7 @@
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#include <algorithm>
 #include <string>
 
 #include "proxy/interface_registry.hpp"
@@ -57,11 +58,15 @@ TEST(InterfaceRegistryTest, RejectsInvalidIngressListenerConfiguration) {
     ::close(pipe_fds[1]);
 }
 
-TEST(InterfaceRegistryTest, DoesNotRecordWanInterfaceWhenIngressAttachFails) {
+TEST(InterfaceRegistryTest, RecordsWanInterfaceEvenWhenIngressAttachFailsAndStillRemovesIt) {
     inline_proxy::InterfaceRegistry registry;
 
-    EXPECT_FALSE(registry.RecordInterface("wan_eth0"));
+    EXPECT_TRUE(registry.RecordInterface("wan_eth0"));
+    EXPECT_NE(std::find(registry.wan_interfaces().begin(), registry.wan_interfaces().end(), "wan_eth0"),
+              registry.wan_interfaces().end());
+    EXPECT_NE(registry.SummaryText().find("wan_eth0"), std::string::npos);
 
+    EXPECT_TRUE(registry.RemoveInterface("wan_eth0"));
     EXPECT_TRUE(registry.wan_interfaces().empty());
     EXPECT_EQ(registry.SummaryText(), "wan_interfaces=none\nlan_interfaces=none\nactive_sessions=0\n");
 }

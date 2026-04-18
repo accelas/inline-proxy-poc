@@ -45,9 +45,7 @@ void InterfaceRegistry::AppendList(std::string& out,
 
 bool InterfaceRegistry::RecordInterface(std::string_view name) {
     if (HasPrefix(name, "wan_")) {
-        if (!bpf_loader_.AttachIngress(name)) {
-            return false;
-        }
+        (void)bpf_loader_.AttachIngress(name);
         AppendUnique(wan_interfaces_, name);
         return true;
     }
@@ -70,10 +68,9 @@ bool InterfaceRegistry::RemoveInterface(std::string_view name) {
     };
 
     if (HasPrefix(name, "wan_")) {
-        if (!bpf_loader_.DetachIngress(name)) {
-            return false;
-        }
-        return remove_from(wan_interfaces_);
+        const bool removed = remove_from(wan_interfaces_);
+        (void)bpf_loader_.DetachIngress(name);
+        return removed;
     }
     if (HasPrefix(name, "lan_")) {
         return remove_from(lan_interfaces_);

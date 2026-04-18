@@ -9,7 +9,7 @@ struct ingress_redirect_config {
     __u32 redirect_ifindex;
 };
 
-using IngressRedirectConfig = struct ingress_redirect_config;
+typedef struct ingress_redirect_config IngressRedirectConfig;
 
 enum {
     INGRESS_REDIRECT_MAP_KEY_ZERO = 0u,
