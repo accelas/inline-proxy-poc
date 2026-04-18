@@ -1,7 +1,42 @@
+package(default_visibility = ["//visibility:public"])
+
 exports_files(["BUILD.bazel"])
+
+cc_library(
+    name = "cni_types",
+    srcs = ["cni_types.cpp"],
+    hdrs = ["cni_types.hpp"],
+    include_prefix = "cni",
+)
+
+cc_library(
+    name = "cni_parser",
+    srcs = ["yajl_parser.cpp"],
+    hdrs = ["yajl_parser.hpp"],
+    deps = [
+        ":cni_types",
+        "@yajl//:yajl",
+    ],
+    include_prefix = "cni",
+)
+
+cc_library(
+    name = "k8s_client",
+    srcs = ["k8s_client.cpp"],
+    hdrs = ["k8s_client.hpp"],
+    deps = [
+        ":cni_types",
+    ],
+    linkopts = ["-lssl", "-lcrypto"],
+    include_prefix = "cni",
+)
 
 cc_binary(
     name = "inline_proxy_cni",
     srcs = ["main.cpp"],
-    deps = ["//src/shared:core"],
+    deps = [
+        "//src/shared:core",
+        ":cni_parser",
+        ":k8s_client",
+    ],
 )
