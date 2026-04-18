@@ -2,7 +2,7 @@ cc_test(
     name = "project_layout_test",
     srcs = ["project_layout_test.cpp"],
     deps = [
-        "//third_party/googletest:gtest_main",
+        "@googletest//:gtest_main",
     ],
     data = [
         "//src/shared:BUILD.bazel",

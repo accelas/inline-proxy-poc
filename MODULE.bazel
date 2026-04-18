@@ -21,14 +21,7 @@ local_path_override(module_name = "libbpf", path = "third_party/libbpf")
 # Testing
 # ============================================================================
 
-# The repo carries a tiny local gtest-compatible shim under third_party/ so the
-# layout regression test can run without pulling the full upstream dependency.
-
-# ============================================================================
-# C++ Toolchain
-# ============================================================================
-
-register_toolchains("//toolchain:cc_toolchain_for_k8")
+bazel_dep(name = "googletest", version = "1.15.2")
 
 # ============================================================================
 # Development Tools
