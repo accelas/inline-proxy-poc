@@ -4,8 +4,8 @@
 #include <string>
 
 namespace inline_proxy {
-void InterfaceRegistry::ConfigureIngressListener(int listener_fd) {
-    bpf_loader_.ConfigureListenerSocket(listener_fd);
+bool InterfaceRegistry::ConfigureIngressListener(int listener_fd) {
+    return bpf_loader_.ConfigureListenerSocket(listener_fd);
 }
 
 bool InterfaceRegistry::HasPrefix(std::string_view name, std::string_view prefix) {
@@ -43,35 +43,42 @@ void InterfaceRegistry::AppendList(std::string& out,
     out += '\n';
 }
 
-void InterfaceRegistry::RecordInterface(std::string_view name) {
+bool InterfaceRegistry::RecordInterface(std::string_view name) {
     if (HasPrefix(name, "wan_")) {
+        if (!bpf_loader_.AttachIngress(name)) {
+            return false;
+        }
         AppendUnique(wan_interfaces_, name);
-        bpf_loader_.AttachIngress(name);
-        return;
+        return true;
     }
     if (HasPrefix(name, "lan_")) {
         AppendUnique(lan_interfaces_, name);
+        return true;
     }
+    return false;
 }
 
-void InterfaceRegistry::RemoveInterface(std::string_view name) {
+bool InterfaceRegistry::RemoveInterface(std::string_view name) {
     auto remove_from = [name](std::vector<std::string>& values) {
         for (auto it = values.begin(); it != values.end(); ++it) {
             if (*it == name) {
                 values.erase(it);
-                return;
+                return true;
             }
         }
+        return false;
     };
 
     if (HasPrefix(name, "wan_")) {
-        remove_from(wan_interfaces_);
-        bpf_loader_.DetachIngress(name);
-        return;
+        if (!bpf_loader_.DetachIngress(name)) {
+            return false;
+        }
+        return remove_from(wan_interfaces_);
     }
     if (HasPrefix(name, "lan_")) {
-        remove_from(lan_interfaces_);
+        return remove_from(lan_interfaces_);
     }
+    return false;
 }
 
 void InterfaceRegistry::IncrementSessions() noexcept {

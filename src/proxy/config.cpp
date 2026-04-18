@@ -429,12 +429,16 @@ int RunProxyDaemon(const ProxyConfig& cfg) {
         return 1;
     }
 
-    registry.ConfigureIngressListener(transparent_listener.fd());
+    if (!registry.ConfigureIngressListener(transparent_listener.fd())) {
+        std::cerr << "failed to configure ingress listener for transparent port " << cfg.transparent_port << '\n';
+        return 1;
+    }
 
     const std::string admin_interface_name = "lan_listener_" + std::to_string(cfg.admin_port);
-    const std::string transparent_interface_name = "wan_listener_" + std::to_string(cfg.transparent_port);
-    registry.RecordInterface(admin_interface_name);
-    registry.RecordInterface(transparent_interface_name);
+    if (!registry.RecordInterface(admin_interface_name)) {
+        std::cerr << "failed to record admin interface " << admin_interface_name << '\n';
+        return 1;
+    }
 
     auto admin_http = BuildAdminHttp(state, registry);
 
@@ -535,9 +539,12 @@ int RunProxyDaemon(const ProxyConfig& cfg) {
 
     loop.Run();
     state.set_ready(false);
-    registry.RemoveInterface(admin_interface_name);
-    registry.RemoveInterface(transparent_interface_name);
-    return 0;
+    bool cleanup_ok = true;
+    if (!registry.RemoveInterface(admin_interface_name)) {
+        std::cerr << "failed to remove admin interface " << admin_interface_name << '\n';
+        cleanup_ok = false;
+    }
+    return cleanup_ok ? 0 : 1;
 }
 
 }  // namespace inline_proxy

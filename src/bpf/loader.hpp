@@ -9,15 +9,10 @@
 
 #include <linux/bpf.h>
 
+#include "bpf/ingress_redirect_common.h"
 #include "shared/scoped_fd.hpp"
 
 namespace inline_proxy {
-
-struct IngressRedirectConfig {
-    std::uint32_t enabled = 0;
-    std::uint32_t listener_port = 0;
-    std::uint32_t redirect_ifindex = 0;
-};
 
 class BpfLoader {
 public:

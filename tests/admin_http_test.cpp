@@ -49,15 +49,13 @@ TEST(AdminHttpTest, UnknownOrUnsupportedRequestsReturnExpectedStatus) {
 TEST(AdminHttpTest, InterfacesEndpointReturnsRegistryStateAndIsGetOnly) {
     inline_proxy::ProxyState state;
     inline_proxy::InterfaceRegistry registry;
-    registry.RecordInterface("wan_eth0");
-    registry.RecordInterface("lan_eth1");
+    EXPECT_TRUE(registry.RecordInterface("lan_eth1"));
 
     auto app = inline_proxy::BuildAdminHttp(state, registry);
     const auto interfaces = app.Handle("GET", "/interfaces");
 
     EXPECT_EQ(interfaces.status, 200);
     EXPECT_EQ(interfaces.content_type, "text/plain; charset=utf-8");
-    EXPECT_NE(interfaces.body.find("wan_eth0"), std::string::npos);
     EXPECT_NE(interfaces.body.find("lan_eth1"), std::string::npos);
 
     EXPECT_EQ(app.Handle("POST", "/interfaces").status, 405);

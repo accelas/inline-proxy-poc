@@ -40,15 +40,6 @@ constexpr __u8 kCodeJmpNe = BPF_JMP | BPF_JNE | BPF_K;
 constexpr __u8 kCodeCall = BPF_JMP | BPF_CALL;
 constexpr __u8 kCodeExit = BPF_JMP | BPF_EXIT;
 
-constexpr int kHelperMapLookupElem = 1;
-constexpr int kHelperRedirect = 23;
-constexpr int kHelperSkbLoadBytes = 26;
-
-constexpr std::uint32_t kMapKeyZero = 0;
-constexpr std::uint32_t kIpv4WireValue = 0x0008;
-constexpr std::uint32_t kTcpProtocol = IPPROTO_TCP;
-constexpr std::uint32_t kIngressFlag = static_cast<std::uint32_t>(BPF_F_INGRESS);
-
 static bpf_insn MakeInsn(__u8 code, __u8 dst, __u8 src, __s16 off, __s32 imm) {
     bpf_insn insn{};
     insn.code = code;
@@ -119,8 +110,8 @@ std::vector<bpf_insn> BuildIngressProgram(int map_fd) {
     builder.EmitLoadMapFd(BPF_REG_1, map_fd);
     builder.Emit(MakeInsn(kCodeMovReg, BPF_REG_2, BPF_REG_10, 0, 0));
     builder.Emit(MakeInsn(kCodeAddImm, BPF_REG_2, 0, 0, -4));
-    builder.Emit(MakeInsn(kCodeStMem, BPF_REG_2, 0, 0, static_cast<__s32>(kMapKeyZero)));
-    builder.EmitCall(kHelperMapLookupElem);
+    builder.Emit(MakeInsn(kCodeStMem, BPF_REG_2, 0, 0, static_cast<__s32>(INGRESS_REDIRECT_MAP_KEY_ZERO)));
+    builder.EmitCall(INGRESS_REDIRECT_HELPER_MAP_LOOKUP_ELEM);
     const std::size_t missing_config_jump = builder.EmitJump(kCodeJmpEq, BPF_REG_0, 0);
     builder.Emit(MakeInsn(kCodeMovReg, BPF_REG_6, BPF_REG_0, 0, 0));
 
@@ -129,7 +120,7 @@ std::vector<bpf_insn> BuildIngressProgram(int map_fd) {
     builder.Emit(MakeInsn(kCodeMovReg, BPF_REG_3, BPF_REG_10, 0, 0));
     builder.Emit(MakeInsn(kCodeAddImm, BPF_REG_3, 0, 0, -8));
     builder.Emit(MakeInsn(kCodeMovImm, BPF_REG_4, 0, 0, 2));
-    builder.EmitCall(kHelperSkbLoadBytes);
+    builder.EmitCall(INGRESS_REDIRECT_HELPER_SKB_LOAD_BYTES);
     const std::size_t ethertype_load_failed_jump = builder.EmitJump(kCodeJmpNe, BPF_REG_0, 0);
 
     builder.Emit(MakeInsn(kCodeMovReg, BPF_REG_1, BPF_REG_8, 0, 0));
@@ -137,21 +128,21 @@ std::vector<bpf_insn> BuildIngressProgram(int map_fd) {
     builder.Emit(MakeInsn(kCodeMovReg, BPF_REG_3, BPF_REG_10, 0, 0));
     builder.Emit(MakeInsn(kCodeAddImm, BPF_REG_3, 0, 0, -12));
     builder.Emit(MakeInsn(kCodeMovImm, BPF_REG_4, 0, 0, 1));
-    builder.EmitCall(kHelperSkbLoadBytes);
+    builder.EmitCall(INGRESS_REDIRECT_HELPER_SKB_LOAD_BYTES);
     const std::size_t ipproto_load_failed_jump = builder.EmitJump(kCodeJmpNe, BPF_REG_0, 0);
 
     builder.Emit(MakeInsn(kCodeLdxMem | BPF_H, BPF_REG_7, BPF_REG_10, -8, 0));
-    const std::size_t non_ipv4_jump = builder.EmitJump(kCodeJmpNe, BPF_REG_7, static_cast<__s32>(kIpv4WireValue));
+    const std::size_t non_ipv4_jump = builder.EmitJump(kCodeJmpNe, BPF_REG_7, static_cast<__s32>(INGRESS_REDIRECT_IPV4_WIRE_VALUE));
 
     builder.Emit(MakeInsn(kCodeLdxMem | BPF_B, BPF_REG_7, BPF_REG_10, -12, 0));
-    const std::size_t non_tcp_jump = builder.EmitJump(kCodeJmpNe, BPF_REG_7, static_cast<__s32>(kTcpProtocol));
+    const std::size_t non_tcp_jump = builder.EmitJump(kCodeJmpNe, BPF_REG_7, static_cast<__s32>(INGRESS_REDIRECT_TCP_PROTOCOL));
 
     builder.Emit(MakeInsn(kCodeMovReg, BPF_REG_1, BPF_REG_8, 0, 0));
     builder.Emit(MakeInsn(kCodeMovImm, BPF_REG_2, 0, 0, 36));
     builder.Emit(MakeInsn(kCodeMovReg, BPF_REG_3, BPF_REG_10, 0, 0));
     builder.Emit(MakeInsn(kCodeAddImm, BPF_REG_3, 0, 0, -16));
     builder.Emit(MakeInsn(kCodeMovImm, BPF_REG_4, 0, 0, 2));
-    builder.EmitCall(kHelperSkbLoadBytes);
+    builder.EmitCall(INGRESS_REDIRECT_HELPER_SKB_LOAD_BYTES);
     const std::size_t tcp_port_load_failed_jump = builder.EmitJump(kCodeJmpNe, BPF_REG_0, 0);
 
     builder.Emit(MakeInsn(kCodeLdxMem | BPF_H, BPF_REG_7, BPF_REG_10, -16, 0));
@@ -161,8 +152,8 @@ std::vector<bpf_insn> BuildIngressProgram(int map_fd) {
 
     builder.Emit(MakeInsn(kCodeMovReg, BPF_REG_1, BPF_REG_8, 0, 0));
     builder.Emit(MakeInsn(kCodeLdxMem | BPF_W, BPF_REG_1, BPF_REG_6, 8, 0));
-    builder.Emit(MakeInsn(kCodeMovImm, BPF_REG_2, 0, 0, static_cast<__s32>(kIngressFlag)));
-    builder.EmitCall(kHelperRedirect);
+    builder.Emit(MakeInsn(kCodeMovImm, BPF_REG_2, 0, 0, static_cast<__s32>(INGRESS_REDIRECT_INGRESS_FLAG)));
+    builder.EmitCall(INGRESS_REDIRECT_HELPER_REDIRECT);
     const std::size_t exit_index = builder.EmitExit();
 
     builder.PatchJump(missing_config_jump, exit_index);
@@ -296,11 +287,13 @@ bool EnsureClsactQdisc(unsigned int ifindex) {
     return SendNetlinkRequest(std::move(request));
 }
 
-bool RemoveClsactQdisc(unsigned int ifindex) {
-    auto request = MakeNetlinkMessage(RTM_DELQDISC, 0, ifindex);
+bool RemoveIngressFilter(unsigned int ifindex) {
+    auto request = MakeNetlinkMessage(RTM_DELTFILTER, 0, ifindex);
     auto* tc = reinterpret_cast<tcmsg*>(NLMSG_DATA(reinterpret_cast<nlmsghdr*>(request.data())));
-    tc->tcm_parent = TC_H_CLSACT;
+    tc->tcm_parent = TC_H_MAKE(TC_H_CLSACT, TC_H_MIN_INGRESS);
     tc->tcm_handle = 0;
+    tc->tcm_info = htons(ETH_P_ALL);
+    AppendStringAttr(request, TCA_KIND, "bpf");
     FinalizeNetlinkMessage(request);
     return SendNetlinkRequest(std::move(request));
 }
@@ -432,7 +425,7 @@ bool BpfLoader::DetachIngress(std::string_view interface_name) {
         return false;
     }
 
-    if (!RemoveClsactQdisc(*ifindex)) {
+    if (!RemoveIngressFilter(*ifindex)) {
         return false;
     }
 
@@ -447,26 +440,35 @@ bool BpfLoader::ConfigureListenerSocket(int listener_fd) {
 
     sockaddr_storage addr{};
     socklen_t addrlen = sizeof(addr);
+    if (::getsockname(listener_fd, reinterpret_cast<sockaddr*>(&addr), &addrlen) != 0) {
+        return false;
+    }
+
     std::uint32_t listener_port = 0;
-    if (::getsockname(listener_fd, reinterpret_cast<sockaddr*>(&addr), &addrlen) == 0) {
-        if (addr.ss_family == AF_INET) {
-            const auto* v4 = reinterpret_cast<const sockaddr_in*>(&addr);
-            listener_port = ntohs(v4->sin_port);
-        } else if (addr.ss_family == AF_INET6) {
-            const auto* v6 = reinterpret_cast<const sockaddr_in6*>(&addr);
-            listener_port = ntohs(v6->sin6_port);
-        }
+    if (addr.ss_family == AF_INET) {
+        const auto* v4 = reinterpret_cast<const sockaddr_in*>(&addr);
+        listener_port = ntohs(v4->sin_port);
+    } else if (addr.ss_family == AF_INET6) {
+        const auto* v6 = reinterpret_cast<const sockaddr_in6*>(&addr);
+        listener_port = ntohs(v6->sin6_port);
+    }
+    if (listener_port == 0) {
+        return false;
+    }
+
+    const std::uint32_t redirect_ifindex = LinkIndex("lo").value_or(0);
+    IngressRedirectConfig new_runtime_config{};
+    new_runtime_config.enabled = 1;
+    new_runtime_config.listener_port = listener_port;
+    new_runtime_config.redirect_ifindex = redirect_ifindex;
+
+    if (config_map_.valid() && !UpdateConfigMap(config_map_, new_runtime_config)) {
+        return false;
     }
 
     listener_socket_fd_ = listener_fd;
     listener_port_ = listener_port;
-    runtime_config_.enabled = 1;
-    runtime_config_.listener_port = listener_port;
-    runtime_config_.redirect_ifindex = LinkIndex("lo").value_or(0);
-
-    if (config_map_.valid() && !UpdateConfigMap(config_map_, runtime_config_)) {
-        return false;
-    }
+    runtime_config_ = new_runtime_config;
 
     return true;
 }

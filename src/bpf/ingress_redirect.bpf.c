@@ -18,13 +18,9 @@
 #include <linux/tcp.h>
 #include <stddef.h>
 
-#define SEC(NAME) __attribute__((section(NAME), used))
+#include "ingress_redirect_common.h"
 
-struct ingress_redirect_config {
-    __u32 enabled;
-    __u32 listener_port;
-    __u32 redirect_ifindex;
-};
+#define SEC(NAME) __attribute__((section(NAME), used))
 
 struct bpf_map_def {
     __u32 type;
@@ -36,10 +32,6 @@ struct bpf_map_def {
 static void* (*bpf_map_lookup_elem)(void* map, const void* key) = (void*)1;
 static int (*bpf_redirect)(int ifindex, __u64 flags) = (void*)23;
 
-enum {
-    BPF_MAP_TYPE_ARRAY = 2,
-};
-
 SEC("maps")
 struct bpf_map_def redirect_config_map = {
     .type = BPF_MAP_TYPE_ARRAY,
@@ -49,7 +41,7 @@ struct bpf_map_def redirect_config_map = {
 };
 
 static inline struct ingress_redirect_config* lookup_runtime_config(void) {
-    __u32 key = 0;
+    __u32 key = INGRESS_REDIRECT_MAP_KEY_ZERO;
     return bpf_map_lookup_elem(&redirect_config_map, &key);
 }
 
@@ -79,7 +71,7 @@ int redirect_ingress(struct __sk_buff* skb) {
     if ((void*)(iph + 1) > data_end) {
         return TC_ACT_OK;
     }
-    if (iph->protocol != IPPROTO_TCP) {
+    if (iph->protocol != INGRESS_REDIRECT_TCP_PROTOCOL) {
         return TC_ACT_OK;
     }
 
@@ -96,7 +88,7 @@ int redirect_ingress(struct __sk_buff* skb) {
         return TC_ACT_OK;
     }
 
-    return bpf_redirect((int)config->redirect_ifindex, BPF_F_INGRESS);
+    return bpf_redirect((int)config->redirect_ifindex, INGRESS_REDIRECT_INGRESS_FLAG);
 }
 
 char _license[] SEC("license") = "GPL";

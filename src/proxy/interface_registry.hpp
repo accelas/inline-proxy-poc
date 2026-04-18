@@ -11,10 +11,10 @@ namespace inline_proxy {
 
 class InterfaceRegistry {
 public:
-    void ConfigureIngressListener(int listener_fd);
+    bool ConfigureIngressListener(int listener_fd);
 
-    void RecordInterface(std::string_view name);
-    void RemoveInterface(std::string_view name);
+    bool RecordInterface(std::string_view name);
+    bool RemoveInterface(std::string_view name);
 
     void IncrementSessions() noexcept;
     void DecrementSessions();

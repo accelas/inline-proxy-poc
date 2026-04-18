@@ -13,11 +13,16 @@ TEST(BpfLoaderTest, RejectsMissingInterfaceName) {
     EXPECT_FALSE(loader.AttachIngress(""));
 }
 
-TEST(BpfLoaderTest, RejectsNonWanInterfaceNames) {
+TEST(BpfLoaderTest, RejectsNonWanInterfaceNamesAfterListenerConfiguration) {
     inline_proxy::BpfLoader loader;
 
     const int listener_fd = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
     ASSERT_GE(listener_fd, 0);
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = 0;
+    ASSERT_EQ(::bind(listener_fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)), 0);
     EXPECT_TRUE(loader.ConfigureListenerSocket(listener_fd));
 
     EXPECT_FALSE(loader.AttachIngress("lan_eth1"));
@@ -46,6 +51,20 @@ TEST(BpfLoaderTest, CapturesListenerPortFromConfiguredSocket) {
     EXPECT_EQ(loader.listener_port(), expected_port);
 
     ::close(listener_fd);
+}
+
+TEST(BpfLoaderTest, RejectsConfigureListenerSocketWhenGetsocknameFails) {
+    inline_proxy::BpfLoader loader;
+
+    int pipe_fds[2];
+    ASSERT_EQ(::pipe(pipe_fds), 0);
+
+    EXPECT_FALSE(loader.ConfigureListenerSocket(pipe_fds[0]));
+    EXPECT_FALSE(loader.listener_socket_fd().has_value());
+    EXPECT_EQ(loader.listener_port(), 0U);
+
+    ::close(pipe_fds[0]);
+    ::close(pipe_fds[1]);
 }
 
 TEST(BpfLoaderTest, GeneratedProgramUsesConfiguredListenerPort) {
