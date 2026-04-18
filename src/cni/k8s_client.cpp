@@ -1,12 +1,15 @@
 #include "cni/k8s_client.hpp"
 
 #include <arpa/inet.h>
+#include <fcntl.h>
 #include <netdb.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
 #include <cstdio>
 #include <cstdlib>
+#include <cerrno>
 #include <fstream>
 #include <mutex>
 #include <sstream>
@@ -90,7 +93,123 @@ std::string BuildHttpRequest(const K8sClientOptions& options, const K8sQuery& qu
     return request.str();
 }
 
-int ConnectTcp(const std::string& host, const std::string& port) {
+bool IsTimeoutErrno(int error) {
+    return error == EAGAIN || error == EWOULDBLOCK || error == ETIMEDOUT;
+}
+
+bool WaitForFd(int fd, short events, std::chrono::steady_clock::time_point deadline) {
+    while (true) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= deadline) {
+            return false;
+        }
+        const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now);
+        pollfd pfd{};
+        pfd.fd = fd;
+        pfd.events = events;
+        const int rc = ::poll(&pfd, 1, static_cast<int>(remaining.count()));
+        if (rc > 0) {
+            return true;
+        }
+        if (rc == 0) {
+            return false;
+        }
+        if (errno != EINTR) {
+            throw std::runtime_error("poll failed while waiting for Kubernetes API I/O");
+        }
+    }
+}
+
+int SslConnectWithTimeout(SSL* ssl, int fd, std::chrono::steady_clock::time_point deadline) {
+    while (true) {
+        const int rc = SSL_connect(ssl);
+        if (rc == 1) {
+            return rc;
+        }
+        const int error = SSL_get_error(ssl, rc);
+        if (error == SSL_ERROR_WANT_READ) {
+            if (!WaitForFd(fd, POLLIN, deadline)) {
+                throw std::runtime_error("timed out negotiating TLS with Kubernetes API server");
+            }
+            continue;
+        }
+        if (error == SSL_ERROR_WANT_WRITE) {
+            if (!WaitForFd(fd, POLLOUT, deadline)) {
+                throw std::runtime_error("timed out negotiating TLS with Kubernetes API server");
+            }
+            continue;
+        }
+        if (error == SSL_ERROR_SYSCALL && IsTimeoutErrno(errno)) {
+            throw std::runtime_error("timed out negotiating TLS with Kubernetes API server");
+        }
+        throw std::runtime_error("failed to negotiate TLS with Kubernetes API server");
+    }
+}
+
+void SslWriteAllWithTimeout(SSL* ssl, int fd, std::chrono::steady_clock::time_point deadline, std::string_view data) {
+    const char* cursor = data.data();
+    std::size_t remaining = data.size();
+    while (remaining > 0) {
+        const int rc = SSL_write(ssl, cursor, static_cast<int>(remaining));
+        if (rc > 0) {
+            cursor += rc;
+            remaining -= static_cast<std::size_t>(rc);
+            continue;
+        }
+        const int error = SSL_get_error(ssl, rc);
+        if (error == SSL_ERROR_WANT_READ) {
+            if (!WaitForFd(fd, POLLIN, deadline)) {
+                throw std::runtime_error("timed out sending Kubernetes API request");
+            }
+            continue;
+        }
+        if (error == SSL_ERROR_WANT_WRITE) {
+            if (!WaitForFd(fd, POLLOUT, deadline)) {
+                throw std::runtime_error("timed out sending Kubernetes API request");
+            }
+            continue;
+        }
+        if (error == SSL_ERROR_SYSCALL && IsTimeoutErrno(errno)) {
+            throw std::runtime_error("timed out sending Kubernetes API request");
+        }
+        throw std::runtime_error("failed to send Kubernetes API request");
+    }
+}
+
+std::string SslReadAllWithTimeout(SSL* ssl, int fd, std::chrono::steady_clock::time_point deadline) {
+    std::string response;
+    char buffer[4096];
+    while (true) {
+        const int rc = SSL_read(ssl, buffer, sizeof(buffer));
+        if (rc > 0) {
+            response.append(buffer, buffer + rc);
+            continue;
+        }
+        const int error = SSL_get_error(ssl, rc);
+        if (error == SSL_ERROR_ZERO_RETURN) {
+            break;
+        }
+        if (error == SSL_ERROR_WANT_READ) {
+            if (!WaitForFd(fd, POLLIN, deadline)) {
+                throw std::runtime_error("timed out waiting for Kubernetes API response");
+            }
+            continue;
+        }
+        if (error == SSL_ERROR_WANT_WRITE) {
+            if (!WaitForFd(fd, POLLOUT, deadline)) {
+                throw std::runtime_error("timed out waiting for Kubernetes API response");
+            }
+            continue;
+        }
+        if (error == SSL_ERROR_SYSCALL && IsTimeoutErrno(errno)) {
+            throw std::runtime_error("timed out waiting for Kubernetes API response");
+        }
+        throw std::runtime_error("failed to read Kubernetes API response");
+    }
+    return response;
+}
+
+int ConnectTcp(const std::string& host, const std::string& port, std::chrono::milliseconds timeout) {
     addrinfo hints{};
     hints.ai_socktype = SOCK_STREAM;
     hints.ai_family = AF_UNSPEC;
@@ -103,25 +222,47 @@ int ConnectTcp(const std::string& host, const std::string& port) {
 
     int fd = -1;
     for (addrinfo* it = results; it != nullptr; it = it->ai_next) {
-        fd = ::socket(it->ai_family, it->ai_socktype, it->ai_protocol);
+        fd = ::socket(it->ai_family, it->ai_socktype | SOCK_NONBLOCK, it->ai_protocol);
         if (fd < 0) {
             continue;
         }
         if (::connect(fd, it->ai_addr, it->ai_addrlen) == 0) {
             break;
         }
-        ::close(fd);
-        fd = -1;
+        if (errno != EINPROGRESS) {
+            ::close(fd);
+            fd = -1;
+            continue;
+        }
+
+        pollfd pfd{};
+        pfd.fd = fd;
+        pfd.events = POLLOUT;
+        const int poll_rc = ::poll(&pfd, 1, static_cast<int>(timeout.count()));
+        if (poll_rc <= 0) {
+            ::close(fd);
+            fd = -1;
+            continue;
+        }
+        int socket_error = 0;
+        socklen_t len = sizeof(socket_error);
+        if (::getsockopt(fd, SOL_SOCKET, SO_ERROR, &socket_error, &len) != 0 || socket_error != 0) {
+            ::close(fd);
+            fd = -1;
+            continue;
+        }
+        break;
     }
     ::freeaddrinfo(results);
     if (fd < 0) {
-        throw std::runtime_error("failed to connect to Kubernetes API server");
+        throw std::runtime_error("failed to connect to Kubernetes API server within timeout");
     }
+
     return fd;
 }
 
 std::string PerformHttpsGet(const K8sClientOptions& options, const K8sQuery& query, const std::string& token) {
-    const int fd = ConnectTcp(options.api_server_host, options.api_server_port);
+    const int fd = ConnectTcp(options.api_server_host, options.api_server_port, options.timeout);
 
     SSL_CTX* ctx = SSL_CTX_new(TLS_client_method());
     if (!ctx) {
@@ -150,48 +291,12 @@ std::string PerformHttpsGet(const K8sClientOptions& options, const K8sQuery& que
         throw std::runtime_error("failed to configure TLS hostname verification");
     }
 
-    if (SSL_connect(ssl) != 1) {
-        SSL_free(ssl);
-        SSL_CTX_free(ctx);
-        ::close(fd);
-        throw std::runtime_error("failed to negotiate TLS with Kubernetes API server");
-    }
+    const auto deadline = std::chrono::steady_clock::now() + options.timeout;
+    SslConnectWithTimeout(ssl, fd, deadline);
 
     const std::string request = BuildHttpRequest(options, query, token);
-    const char* data = request.data();
-    std::size_t remaining = request.size();
-    while (remaining > 0) {
-        const int written = SSL_write(ssl, data, static_cast<int>(remaining));
-        if (written <= 0) {
-            SSL_free(ssl);
-            SSL_CTX_free(ctx);
-            ::close(fd);
-            throw std::runtime_error("failed to send Kubernetes API request");
-        }
-        data += written;
-        remaining -= static_cast<std::size_t>(written);
-    }
-
-    std::string response;
-    char buffer[4096];
-    for (;;) {
-        const int bytes_read = SSL_read(ssl, buffer, sizeof(buffer));
-        if (bytes_read > 0) {
-            response.append(buffer, buffer + bytes_read);
-            continue;
-        }
-        const int error = SSL_get_error(ssl, bytes_read);
-        if (error == SSL_ERROR_ZERO_RETURN) {
-            break;
-        }
-        if (error == SSL_ERROR_WANT_READ || error == SSL_ERROR_WANT_WRITE) {
-            continue;
-        }
-        SSL_free(ssl);
-        SSL_CTX_free(ctx);
-        ::close(fd);
-        throw std::runtime_error("failed to read Kubernetes API response");
-    }
+    SslWriteAllWithTimeout(ssl, fd, deadline, request);
+    const std::string response = SslReadAllWithTimeout(ssl, fd, deadline);
 
     SSL_shutdown(ssl);
     SSL_free(ssl);
@@ -237,6 +342,9 @@ std::optional<std::string> FetchPodJson(const K8sClientOptions& options, const K
 
     if (options.api_server_host.empty()) {
         throw std::runtime_error("KUBERNETES_SERVICE_HOST is not set");
+    }
+    if (options.timeout.count() <= 0) {
+        throw std::runtime_error("Kubernetes client timeout must be positive");
     }
     const std::string token = Trim(ReadFile(options.token_path));
     const std::string response = PerformHttpsGet(options, query, token);

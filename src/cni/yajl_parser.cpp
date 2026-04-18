@@ -35,6 +35,15 @@ std::optional<std::string> ReadString(yajl_val node, const char* key) {
     return result;
 }
 
+
+std::optional<std::string> ReadRequiredString(yajl_val node, const char* key) {
+    const auto value = ReadString(node, key);
+    if (!value || value->empty()) {
+        return std::nullopt;
+    }
+    return value;
+}
+
 std::optional<CniInterface> ParseInterface(yajl_val node) {
     if (!node || yajl_typeof(node) != yajl_t_object) {
         return std::nullopt;
@@ -100,16 +109,19 @@ std::optional<CniRequest> ParseCniRequest(std::string_view json) {
         return std::nullopt;
     }
 
-    auto version = ReadString(root.get(), "cniVersion");
+    auto version = ReadRequiredString(root.get(), "cniVersion");
     if (!version) {
+        return std::nullopt;
+    }
+
+    auto name = ReadRequiredString(root.get(), "name");
+    if (!name) {
         return std::nullopt;
     }
 
     CniRequest request;
     request.cni_version = std::move(*version);
-    if (auto name = ReadString(root.get(), "name")) {
-        request.name = std::move(*name);
-    }
+    request.name = std::move(*name);
 
     const auto prev_result = yajl_object_get(root.get(), "prevResult");
     if (prev_result) {

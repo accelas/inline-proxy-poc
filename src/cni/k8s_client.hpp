@@ -1,5 +1,6 @@
 #pragma once
 
+#include <chrono>
 #include <cstdint>
 #include <filesystem>
 #include <functional>
@@ -20,6 +21,7 @@ struct K8sClientOptions {
     std::string api_server_port = "443";
     std::filesystem::path token_path = "/var/run/secrets/kubernetes.io/serviceaccount/token";
     std::filesystem::path ca_path = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt";
+    std::chrono::milliseconds timeout{5000};
 };
 
 struct PodInfo {
