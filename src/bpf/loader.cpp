@@ -4,6 +4,7 @@
 #include "shared/scoped_fd.hpp"
 
 #include <array>
+#include <cstdio>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -33,12 +34,22 @@ constexpr __u8 kCodeStMem = BPF_ST | BPF_MEM;
 constexpr __u8 kCodeMovImm = BPF_ALU64 | BPF_MOV | BPF_K;
 constexpr __u8 kCodeMovReg = BPF_ALU64 | BPF_MOV | BPF_X;
 constexpr __u8 kCodeAddImm = BPF_ALU64 | BPF_ADD | BPF_K;
+constexpr __u8 kCodeAndImm = BPF_ALU64 | BPF_AND | BPF_K;
+constexpr __u8 kCodeLshImm = BPF_ALU64 | BPF_LSH | BPF_K;
 constexpr __u8 kCodeEndianFromBe = BPF_ALU | BPF_END | BPF_FROM_BE;
 constexpr __u8 kCodeJmpEq = BPF_JMP | BPF_JEQ | BPF_K;
 constexpr __u8 kCodeJmpNeReg = BPF_JMP | BPF_JNE | BPF_X;
 constexpr __u8 kCodeJmpNe = BPF_JMP | BPF_JNE | BPF_K;
+constexpr __u8 kCodeJmpLt = BPF_JMP | BPF_JLT | BPF_K;
 constexpr __u8 kCodeCall = BPF_JMP | BPF_CALL;
 constexpr __u8 kCodeExit = BPF_JMP | BPF_EXIT;
+
+constexpr __s32 kIpv4HeaderOffset = 14;
+constexpr __s32 kIpv4IhlStackOffset = -20;
+constexpr __s32 kTcpPortStackOffset = -16;
+constexpr __s32 kTcpPortPacketOffsetBase = 16;
+constexpr __s32 kIpv4MinimumHeaderBytes = 20;
+constexpr __s32 kIpv4IhlMask = 0x0f;
 
 static bpf_insn MakeInsn(__u8 code, __u8 dst, __u8 src, __s16 off, __s32 imm) {
     bpf_insn insn{};
@@ -138,9 +149,24 @@ std::vector<bpf_insn> BuildIngressProgram(int map_fd) {
     const std::size_t non_tcp_jump = builder.EmitJump(kCodeJmpNe, BPF_REG_7, static_cast<__s32>(INGRESS_REDIRECT_TCP_PROTOCOL));
 
     builder.Emit(MakeInsn(kCodeMovReg, BPF_REG_1, BPF_REG_8, 0, 0));
-    builder.Emit(MakeInsn(kCodeMovImm, BPF_REG_2, 0, 0, 36));
+    builder.Emit(MakeInsn(kCodeMovImm, BPF_REG_2, 0, 0, kIpv4HeaderOffset));
     builder.Emit(MakeInsn(kCodeMovReg, BPF_REG_3, BPF_REG_10, 0, 0));
-    builder.Emit(MakeInsn(kCodeAddImm, BPF_REG_3, 0, 0, -16));
+    builder.Emit(MakeInsn(kCodeAddImm, BPF_REG_3, 0, 0, kIpv4IhlStackOffset));
+    builder.Emit(MakeInsn(kCodeMovImm, BPF_REG_4, 0, 0, 1));
+    builder.EmitCall(INGRESS_REDIRECT_HELPER_SKB_LOAD_BYTES);
+    const std::size_t ihl_load_failed_jump = builder.EmitJump(kCodeJmpNe, BPF_REG_0, 0);
+
+    builder.Emit(MakeInsn(kCodeLdxMem | BPF_B, BPF_REG_7, BPF_REG_10, kIpv4IhlStackOffset, 0));
+    builder.Emit(MakeInsn(kCodeAndImm, BPF_REG_7, 0, 0, kIpv4IhlMask));
+    builder.Emit(MakeInsn(kCodeLshImm, BPF_REG_7, 0, 0, 2));
+    const std::size_t short_ipv4_header_jump = builder.EmitJump(kCodeJmpLt, BPF_REG_7,
+                                                                static_cast<__s32>(kIpv4MinimumHeaderBytes));
+
+    builder.Emit(MakeInsn(kCodeMovReg, BPF_REG_2, BPF_REG_7, 0, 0));
+    builder.Emit(MakeInsn(kCodeAddImm, BPF_REG_2, 0, 0, kTcpPortPacketOffsetBase));
+    builder.Emit(MakeInsn(kCodeMovReg, BPF_REG_1, BPF_REG_8, 0, 0));
+    builder.Emit(MakeInsn(kCodeMovReg, BPF_REG_3, BPF_REG_10, 0, 0));
+    builder.Emit(MakeInsn(kCodeAddImm, BPF_REG_3, 0, 0, kTcpPortStackOffset));
     builder.Emit(MakeInsn(kCodeMovImm, BPF_REG_4, 0, 0, 2));
     builder.EmitCall(INGRESS_REDIRECT_HELPER_SKB_LOAD_BYTES);
     const std::size_t tcp_port_load_failed_jump = builder.EmitJump(kCodeJmpNe, BPF_REG_0, 0);
@@ -159,6 +185,8 @@ std::vector<bpf_insn> BuildIngressProgram(int map_fd) {
     builder.PatchJump(missing_config_jump, exit_index);
     builder.PatchJump(ethertype_load_failed_jump, exit_index);
     builder.PatchJump(ipproto_load_failed_jump, exit_index);
+    builder.PatchJump(ihl_load_failed_jump, exit_index);
+    builder.PatchJump(short_ipv4_header_jump, exit_index);
     builder.PatchJump(tcp_port_load_failed_jump, exit_index);
     builder.PatchJump(non_ipv4_jump, exit_index);
     builder.PatchJump(non_tcp_jump, exit_index);
@@ -350,6 +378,9 @@ bool LoadProgram(const ScopedFd& map_fd, ScopedFd& program_fd) {
 
     auto fd = SysBpf(BPF_PROG_LOAD, &attr);
     if (!fd) {
+        if (!log_buffer.empty() && log_buffer[0] != '\0') {
+            std::fprintf(stderr, "%s", log_buffer.data());
+        }
         return false;
     }
 
