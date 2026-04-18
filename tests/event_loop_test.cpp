@@ -1,4 +1,5 @@
 #include <chrono>
+#include <limits>
 #include <future>
 #include <thread>
 #include <string>
@@ -223,4 +224,62 @@ TEST(EventLoopTest, PollCallbacksStopPreventsLaterPollCallbacksInSameCycle) {
 
     EXPECT_EQ(order, std::vector<int>({1}));
     (void)handle;
+}
+
+
+TEST(EventLoopTest, PendingTimerIsNotDuplicatedByEarlyWakeups) {
+    inline_proxy::EventLoop loop;
+    std::vector<int> order;
+
+    loop.Schedule(std::chrono::milliseconds(100), [&] { order.push_back(1); });
+    loop.Schedule(std::chrono::milliseconds(250), [&] { loop.Stop(); });
+
+    std::thread waker([&] {
+        for (int i = 0; i < 10; ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            loop.Defer([] {});
+        }
+    });
+
+    loop.Run();
+    waker.join();
+
+    EXPECT_EQ(order, std::vector<int>({1}));
+}
+
+TEST(EventLoopTest, WriteCallbackIsSkippedAfterReadDisablesItInSameCycle) {
+    inline_proxy::EventLoop loop;
+
+    int fds[2];
+    ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM, 0, fds), 0);
+    inline_proxy::ScopedFd a(fds[0]);
+    inline_proxy::ScopedFd b(fds[1]);
+
+    int read_hits = 0;
+    int write_hits = 0;
+    std::unique_ptr<inline_proxy::EventLoop::Handle> handle;
+
+    handle = loop.Register(a.get(), true, true,
+                           [&] {
+                               ++read_hits;
+                               char buffer[1];
+                               (void)::read(a.get(), buffer, sizeof(buffer));
+                               handle->Update(true, false);
+                           },
+                           [&] { ++write_hits; },
+                           {});
+
+    const char byte = 'x';
+    ASSERT_EQ(::write(b.get(), &byte, 1), 1);
+
+    std::thread stopper([&] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        loop.Stop();
+    });
+
+    loop.Run();
+    stopper.join();
+
+    EXPECT_EQ(read_hits, 1);
+    EXPECT_EQ(write_hits, 0);
 }

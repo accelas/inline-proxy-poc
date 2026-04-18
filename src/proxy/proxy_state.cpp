@@ -1,5 +1,6 @@
 #include "proxy/proxy_state.hpp"
 
+#include <stdexcept>
 #include <string>
 
 namespace inline_proxy {
@@ -28,10 +29,11 @@ void ProxyState::increment_sessions() noexcept {
     ++active_sessions_;
 }
 
-void ProxyState::decrement_sessions() noexcept {
-    if (active_sessions_ > 0) {
-        --active_sessions_;
+void ProxyState::decrement_sessions() {
+    if (active_sessions_ == 0) {
+        throw std::logic_error("proxy session underflow");
     }
+    --active_sessions_;
 }
 
 std::string ProxyState::MetricsText() const {

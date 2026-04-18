@@ -157,6 +157,9 @@ std::vector<EventLoop::Callback> EventLoop::State::TakeDueTimers() {
 
     std::lock_guard lock(mutex);
     while (!timers.empty() && callbacks.size() < kMaxDrainCallbacks) {
+        if (timers.front().due > now) {
+            break;
+        }
         std::pop_heap(timers.begin(), timers.end(), [](const Timer& lhs, const Timer& rhs) {
             if (lhs.due != rhs.due) {
                 return lhs.due > rhs.due;
@@ -164,16 +167,6 @@ std::vector<EventLoop::Callback> EventLoop::State::TakeDueTimers() {
             return lhs.id > rhs.id;
         });
         auto timer = std::move(timers.back());
-        if (timer.due > now) {
-            timers.push_back(std::move(timer));
-            std::push_heap(timers.begin(), timers.end(), [](const Timer& lhs, const Timer& rhs) {
-                if (lhs.due != rhs.due) {
-                    return lhs.due > rhs.due;
-                }
-                return lhs.id > rhs.id;
-            });
-            break;
-        }
         timers.pop_back();
         if (timer.callback) {
             callbacks.push_back(std::move(timer.callback));
@@ -387,11 +380,11 @@ void EventLoop::Run() {
                 continue;
             }
 
-            const bool want_read = registration->want_read && (revents & POLLIN);
-            const bool want_write = registration->want_write && (revents & POLLOUT);
+            const bool saw_read = revents & POLLIN;
+            const bool saw_write = revents & POLLOUT;
             const bool terminal = revents & (POLLERR | POLLHUP | POLLNVAL);
 
-            if (want_read && registration->on_read) {
+            if (saw_read && registration->want_read && registration->on_read) {
                 registration->on_read();
                 if (state_->stop_requested.load(std::memory_order_acquire)) {
                     break;
@@ -400,7 +393,7 @@ void EventLoop::Run() {
             if (!registration->active || state_->stop_requested.load(std::memory_order_acquire)) {
                 continue;
             }
-            if (want_write && registration->on_write) {
+            if (saw_write && registration->want_write && registration->on_write) {
                 registration->on_write();
                 if (state_->stop_requested.load(std::memory_order_acquire)) {
                     break;

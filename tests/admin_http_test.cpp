@@ -1,4 +1,5 @@
 #include <gtest/gtest.h>
+#include <stdexcept>
 
 #include "proxy/admin_http.hpp"
 
@@ -39,4 +40,10 @@ TEST(AdminHttpTest, UnknownOrUnsupportedRequestsReturnExpectedStatus) {
 
     EXPECT_EQ(app.Handle("GET", "/does-not-exist").status, 404);
     EXPECT_EQ(app.Handle("POST", "/healthz").status, 405);
+}
+
+
+TEST(ProxyStateTest, DecrementSessionsUnderflowThrows) {
+    inline_proxy::ProxyState state;
+    EXPECT_THROW(state.decrement_sessions(), std::logic_error);
 }

@@ -19,7 +19,7 @@ public:
 
     std::size_t active_sessions() const noexcept;
     void increment_sessions() noexcept;
-    void decrement_sessions() noexcept;
+    void decrement_sessions();
 
     std::string MetricsText() const;
     std::string SessionsText() const;
