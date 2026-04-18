@@ -40,12 +40,12 @@ bool MakePipe(int fds[2]) {
 
 struct EventLoop::Registration {
     int fd = -1;
-    bool want_read = false;
-    bool want_write = false;
+    std::atomic<bool> want_read{false};
+    std::atomic<bool> want_write{false};
     Callback on_read;
     Callback on_write;
     ErrorCallback on_error;
-    bool active = true;
+    std::atomic<bool> active{true};
 };
 
 struct EventLoop::Timer {
@@ -73,7 +73,7 @@ void EventLoop::State::Remove(const std::shared_ptr<Registration>& registration)
         auto it = registrations.find(registration->fd);
         if (it != registrations.end() && it->second == registration) {
             if (it->second) {
-                it->second->active = false;
+                it->second->active.store(false, std::memory_order_release);
             }
             registrations.erase(it);
         }
@@ -93,8 +93,8 @@ void EventLoop::State::Update(const std::shared_ptr<Registration>& registration,
     if (it == registrations.end() || it->second != registration || !it->second) {
         return;
     }
-    it->second->want_read = want_read;
-    it->second->want_write = want_write;
+    it->second->want_read.store(want_read, std::memory_order_release);
+    it->second->want_write.store(want_write, std::memory_order_release);
     Wake();
 }
 
@@ -253,7 +253,7 @@ std::unique_ptr<EventLoop::Handle> EventLoop::Register(
         std::lock_guard lock(state_->mutex);
         auto it = state_->registrations.find(fd);
         if (it != state_->registrations.end() && it->second) {
-            it->second->active = false;
+            it->second->active.store(false, std::memory_order_release);
         }
         state_->registrations[fd] = registration;
     }
@@ -336,7 +336,7 @@ void EventLoop::Run() {
             std::lock_guard lock(state_->mutex);
             registrations.reserve(state_->registrations.size());
             for (const auto& entry : state_->registrations) {
-                if (entry.second && entry.second->active) {
+                if (entry.second && entry.second->active.load(std::memory_order_acquire)) {
                     registrations.push_back(entry.second);
                 }
             }
@@ -371,7 +371,7 @@ void EventLoop::Run() {
 
         for (std::size_t i = 0; i < registrations.size(); ++i) {
             const auto& registration = registrations[i];
-            if (!registration || !registration->active) {
+            if (!registration || !registration->active.load(std::memory_order_acquire)) {
                 continue;
             }
 
@@ -380,26 +380,24 @@ void EventLoop::Run() {
                 continue;
             }
 
-            const bool saw_read = revents & POLLIN;
-            const bool saw_write = revents & POLLOUT;
             const bool terminal = revents & (POLLERR | POLLHUP | POLLNVAL);
 
-            if (saw_read && registration->want_read && registration->on_read) {
+            if ((revents & POLLIN) && registration->want_read.load(std::memory_order_acquire) && registration->on_read) {
                 registration->on_read();
                 if (state_->stop_requested.load(std::memory_order_acquire)) {
                     break;
                 }
             }
-            if (!registration->active || state_->stop_requested.load(std::memory_order_acquire)) {
+            if (!registration->active.load(std::memory_order_acquire) || state_->stop_requested.load(std::memory_order_acquire)) {
                 continue;
             }
-            if (saw_write && registration->want_write && registration->on_write) {
+            if ((revents & POLLOUT) && registration->want_write.load(std::memory_order_acquire) && registration->on_write) {
                 registration->on_write();
                 if (state_->stop_requested.load(std::memory_order_acquire)) {
                     break;
                 }
             }
-            if (!registration->active || state_->stop_requested.load(std::memory_order_acquire)) {
+            if (!registration->active.load(std::memory_order_acquire) || state_->stop_requested.load(std::memory_order_acquire)) {
                 continue;
             }
             if (terminal && registration->on_error) {
@@ -408,7 +406,7 @@ void EventLoop::Run() {
                     break;
                 }
             }
-            if (!registration->active || state_->stop_requested.load(std::memory_order_acquire)) {
+            if (!registration->active.load(std::memory_order_acquire) || state_->stop_requested.load(std::memory_order_acquire)) {
                 continue;
             }
             if ((revents & POLLNVAL) != 0) {

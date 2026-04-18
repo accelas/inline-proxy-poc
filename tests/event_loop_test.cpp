@@ -247,7 +247,7 @@ TEST(EventLoopTest, PendingTimerIsNotDuplicatedByEarlyWakeups) {
     EXPECT_EQ(order, std::vector<int>({1}));
 }
 
-TEST(EventLoopTest, WriteCallbackIsSkippedAfterReadDisablesItInSameCycle) {
+TEST(EventLoopTest, WriteCallbackIsSkippedAfterConcurrentUpdateDisablesIt) {
     inline_proxy::EventLoop loop;
 
     int fds[2];
@@ -257,17 +257,28 @@ TEST(EventLoopTest, WriteCallbackIsSkippedAfterReadDisablesItInSameCycle) {
 
     int read_hits = 0;
     int write_hits = 0;
+    std::promise<void> read_entered;
+    std::promise<void> update_done;
+    auto read_entered_future = read_entered.get_future().share();
+    auto update_done_future = update_done.get_future().share();
     std::unique_ptr<inline_proxy::EventLoop::Handle> handle;
 
     handle = loop.Register(a.get(), true, true,
                            [&] {
                                ++read_hits;
+                               read_entered.set_value();
+                               update_done_future.wait();
                                char buffer[1];
                                (void)::read(a.get(), buffer, sizeof(buffer));
-                               handle->Update(true, false);
                            },
                            [&] { ++write_hits; },
                            {});
+
+    std::thread updater([&] {
+        read_entered_future.wait();
+        handle->Update(true, false);
+        update_done.set_value();
+    });
 
     const char byte = 'x';
     ASSERT_EQ(::write(b.get(), &byte, 1), 1);
@@ -278,6 +289,7 @@ TEST(EventLoopTest, WriteCallbackIsSkippedAfterReadDisablesItInSameCycle) {
     });
 
     loop.Run();
+    updater.join();
     stopper.join();
 
     EXPECT_EQ(read_hits, 1);
