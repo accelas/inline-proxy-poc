@@ -16,12 +16,32 @@
 #include <unistd.h>
 
 #include "proxy/relay_session.hpp"
+#include "proxy/transparent_listener.hpp"
 #include "proxy/transparent_socket.hpp"
 #include "shared/event_loop.hpp"
 #include "shared/scoped_fd.hpp"
 #include "shared/sockaddr.hpp"
 
 namespace {
+
+bool g_fake_transparent_options = false;
+
+class HookScope {
+public:
+    HookScope() = default;
+    ~HookScope() {
+        inline_proxy::SetSetSockOptHookForTesting(nullptr);
+        g_fake_transparent_options = false;
+    }
+};
+
+int TestSetSockOpt(int fd, int level, int optname, const void* optval, socklen_t optlen) {
+    if (level == IPPROTO_IP && (optname == IP_TRANSPARENT || optname == IP_FREEBIND) &&
+        g_fake_transparent_options) {
+        return 0;
+    }
+    return ::setsockopt(fd, level, optname, optval, optlen);
+}
 
 struct TcpListener {
     inline_proxy::ScopedFd fd;
@@ -91,6 +111,10 @@ std::string ReadWithTimeout(int fd) {
 }  // namespace
 
 TEST(RelaySessionTest, RelaysBytesBetweenClientAndUpstreamServer) {
+    HookScope hooks;
+    g_fake_transparent_options = true;
+    inline_proxy::SetSetSockOptHookForTesting(TestSetSockOpt);
+
     auto upstream = MakeTcpListener("127.0.0.1");
     auto proxy_listener = inline_proxy::CreateTransparentListener("127.0.0.1", 0);
     ASSERT_TRUE(proxy_listener.ok());
@@ -122,7 +146,7 @@ TEST(RelaySessionTest, RelaysBytesBetweenClientAndUpstreamServer) {
     inline_proxy::ScopedFd accepted(accepted_fd);
 
     inline_proxy::SessionEndpoints endpoints{
-        .client = inline_proxy::GetPeer(accepted.get()),
+        .client = inline_proxy::MakeSockaddr4("127.0.0.1", 0),
         .original_dst = upstream.addr,
     };
 
@@ -149,4 +173,3 @@ TEST(RelaySessionTest, RelaysBytesBetweenClientAndUpstreamServer) {
     ASSERT_EQ(upstream_done.get_future().wait_for(std::chrono::seconds(1)), std::future_status::ready)
         << "upstream server never observed echoed data";
 }
-

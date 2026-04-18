@@ -1,19 +1,72 @@
 #include "proxy/transparent_socket.hpp"
 
-#include <arpa/inet.h>
 #include <cerrno>
 #include <fcntl.h>
 #include <netinet/in.h>
-#include <sys/socket.h>
 #include <unistd.h>
-
-#include <cstring>
 
 namespace inline_proxy {
 namespace {
 
+SetSockOptHook& SetSockOptHookRef() {
+    static SetSockOptHook hook = nullptr;
+    return hook;
+}
+
+BindHook& BindHookRef() {
+    static BindHook hook = nullptr;
+    return hook;
+}
+
+ConnectHook& ConnectHookRef() {
+    static ConnectHook hook = nullptr;
+    return hook;
+}
+
+FcntlHook& FcntlHookRef() {
+    static FcntlHook hook = nullptr;
+    return hook;
+}
+
+}  // namespace
+
+int DoSetSockOpt(int fd, int level, int optname, const void* optval, socklen_t optlen) {
+    if (auto hook = SetSockOptHookRef()) {
+        return hook(fd, level, optname, optval, optlen);
+    }
+    return ::setsockopt(fd, level, optname, optval, optlen);
+}
+
+int DoBind(int fd, const sockaddr* addr, socklen_t addrlen) {
+    if (auto hook = BindHookRef()) {
+        return hook(fd, addr, addrlen);
+    }
+    return ::bind(fd, addr, addrlen);
+}
+
+int DoConnect(int fd, const sockaddr* addr, socklen_t addrlen) {
+    if (auto hook = ConnectHookRef()) {
+        return hook(fd, addr, addrlen);
+    }
+    return ::connect(fd, addr, addrlen);
+}
+
+int DoFcntl(int fd, int cmd, int arg) {
+    if (auto hook = FcntlHookRef()) {
+        return hook(fd, cmd, arg);
+    }
+    switch (cmd) {
+        case F_GETFL:
+            return ::fcntl(fd, cmd);
+        default:
+            return ::fcntl(fd, cmd, arg);
+    }
+}
+
+namespace {
+
 bool SetSocketOptionInt(int fd, int level, int name, int value) {
-    return ::setsockopt(fd, level, name, &value, sizeof(value)) == 0;
+    return DoSetSockOpt(fd, level, name, &value, sizeof(value)) == 0;
 }
 
 socklen_t SockaddrLength(const sockaddr_storage& addr) {
@@ -27,21 +80,52 @@ socklen_t SockaddrLength(const sockaddr_storage& addr) {
     }
 }
 
-ScopedFd MakeSocket() {
-    ScopedFd fd(::socket(AF_INET, SOCK_STREAM, 0));
-    if (!fd) {
+TransparentConnectResult MakeSocket() {
+    TransparentConnectResult result;
+    result.fd.reset(::socket(AF_INET, SOCK_STREAM, 0));
+    if (!result.fd) {
         return {};
     }
+
     const int reuse = 1;
-    if (!SetSocketOptionInt(fd.get(), SOL_SOCKET, SO_REUSEADDR, reuse)) {
+    if (!SetSocketOptionInt(result.fd.get(), SOL_SOCKET, SO_REUSEADDR, reuse)) {
         return {};
     }
-    (void)SetSocketOptionInt(fd.get(), IPPROTO_IP, IP_TRANSPARENT, 1);
-    (void)SetSocketOptionInt(fd.get(), IPPROTO_IP, IP_FREEBIND, 1);
-    return fd;
+    if (!SetSocketOptionInt(result.fd.get(), IPPROTO_IP, IP_TRANSPARENT, 1)) {
+        return {};
+    }
+    if (!SetSocketOptionInt(result.fd.get(), IPPROTO_IP, IP_FREEBIND, 1)) {
+        return {};
+    }
+
+    return result;
 }
 
 }  // namespace
+
+bool TransparentConnectResult::ok() const noexcept {
+    return fd.valid();
+}
+
+TransparentConnectResult::operator bool() const noexcept {
+    return ok();
+}
+
+void SetSetSockOptHookForTesting(SetSockOptHook hook) {
+    SetSockOptHookRef() = hook;
+}
+
+void SetBindHookForTesting(BindHook hook) {
+    BindHookRef() = hook;
+}
+
+void SetConnectHookForTesting(ConnectHook hook) {
+    ConnectHookRef() = hook;
+}
+
+void SetFcntlHookForTesting(FcntlHook hook) {
+    FcntlHookRef() = hook;
+}
 
 sockaddr_storage GetPeer(int fd) {
     sockaddr_storage addr{};
@@ -62,38 +146,44 @@ sockaddr_storage GetSockName(int fd) {
 }
 
 bool SetNonBlocking(int fd) {
-    const int flags = ::fcntl(fd, F_GETFL, 0);
+    const int flags = DoFcntl(fd, F_GETFL, 0);
     if (flags < 0) {
         return false;
     }
-    return ::fcntl(fd, F_SETFL, flags | O_NONBLOCK) == 0;
+    return DoFcntl(fd, F_SETFL, flags | O_NONBLOCK) == 0;
 }
 
-ScopedFd CreateTransparentSocket(const sockaddr_storage& original_src,
-                                 const sockaddr_storage& original_dst) {
+TransparentConnectResult CreateTransparentSocket(const sockaddr_storage& original_src,
+                                                 const sockaddr_storage& original_dst) {
     if (original_src.ss_family != AF_INET || original_dst.ss_family != AF_INET) {
         return {};
     }
 
-    ScopedFd fd = MakeSocket();
-    if (!fd) {
+    auto result = MakeSocket();
+    if (!result) {
         return {};
     }
 
-    if (::bind(fd.get(), reinterpret_cast<const sockaddr*>(&original_src), SockaddrLength(original_src)) != 0) {
-        // Best-effort fallback for environments without CAP_NET_ADMIN.
-        // The upstream connection still works with an ephemeral local source.
-    }
-
-    if (::connect(fd.get(), reinterpret_cast<const sockaddr*>(&original_dst), SockaddrLength(original_dst)) != 0) {
+    if (!SetNonBlocking(result.fd.get())) {
         return {};
     }
 
-    if (!SetNonBlocking(fd.get())) {
+    if (DoBind(result.fd.get(),
+               reinterpret_cast<const sockaddr*>(&original_src),
+               SockaddrLength(original_src)) != 0) {
         return {};
     }
 
-    return fd;
+    if (DoConnect(result.fd.get(),
+                  reinterpret_cast<const sockaddr*>(&original_dst),
+                  SockaddrLength(original_dst)) != 0) {
+        if (errno != EINPROGRESS && errno != EWOULDBLOCK) {
+            return {};
+        }
+        result.connecting = true;
+    }
+
+    return result;
 }
 
 }  // namespace inline_proxy

@@ -31,12 +31,14 @@ std::shared_ptr<RelaySession> RelaySession::Create(EventLoop& loop,
         return {};
     }
 
-    auto upstream_fd = CreateTransparentSocket(endpoints.client, endpoints.original_dst);
-    if (!upstream_fd) {
+    auto upstream = CreateTransparentSocket(endpoints.client, endpoints.original_dst);
+    if (!upstream) {
         return {};
     }
 
-    auto session = std::shared_ptr<RelaySession>(new RelaySession(loop, std::move(client_fd), std::move(upstream_fd)));
+    auto session = std::shared_ptr<RelaySession>(
+        new RelaySession(loop, std::move(client_fd), std::move(upstream.fd)));
+    session->upstream_connecting_ = upstream.connecting;
     session->Arm();
     session->UpdateInterest();
     return session;
@@ -102,6 +104,9 @@ void RelaySession::OnClientWritable() {
 }
 
 void RelaySession::OnUpstreamReadable() {
+    if (upstream_connecting_) {
+        return;
+    }
     if (!PumpRead(upstream_fd_.get(), upstream_to_client_, upstream_closed_)) {
         Close();
         return;
@@ -110,11 +115,31 @@ void RelaySession::OnUpstreamReadable() {
 }
 
 void RelaySession::OnUpstreamWritable() {
+    if (upstream_connecting_) {
+        if (!CompleteUpstreamConnect()) {
+            Close();
+            return;
+        }
+    }
     if (!PumpWrite(upstream_fd_.get(), client_to_upstream_, client_to_upstream_offset_)) {
         Close();
         return;
     }
     UpdateInterest();
+}
+
+bool RelaySession::CompleteUpstreamConnect() {
+    int socket_error = 0;
+    socklen_t len = sizeof(socket_error);
+    if (::getsockopt(upstream_fd_.get(), SOL_SOCKET, SO_ERROR, &socket_error, &len) != 0) {
+        return false;
+    }
+    if (socket_error != 0) {
+        errno = socket_error;
+        return false;
+    }
+    upstream_connecting_ = false;
+    return true;
 }
 
 bool RelaySession::PumpRead(int fd, std::string& buffer, bool& peer_closed) {
@@ -171,7 +196,8 @@ void RelaySession::UpdateInterest() {
         client_handle_->Update(!client_closed_, !upstream_to_client_.empty());
     }
     if (upstream_handle_) {
-        upstream_handle_->Update(!upstream_closed_, !client_to_upstream_.empty());
+        upstream_handle_->Update(!upstream_closed_ && !upstream_connecting_,
+                                 upstream_connecting_ || !client_to_upstream_.empty());
     }
 }
 

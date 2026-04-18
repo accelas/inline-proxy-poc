@@ -31,6 +31,7 @@ private:
     void OnClientWritable();
     void OnUpstreamReadable();
     void OnUpstreamWritable();
+    bool CompleteUpstreamConnect();
     void Close();
     void UpdateInterest();
 
@@ -48,6 +49,7 @@ private:
     std::size_t upstream_to_client_offset_ = 0;
     bool client_closed_ = false;
     bool upstream_closed_ = false;
+    bool upstream_connecting_ = false;
     bool closed_ = false;
 };
 
