@@ -1,0 +1,85 @@
+#include "proxy/interface_registry.hpp"
+
+#include <stdexcept>
+#include <string>
+
+namespace inline_proxy {
+bool InterfaceRegistry::HasPrefix(std::string_view name, std::string_view prefix) {
+    return name.size() >= prefix.size() && name.substr(0, prefix.size()) == prefix;
+}
+
+void InterfaceRegistry::AppendUnique(std::vector<std::string>& values, std::string_view name) {
+    for (const auto& value : values) {
+        if (value == name) {
+            return;
+        }
+    }
+    values.emplace_back(name);
+}
+
+void InterfaceRegistry::AppendList(std::string& out,
+                                   std::string_view label,
+                                   const std::vector<std::string>& values) {
+    out += label;
+    out += '=';
+    if (values.empty()) {
+        out += "none";
+        out += '\n';
+        return;
+    }
+
+    bool first = true;
+    for (const auto& value : values) {
+        if (!first) {
+            out += ',';
+        }
+        out += value;
+        first = false;
+    }
+    out += '\n';
+}
+
+void InterfaceRegistry::RecordInterface(std::string_view name) {
+    if (HasPrefix(name, "wan_")) {
+        AppendUnique(wan_interfaces_, name);
+        return;
+    }
+    if (HasPrefix(name, "lan_")) {
+        AppendUnique(lan_interfaces_, name);
+    }
+}
+
+void InterfaceRegistry::IncrementSessions() noexcept {
+    ++active_sessions_;
+}
+
+void InterfaceRegistry::DecrementSessions() {
+    if (active_sessions_ == 0) {
+        throw std::logic_error("interface session underflow");
+    }
+    --active_sessions_;
+}
+
+std::size_t InterfaceRegistry::active_sessions() const noexcept {
+    return active_sessions_;
+}
+
+const std::vector<std::string>& InterfaceRegistry::wan_interfaces() const noexcept {
+    return wan_interfaces_;
+}
+
+const std::vector<std::string>& InterfaceRegistry::lan_interfaces() const noexcept {
+    return lan_interfaces_;
+}
+
+std::string InterfaceRegistry::SummaryText() const {
+    std::string out;
+    AppendList(out, "wan_interfaces", wan_interfaces_);
+    AppendList(out, "lan_interfaces", lan_interfaces_);
+    out += "active_sessions=";
+    out += std::to_string(active_sessions_);
+    out += '\n';
+    return out;
+}
+
+}  // namespace inline_proxy

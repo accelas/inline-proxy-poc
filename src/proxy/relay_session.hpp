@@ -27,6 +27,8 @@ class RelaySession : public std::enable_shared_from_this<RelaySession> {
 public:
     ~RelaySession();
 
+    bool closed() const noexcept;
+
     static std::shared_ptr<RelaySession> Create(EventLoop& loop,
                                                 ScopedFd client_fd,
                                                 const SessionEndpoints& endpoints);

@@ -6,6 +6,8 @@ cc_library(
     name = "proxy",
     srcs = [
         "admin_http.cpp",
+        "config.cpp",
+        "interface_registry.cpp",
         "proxy_state.cpp",
         "relay_session.cpp",
         "transparent_listener.cpp",
@@ -13,6 +15,8 @@ cc_library(
     ],
     hdrs = [
         "admin_http.hpp",
+        "config.hpp",
+        "interface_registry.hpp",
         "proxy_state.hpp",
         "relay_session.hpp",
         "transparent_listener.hpp",

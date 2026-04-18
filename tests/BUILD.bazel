@@ -71,3 +71,12 @@ cc_test(
         "//src/shared:shared",
     ],
 )
+
+cc_test(
+    name = "proxy_daemon_config_test",
+    srcs = ["proxy_daemon_config_test.cpp"],
+    deps = [
+        "@googletest//:gtest_main",
+        "//src/proxy:proxy",
+    ],
+)

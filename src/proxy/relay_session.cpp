@@ -77,6 +77,10 @@ RelaySession::~RelaySession() {
     Close();
 }
 
+bool RelaySession::closed() const noexcept {
+    return closed_;
+}
+
 std::shared_ptr<RelaySession> RelaySession::Create(EventLoop& loop,
                                                    ScopedFd client_fd,
                                                    const SessionEndpoints& endpoints) {
