@@ -10,6 +10,7 @@
 #include <iostream>
 #include <list>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <sys/socket.h>
@@ -30,6 +31,8 @@ namespace {
 
 constexpr std::string_view kAdminPortEnv = "INLINE_PROXY_ADMIN_PORT";
 constexpr std::string_view kTransparentPortEnv = "INLINE_PROXY_TRANSPARENT_PORT";
+constexpr std::string_view kAdminPrefix = "--admin-port=";
+constexpr std::string_view kTransparentPrefix = "--transparent-port=";
 
 struct PlainListener {
     ScopedFd fd;
@@ -47,34 +50,33 @@ struct PlainListener {
     }
 };
 
-bool ParsePort(std::string_view value, std::uint16_t& out) {
+std::uint16_t ParsePortOrThrow(std::string_view value, std::string_view source) {
     unsigned int parsed = 0;
     const char* begin = value.data();
     const char* end = value.data() + value.size();
     const auto result = std::from_chars(begin, end, parsed);
     if (result.ec != std::errc{} || result.ptr != end || parsed == 0 || parsed > 65535U) {
-        return false;
+        throw std::invalid_argument(std::string(source) + " must be a port number between 1 and 65535");
     }
-    out = static_cast<std::uint16_t>(parsed);
-    return true;
+    return static_cast<std::uint16_t>(parsed);
 }
 
 void ApplyOverride(ProxyConfig& cfg, std::string_view name, std::string_view value) {
     if (name == kAdminPortEnv) {
-        (void)ParsePort(value, cfg.admin_port);
+        cfg.admin_port = ParsePortOrThrow(value, kAdminPortEnv);
         return;
     }
     if (name == kTransparentPortEnv) {
-        (void)ParsePort(value, cfg.transparent_port);
+        cfg.transparent_port = ParsePortOrThrow(value, kTransparentPortEnv);
     }
 }
 
 void ApplyProcessEnv(ProxyConfig& cfg) {
     if (const char* value = std::getenv("INLINE_PROXY_ADMIN_PORT")) {
-        (void)ParsePort(value, cfg.admin_port);
+        cfg.admin_port = ParsePortOrThrow(value, kAdminPortEnv);
     }
     if (const char* value = std::getenv("INLINE_PROXY_TRANSPARENT_PORT")) {
-        (void)ParsePort(value, cfg.transparent_port);
+        cfg.transparent_port = ParsePortOrThrow(value, kTransparentPortEnv);
     }
 }
 
@@ -87,14 +89,12 @@ void ApplyEnvOverrides(ProxyConfig& cfg, std::initializer_list<ProxyConfig::EnvO
 void ApplyCliOverrides(ProxyConfig& cfg, int argc, char** argv) {
     for (int i = 1; i < argc; ++i) {
         const std::string_view arg(argv[i] ? argv[i] : "");
-        constexpr std::string_view kAdminPrefix = "--admin-port=";
-        constexpr std::string_view kTransparentPrefix = "--transparent-port=";
         if (arg.rfind(kAdminPrefix, 0) == 0) {
-            (void)ParsePort(arg.substr(kAdminPrefix.size()), cfg.admin_port);
+            cfg.admin_port = ParsePortOrThrow(arg.substr(kAdminPrefix.size()), kAdminPrefix);
             continue;
         }
         if (arg.rfind(kTransparentPrefix, 0) == 0) {
-            (void)ParsePort(arg.substr(kTransparentPrefix.size()), cfg.transparent_port);
+            cfg.transparent_port = ParsePortOrThrow(arg.substr(kTransparentPrefix.size()), kTransparentPrefix);
         }
     }
 }
@@ -140,7 +140,7 @@ std::string HttpStatusText(int status) {
         case 404: return "Not Found";
         case 405: return "Method Not Allowed";
         case 503: return "Service Unavailable";
-        default: return "OK";
+        default: return "Unknown";
     }
 }
 
@@ -185,11 +185,8 @@ std::pair<std::string_view, std::string_view> ParseRequestLine(const std::string
 
 class AdminConnection : public std::enable_shared_from_this<AdminConnection> {
 public:
-    AdminConnection(EventLoop& loop,
-                    ScopedFd fd,
-                    AdminHttp& admin_http,
-                    InterfaceRegistry& registry)
-        : loop_(loop), fd_(std::move(fd)), admin_http_(admin_http), registry_(registry) {}
+    AdminConnection(EventLoop& loop, ScopedFd fd, AdminHttp& admin_http)
+        : loop_(loop), fd_(std::move(fd)), admin_http_(admin_http) {}
 
     void Arm() {
         auto weak = weak_from_this();
@@ -294,11 +291,6 @@ private:
             return;
         }
 
-        if (path == "/interfaces") {
-            PrepareResponse(200, registry_.SummaryText());
-            return;
-        }
-
         auto response = admin_http_.Handle(method, path);
         response_ = FormatHttpResponse(response);
         response_offset_ = 0;
@@ -321,7 +313,6 @@ private:
     EventLoop& loop_;
     ScopedFd fd_;
     AdminHttp& admin_http_;
-    InterfaceRegistry& registry_;
     std::unique_ptr<EventLoop::Handle> handle_;
     std::string request_;
     std::string response_;
@@ -362,7 +353,7 @@ ProxyConfig ProxyConfig::FromEnv(std::initializer_list<EnvOverride> env) {
     return cfg;
 }
 
-ProxyConfig ProxyConfig::FromEnv(int argc, char** argv) {
+ProxyConfig ProxyConfig::FromArgs(int argc, char** argv) {
     ProxyConfig cfg;
     ApplyProcessEnv(cfg);
     ApplyCliOverrides(cfg, argc, argv);
@@ -374,10 +365,6 @@ int RunProxyDaemon(const ProxyConfig& cfg) {
     state.set_ready(false);
 
     InterfaceRegistry registry;
-    registry.RecordInterface("wan_proxy");
-    registry.RecordInterface("lan_proxy");
-
-    auto admin_http = BuildAdminHttp(state);
     auto admin_listener = CreatePlainListener("127.0.0.1", cfg.admin_port);
     if (!admin_listener) {
         std::cerr << "failed to create admin listener on port " << cfg.admin_port << '\n';
@@ -389,6 +376,13 @@ int RunProxyDaemon(const ProxyConfig& cfg) {
         std::cerr << "failed to create transparent listener on port " << cfg.transparent_port << '\n';
         return 1;
     }
+
+    const std::string admin_interface_name = "lan_listener_" + std::to_string(cfg.admin_port);
+    const std::string transparent_interface_name = "wan_listener_" + std::to_string(cfg.transparent_port);
+    registry.RecordInterface(admin_interface_name);
+    registry.RecordInterface(transparent_interface_name);
+
+    auto admin_http = BuildAdminHttp(state, registry);
 
     state.set_ready(true);
     auto& loop = state.loop();
@@ -427,7 +421,7 @@ int RunProxyDaemon(const ProxyConfig& cfg) {
                 }
 
                 auto connection = std::make_shared<AdminConnection>(
-                    loop, std::move(accepted), admin_http, registry);
+                    loop, std::move(accepted), admin_http);
                 connection->Arm();
                 admin_connections.push_back(std::move(connection));
             }
@@ -478,6 +472,9 @@ int RunProxyDaemon(const ProxyConfig& cfg) {
     (void)transparent_handle;
 
     loop.Run();
+    state.set_ready(false);
+    registry.RemoveInterface(admin_interface_name);
+    registry.RemoveInterface(transparent_interface_name);
     return 0;
 }
 

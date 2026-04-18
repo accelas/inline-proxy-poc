@@ -2,6 +2,7 @@
 
 #include <cstdlib>
 #include <optional>
+#include <stdexcept>
 #include <string>
 
 #include "proxy/config.hpp"
@@ -14,7 +15,11 @@ public:
         if (const char* existing = std::getenv(name)) {
             previous_ = std::string(existing);
         }
-        ::setenv(name, value, 1);
+        if (value) {
+            ::setenv(name, value, 1);
+        } else {
+            ::unsetenv(name);
+        }
     }
 
     ~ScopedEnvVar() {
@@ -33,7 +38,11 @@ private:
 }  // namespace
 
 TEST(ProxyConfigTest, ParsesDefaultAdminAndTransparentPorts) {
-    auto cfg = inline_proxy::ProxyConfig::FromEnv({});
+    ScopedEnvVar admin_env("INLINE_PROXY_ADMIN_PORT", nullptr);
+    ScopedEnvVar transparent_env("INLINE_PROXY_TRANSPARENT_PORT", nullptr);
+    char arg0[] = "proxy_daemon";
+    char* argv[] = {arg0};
+    auto cfg = inline_proxy::ProxyConfig::FromArgs(1, argv);
     EXPECT_EQ(cfg.admin_port, 8080);
     EXPECT_EQ(cfg.transparent_port, 15001);
 }
@@ -57,8 +66,27 @@ TEST(ProxyConfigTest, ParsesCliOverridesForPorts) {
     char arg2[] = "--transparent-port=35001";
     char* argv[] = {arg0, arg1, arg2};
 
-    auto cfg = inline_proxy::ProxyConfig::FromEnv(3, argv);
+    auto cfg = inline_proxy::ProxyConfig::FromArgs(3, argv);
 
     EXPECT_EQ(cfg.admin_port, 28080);
     EXPECT_EQ(cfg.transparent_port, 35001);
+}
+
+TEST(ProxyConfigTest, RejectsInvalidEnvPortValues) {
+    ScopedEnvVar admin_env("INLINE_PROXY_ADMIN_PORT", "not-a-number");
+    ScopedEnvVar transparent_env("INLINE_PROXY_TRANSPARENT_PORT", nullptr);
+    char arg0[] = "proxy_daemon";
+    char* argv[] = {arg0};
+
+    EXPECT_THROW((void)inline_proxy::ProxyConfig::FromArgs(1, argv), std::invalid_argument);
+}
+
+TEST(ProxyConfigTest, RejectsInvalidCliPortValues) {
+    ScopedEnvVar admin_env("INLINE_PROXY_ADMIN_PORT", nullptr);
+    ScopedEnvVar transparent_env("INLINE_PROXY_TRANSPARENT_PORT", nullptr);
+    char arg0[] = "proxy_daemon";
+    char arg1[] = "--admin-port=abc";
+    char* argv[] = {arg0, arg1};
+
+    EXPECT_THROW((void)inline_proxy::ProxyConfig::FromArgs(2, argv), std::invalid_argument);
 }

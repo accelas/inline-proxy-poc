@@ -15,7 +15,8 @@ AdminResponse MakeTextResponse(int status, std::string body) {
 
 }  // namespace
 
-AdminHttp::AdminHttp(ProxyState& state) noexcept : state_(state) {}
+AdminHttp::AdminHttp(ProxyState& state, InterfaceRegistry& interfaces) noexcept
+    : state_(state), interfaces_(interfaces) {}
 
 AdminResponse AdminHttp::Handle(std::string_view method, std::string_view path) const {
     if (method != "GET") {
@@ -43,12 +44,19 @@ AdminResponse AdminHttp::Handle(std::string_view method, std::string_view path) 
             .body = state_.SessionsText(),
         };
     }
+    if (path == "/interfaces") {
+        return AdminResponse{
+            .status = 200,
+            .content_type = "text/plain; charset=utf-8",
+            .body = interfaces_.SummaryText(),
+        };
+    }
 
     return MakeTextResponse(404, "not found\n");
 }
 
-AdminHttp BuildAdminHttp(ProxyState& state) noexcept {
-    return AdminHttp(state);
+AdminHttp BuildAdminHttp(ProxyState& state, InterfaceRegistry& interfaces) noexcept {
+    return AdminHttp(state, interfaces);
 }
 
 }  // namespace inline_proxy

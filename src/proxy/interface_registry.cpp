@@ -49,6 +49,25 @@ void InterfaceRegistry::RecordInterface(std::string_view name) {
     }
 }
 
+void InterfaceRegistry::RemoveInterface(std::string_view name) {
+    auto remove_from = [name](std::vector<std::string>& values) {
+        for (auto it = values.begin(); it != values.end(); ++it) {
+            if (*it == name) {
+                values.erase(it);
+                return;
+            }
+        }
+    };
+
+    if (HasPrefix(name, "wan_")) {
+        remove_from(wan_interfaces_);
+        return;
+    }
+    if (HasPrefix(name, "lan_")) {
+        remove_from(lan_interfaces_);
+    }
+}
+
 void InterfaceRegistry::IncrementSessions() noexcept {
     ++active_sessions_;
 }

@@ -80,3 +80,12 @@ cc_test(
         "//src/proxy:proxy",
     ],
 )
+
+cc_test(
+    name = "interface_registry_test",
+    srcs = ["interface_registry_test.cpp"],
+    deps = [
+        "@googletest//:gtest_main",
+        "//src/proxy:proxy",
+    ],
+)

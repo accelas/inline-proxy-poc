@@ -10,6 +10,7 @@ namespace inline_proxy {
 class InterfaceRegistry {
 public:
     void RecordInterface(std::string_view name);
+    void RemoveInterface(std::string_view name);
 
     void IncrementSessions() noexcept;
     void DecrementSessions();
