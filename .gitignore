@@ -1,0 +1,33 @@
+# Bazel
+/bazel-*
+/dist/
+.bazel_cache/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+
+# Build artifacts
+*.o
+*.a
+*.so
+*.dylib
+
+# Generated files
+*.pb.h
+*.pb.cc
+
+# Test artifacts
+.cache/
+*.log
+
+# Editor backups
+*~
+\#*\#
+.#*
+
+# Git worktrees
+.worktrees/

@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    container: debian:trixie
+
+    steps:
+      - name: Install system dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            git \
+            wget \
+            ca-certificates \
+            build-essential \
+            python3
+          # Add project-specific dependencies here:
+          # C++ projects: libssl-dev libpq-dev protobuf-compiler
+          # Python projects: python3-pip python3-venv
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Cache Bazelisk
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/bazelisk
+          key: bazelisk-${{ runner.os }}
+
+      - name: Cache Bazel versions
+        uses: actions/cache@v4
+        with:
+          path: ~/.bazel
+          key: bazel-version-${{ hashFiles('.bazelversion') }}
+
+      - name: Cache Bazel build
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/bazel
+          key: bazel-build-${{ runner.os }}-${{ hashFiles('.bazelversion', 'MODULE.bazel') }}-${{ github.sha }}
+          restore-keys: |
+            bazel-build-${{ runner.os }}-${{ hashFiles('.bazelversion', 'MODULE.bazel') }}-
+            bazel-build-${{ runner.os }}-
+
+      - name: Build all targets
+        run: bazel build //...
+
+      - name: Run tests
+        run: bazel test //... --test_output=errors

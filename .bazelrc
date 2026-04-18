@@ -1,0 +1,34 @@
+# Bazel Configuration for mango-PROJECT_NAME
+
+# ============================================================================
+# Build Output
+# ============================================================================
+
+build --color=yes
+
+# ============================================================================
+# C++ Configuration
+# ============================================================================
+
+# Exclude warnings from external dependencies
+build --per_file_copt=external/.*@-w
+
+# ============================================================================
+# Testing
+# ============================================================================
+
+test --test_output=errors
+
+# ============================================================================
+# Optimization Configs
+# ============================================================================
+
+# Release build: optimized, LTO, dead code elimination, stripped
+build:release -c opt
+build:release --features=function_sections
+build:release --features=lto
+build:release --features=release_extras
+build:release --features=strip_release
+
+# Debug build
+build:debug -c dbg
