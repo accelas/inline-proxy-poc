@@ -12,6 +12,7 @@
 #include <cerrno>
 #include <fstream>
 #include <mutex>
+#include <memory>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -83,10 +84,17 @@ std::string BuildPodPath(const K8sQuery& query) {
     return "/api/v1/namespaces/" + query.namespace_name + "/pods/" + query.pod_name;
 }
 
+std::string BuildHostHeader(const K8sClientOptions& options) {
+    if (options.api_server_port.empty() || options.api_server_port == "443") {
+        return options.api_server_host;
+    }
+    return options.api_server_host + ":" + options.api_server_port;
+}
+
 std::string BuildHttpRequest(const K8sClientOptions& options, const K8sQuery& query, const std::string& token) {
     std::ostringstream request;
     request << "GET " << BuildPodPath(query) << " HTTP/1.1\r\n";
-    request << "Host: " << options.api_server_host << "\r\n";
+    request << "Host: " << BuildHostHeader(options) << "\r\n";
     request << "Authorization: Bearer " << token << "\r\n";
     request << "Accept: application/json\r\n";
     request << "Connection: close\r\n\r\n";
@@ -262,46 +270,71 @@ int ConnectTcp(const std::string& host, const std::string& port, std::chrono::mi
 }
 
 std::string PerformHttpsGet(const K8sClientOptions& options, const K8sQuery& query, const std::string& token) {
-    const int fd = ConnectTcp(options.api_server_host, options.api_server_port, options.timeout);
+    class UniqueFd {
+    public:
+        explicit UniqueFd(int fd) : fd_(fd) {}
+        ~UniqueFd() {
+            if (fd_ >= 0) {
+                ::close(fd_);
+            }
+        }
 
-    SSL_CTX* ctx = SSL_CTX_new(TLS_client_method());
+        UniqueFd(const UniqueFd&) = delete;
+        UniqueFd& operator=(const UniqueFd&) = delete;
+        UniqueFd(UniqueFd&& other) noexcept : fd_(std::exchange(other.fd_, -1)) {}
+        UniqueFd& operator=(UniqueFd&& other) noexcept {
+            if (this != &other) {
+                reset(std::exchange(other.fd_, -1));
+            }
+            return *this;
+        }
+
+        int get() const { return fd_; }
+
+    private:
+        void reset(int fd) {
+            if (fd_ >= 0) {
+                ::close(fd_);
+            }
+            fd_ = fd;
+        }
+
+        int fd_ = -1;
+    };
+
+    const UniqueFd fd(ConnectTcp(options.api_server_host, options.api_server_port, options.timeout));
+
+    std::unique_ptr<SSL_CTX, decltype(&SSL_CTX_free)> ctx(SSL_CTX_new(TLS_client_method()), &SSL_CTX_free);
     if (!ctx) {
-        ::close(fd);
         throw std::runtime_error("failed to create SSL context");
     }
-    SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, nullptr);
-    if (SSL_CTX_load_verify_locations(ctx, options.ca_path.string().c_str(), nullptr) != 1) {
-        SSL_CTX_free(ctx);
-        ::close(fd);
+    SSL_CTX_set_verify(ctx.get(), SSL_VERIFY_PEER, nullptr);
+    if (SSL_CTX_load_verify_locations(ctx.get(), options.ca_path.string().c_str(), nullptr) != 1) {
         throw std::runtime_error("failed to load Kubernetes CA bundle");
     }
 
-    SSL* ssl = SSL_new(ctx);
+    std::unique_ptr<SSL, decltype(&SSL_free)> ssl(SSL_new(ctx.get()), &SSL_free);
     if (!ssl) {
-        SSL_CTX_free(ctx);
-        ::close(fd);
         throw std::runtime_error("failed to create SSL object");
     }
-    SSL_set_fd(ssl, fd);
-    SSL_set_tlsext_host_name(ssl, options.api_server_host.c_str());
-    if (SSL_set1_host(ssl, options.api_server_host.c_str()) != 1) {
-        SSL_free(ssl);
-        SSL_CTX_free(ctx);
-        ::close(fd);
+    if (SSL_set_fd(ssl.get(), fd.get()) != 1) {
+        throw std::runtime_error("failed to bind TLS object to socket");
+    }
+    if (SSL_set_tlsext_host_name(ssl.get(), options.api_server_host.c_str()) != 1) {
+        throw std::runtime_error("failed to configure TLS SNI");
+    }
+    if (SSL_set1_host(ssl.get(), options.api_server_host.c_str()) != 1) {
         throw std::runtime_error("failed to configure TLS hostname verification");
     }
 
     const auto deadline = std::chrono::steady_clock::now() + options.timeout;
-    SslConnectWithTimeout(ssl, fd, deadline);
+    SslConnectWithTimeout(ssl.get(), fd.get(), deadline);
 
     const std::string request = BuildHttpRequest(options, query, token);
-    SslWriteAllWithTimeout(ssl, fd, deadline, request);
-    const std::string response = SslReadAllWithTimeout(ssl, fd, deadline);
+    SslWriteAllWithTimeout(ssl.get(), fd.get(), deadline, request);
+    const std::string response = SslReadAllWithTimeout(ssl.get(), fd.get(), deadline);
 
-    SSL_shutdown(ssl);
-    SSL_free(ssl);
-    SSL_CTX_free(ctx);
-    ::close(fd);
+    (void)SSL_shutdown(ssl.get());
     return response;
 }
 

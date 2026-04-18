@@ -118,6 +118,15 @@ void WritePemFiles(const TempCertBundle& bundle) {
     }
 }
 
+int CountOpenFileDescriptors() {
+    int count = 0;
+    for (const auto& entry : std::filesystem::directory_iterator("/proc/self/fd")) {
+        (void)entry;
+        ++count;
+    }
+    return count;
+}
+
 class StallingTlsServer {
 public:
     explicit StallingTlsServer(const TempCertBundle& bundle) {
@@ -296,4 +305,30 @@ TEST(K8sClientTest, TimesOutWhenApiserverStopsRespondingAfterTlsHandshake) {
     EXPECT_THROW((inline_proxy::FetchPodInfo(query, options)), std::runtime_error);
     const auto elapsed = std::chrono::steady_clock::now() - start;
     EXPECT_LT(std::chrono::duration_cast<std::chrono::seconds>(elapsed).count(), 2);
+}
+
+TEST(K8sClientTest, CleansUpSocketsAndTlsResourcesWhenRequestTimesOut) {
+    const int baseline_fd_count = CountOpenFileDescriptors();
+
+    {
+        auto bundle = CreateTempCertBundle();
+        WritePemFiles(bundle);
+
+        {
+            StallingTlsServer server(bundle);
+
+            inline_proxy::K8sClientOptions options;
+            options.api_server_host = "localhost";
+            options.api_server_port = std::to_string(server.port());
+            options.token_path = bundle.token_path;
+            options.ca_path = bundle.cert_path;
+            options.timeout = std::chrono::milliseconds(100);
+
+            const inline_proxy::K8sQuery query{.namespace_name = "inline-proxy-system", .pod_name = "proxy-1"};
+
+            EXPECT_THROW((inline_proxy::FetchPodInfo(query, options)), std::runtime_error);
+        }
+    }
+
+    EXPECT_EQ(CountOpenFileDescriptors(), baseline_fd_count);
 }
