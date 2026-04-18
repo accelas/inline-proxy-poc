@@ -25,12 +25,14 @@ public:
 
     bool ConfigureListenerSocket(int listener_fd);
     std::optional<int> listener_socket_fd() const noexcept;
+    std::uint32_t listener_port() const noexcept;
 
     bool IsIngressAttached(std::string_view interface_name) const;
 
 private:
     std::set<std::string> attached_interfaces_;
     std::optional<int> listener_socket_fd_;
+    std::uint32_t listener_port_ = 0;
     IngressRedirectConfig runtime_config_{};
     ScopedFd config_map_;
     ScopedFd program_fd_;

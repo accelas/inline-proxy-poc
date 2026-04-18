@@ -263,12 +263,18 @@ bool SendNetlinkRequest(std::vector<char> request) {
     return socket->ReceiveAck();
 }
 
+void FinalizeNetlinkMessage(std::vector<char>& request) {
+    auto* header = reinterpret_cast<nlmsghdr*>(request.data());
+    header->nlmsg_len = static_cast<std::uint32_t>(request.size());
+}
+
 bool EnsureClsactQdisc(unsigned int ifindex) {
     auto request = MakeNetlinkMessage(RTM_NEWQDISC, NLM_F_CREATE | NLM_F_REPLACE, ifindex);
     auto* tc = reinterpret_cast<tcmsg*>(NLMSG_DATA(reinterpret_cast<nlmsghdr*>(request.data())));
     tc->tcm_parent = TC_H_CLSACT;
     tc->tcm_handle = 0;
     AppendStringAttr(request, TCA_KIND, "clsact");
+    FinalizeNetlinkMessage(request);
     return SendNetlinkRequest(std::move(request));
 }
 
@@ -277,6 +283,7 @@ bool RemoveClsactQdisc(unsigned int ifindex) {
     auto* tc = reinterpret_cast<tcmsg*>(NLMSG_DATA(reinterpret_cast<nlmsghdr*>(request.data())));
     tc->tcm_parent = TC_H_CLSACT;
     tc->tcm_handle = 0;
+    FinalizeNetlinkMessage(request);
     return SendNetlinkRequest(std::move(request));
 }
 
@@ -285,6 +292,7 @@ bool AttachIngressFilter(unsigned int ifindex, int program_fd) {
     auto* tc = reinterpret_cast<tcmsg*>(NLMSG_DATA(reinterpret_cast<nlmsghdr*>(request.data())));
     tc->tcm_parent = TC_H_MAKE(TC_H_CLSACT, TC_H_MIN_INGRESS);
     tc->tcm_handle = 0;
+    tc->tcm_info = htons(ETH_P_ALL);
 
     AppendStringAttr(request, TCA_KIND, "bpf");
 
@@ -296,6 +304,7 @@ bool AttachIngressFilter(unsigned int ifindex, int program_fd) {
     AppendAttr(options, TCA_BPF_FLAGS, &flags, sizeof(flags));
 
     AppendAttr(request, TCA_OPTIONS, options.data(), options.size(), true);
+    FinalizeNetlinkMessage(request);
     return SendNetlinkRequest(std::move(request));
 }
 
@@ -355,7 +364,7 @@ bool BpfLoader::AttachIngress(std::string_view interface_name) {
     if (interface_name.empty() || interface_name.rfind("wan_", 0) != 0) {
         return false;
     }
-    if (!listener_socket_fd_) {
+    if (!listener_socket_fd_ || listener_port_ == 0 || runtime_config_.redirect_ifindex == 0) {
         return false;
     }
     if (IsIngressAttached(interface_name)) {
@@ -432,8 +441,9 @@ bool BpfLoader::ConfigureListenerSocket(int listener_fd) {
     }
 
     listener_socket_fd_ = listener_fd;
+    listener_port_ = listener_port;
     runtime_config_.enabled = 1;
-    runtime_config_.listener_port = listener_port;
+    runtime_config_.listener_port = htons(static_cast<std::uint16_t>(listener_port));
     runtime_config_.redirect_ifindex = LinkIndex("lo").value_or(0);
 
     if (config_map_.valid() && !UpdateConfigMap(config_map_, runtime_config_)) {
@@ -445,6 +455,10 @@ bool BpfLoader::ConfigureListenerSocket(int listener_fd) {
 
 std::optional<int> BpfLoader::listener_socket_fd() const noexcept {
     return listener_socket_fd_;
+}
+
+std::uint32_t BpfLoader::listener_port() const noexcept {
+    return listener_port_;
 }
 
 bool BpfLoader::IsIngressAttached(std::string_view interface_name) const {
