@@ -1,13 +1,17 @@
 #include "shared/state_store.hpp"
 
 #include <cctype>
+#include <cerrno>
 #include <filesystem>
 #include <fstream>
 #include <optional>
 #include <sstream>
 #include <string>
 #include <string_view>
-#include <utility>
+#include <system_error>
+#include <unistd.h>
+
+#include "shared/scoped_fd.hpp"
 
 namespace inline_proxy {
 namespace {
@@ -37,6 +41,25 @@ std::string EscapeJsonString(const std::string& input) {
         }
     }
     return output;
+}
+
+bool WriteAll(int fd, std::string_view content) {
+    std::size_t written_total = 0;
+    while (written_total < content.size()) {
+        const auto chunk = ::write(fd, content.data() + written_total,
+                                   content.size() - written_total);
+        if (chunk < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return false;
+        }
+        if (chunk == 0) {
+            return false;
+        }
+        written_total += static_cast<std::size_t>(chunk);
+    }
+    return true;
 }
 
 class JsonReader {
@@ -191,35 +214,50 @@ bool StateStore::Write(const StateFields& fields) const {
         }
     }
 
-    auto temp = path_;
-    temp += ".tmp";
-    {
-        std::ofstream out(temp, std::ios::binary | std::ios::trunc);
-        if (!out) {
-            return false;
-        }
-        out << '{';
+    const auto temp_template_path = path_.parent_path() / (path_.filename().string() + ".XXXXXX");
+    std::string temp_template = temp_template_path.string();
+    temp_template.push_back('\0');
+    const int temp_fd_raw = ::mkstemp(temp_template.data());
+    if (temp_fd_raw < 0) {
+        return false;
+    }
+
+    ScopedFd temp_fd(temp_fd_raw);
+    const std::filesystem::path temp_path(temp_template.c_str());
+
+    const std::string content = [&fields] {
+        std::string json = "{";
         bool first = true;
         for (const auto& entry : fields) {
             if (!first) {
-                out << ',';
+                json.push_back(',');
             }
             first = false;
-            out << '"' << EscapeJsonString(entry.first) << "\":\""
-                << EscapeJsonString(entry.second) << '"';
+            json.push_back('"');
+            json += EscapeJsonString(entry.first);
+            json += "\":";
+            json.push_back('"');
+            json += EscapeJsonString(entry.second);
+            json.push_back('"');
         }
-        out << '}';
-        out.flush();
-        if (!out) {
-            return false;
-        }
+        json.push_back('}');
+        return json;
+    }();
+
+    if (!WriteAll(temp_fd.get(), content)) {
+        std::filesystem::remove(temp_path, ec);
+        return false;
+    }
+    if (::fsync(temp_fd.get()) != 0) {
+        std::filesystem::remove(temp_path, ec);
+        return false;
     }
 
-    std::filesystem::remove(path_, ec);
+    temp_fd.reset();
     ec.clear();
-    std::filesystem::rename(temp, path_, ec);
+    std::filesystem::rename(temp_path, path_, ec);
     if (ec) {
-        std::filesystem::remove(temp, ec);
+        std::filesystem::remove(temp_path, ec);
         return false;
     }
     return true;

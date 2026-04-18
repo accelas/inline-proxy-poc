@@ -1,5 +1,7 @@
 #include <cerrno>
 #include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <fcntl.h>
 #include <gtest/gtest.h>
 #include <unistd.h>
@@ -43,4 +45,35 @@ TEST(StateStoreTest, RoundTripsFlatJson) {
     EXPECT_EQ(*loaded, fields);
     EXPECT_TRUE(store.Remove());
     EXPECT_TRUE(store.Remove());
+}
+
+TEST(StateStoreTest, DoesNotClobberFixedTmpPath) {
+    const auto dir = std::filesystem::temp_directory_path() / "inline_proxy_state_store_tmp_test";
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+    std::filesystem::create_directories(dir, ec);
+    ASSERT_FALSE(ec);
+
+    const auto path = dir / "state.json";
+    const auto temp_path = dir / "state.json.tmp";
+    {
+        std::ofstream temp_out(temp_path, std::ios::binary | std::ios::trunc);
+        ASSERT_TRUE(temp_out);
+        temp_out << "sentinel";
+    }
+
+    inline_proxy::StateStore store(path);
+    inline_proxy::StateFields fields{{"key", "value"}};
+    ASSERT_TRUE(store.Write(fields));
+
+    std::ifstream temp_in(temp_path, std::ios::binary);
+    ASSERT_TRUE(temp_in);
+    std::string temp_content((std::istreambuf_iterator<char>(temp_in)), std::istreambuf_iterator<char>());
+    EXPECT_EQ(temp_content, "sentinel");
+
+    auto loaded = store.Read();
+    ASSERT_TRUE(loaded.has_value());
+    EXPECT_EQ(*loaded, fields);
+    EXPECT_TRUE(store.Remove());
+    std::filesystem::remove_all(dir, ec);
 }

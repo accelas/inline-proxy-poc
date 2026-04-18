@@ -26,5 +26,7 @@ private:
 };
 
 bool CloseFd(int fd) noexcept;
+using CloseHook = int (*)(int);
+void SetCloseHookForTesting(CloseHook hook);
 
 }  // namespace inline_proxy

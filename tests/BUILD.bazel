@@ -21,3 +21,12 @@ cc_test(
         "//src/shared:shared",
     ],
 )
+
+cc_test(
+    name = "scoped_fd_close_test",
+    srcs = ["scoped_fd_close_test.cpp"],
+    deps = [
+        "@googletest//:gtest_main",
+        "//src/shared:shared",
+    ],
+)

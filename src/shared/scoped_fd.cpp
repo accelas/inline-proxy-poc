@@ -4,16 +4,25 @@
 #include <unistd.h>
 
 namespace inline_proxy {
+namespace {
+
+CloseHook& CloseHookRef() {
+    static CloseHook hook = ::close;
+    return hook;
+}
+
+}  // namespace
+
+void SetCloseHookForTesting(CloseHook hook) {
+    CloseHookRef() = hook != nullptr ? hook : ::close;
+}
 
 bool CloseFd(int fd) noexcept {
     if (fd < 0) {
         return true;
     }
 
-    while (::close(fd) == -1) {
-        if (errno == EINTR) {
-            continue;
-        }
+    if (CloseHookRef()(fd) == -1) {
         return false;
     }
     return true;
