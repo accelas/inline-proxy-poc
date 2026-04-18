@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <memory>
 #include <string>
+#include <sys/socket.h>
 
 #include "proxy/transparent_socket.hpp"
 #include "shared/event_loop.hpp"
@@ -10,10 +11,17 @@
 
 namespace inline_proxy {
 
+using SendHook = ssize_t (*)(int fd, const void* buffer, size_t length, int flags);
+using ShutdownHook = int (*)(int fd, int how);
+
 struct SessionEndpoints {
     sockaddr_storage client{};
     sockaddr_storage original_dst{};
 };
+
+void SetSendHookForTesting(SendHook hook);
+void SetShutdownHookForTesting(ShutdownHook hook);
+std::size_t RelaySessionBufferHighWaterMark() noexcept;
 
 class RelaySession : public std::enable_shared_from_this<RelaySession> {
 public:
@@ -32,10 +40,12 @@ private:
     void OnUpstreamReadable();
     void OnUpstreamWritable();
     bool CompleteUpstreamConnect();
+    bool MaybePropagateHalfClose();
+    bool MaybeFinish();
     void Close();
     void UpdateInterest();
 
-    bool PumpRead(int fd, std::string& buffer, bool& peer_closed);
+    bool PumpRead(int fd, std::string& buffer, std::size_t offset, bool& peer_closed);
     bool PumpWrite(int fd, std::string& buffer, std::size_t& offset);
 
     EventLoop* loop_ = nullptr;
@@ -50,6 +60,8 @@ private:
     bool client_closed_ = false;
     bool upstream_closed_ = false;
     bool upstream_connecting_ = false;
+    bool client_write_shutdown_ = false;
+    bool upstream_write_shutdown_ = false;
     bool closed_ = false;
 };
 
