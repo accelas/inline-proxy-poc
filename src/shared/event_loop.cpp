@@ -53,18 +53,166 @@ struct EventLoop::Timer {
     Callback callback;
 };
 
-EventLoop::Handle::Handle(EventLoop& loop, std::shared_ptr<Registration> registration)
-    : loop_(&loop), registration_(std::move(registration)) {}
+EventLoop::State::~State() {
+    if (wakeup_read_fd >= 0) {
+        ::close(wakeup_read_fd);
+    }
+    if (wakeup_write_fd >= 0) {
+        ::close(wakeup_write_fd);
+    }
+}
+
+void EventLoop::State::Remove(const std::shared_ptr<Registration>& registration) {
+    if (!registration) {
+        return;
+    }
+
+    {
+        std::lock_guard lock(mutex);
+        auto it = registrations.find(registration->fd);
+        if (it != registrations.end() && it->second == registration) {
+            if (it->second) {
+                it->second->active = false;
+            }
+            registrations.erase(it);
+        }
+    }
+    Wake();
+}
+
+void EventLoop::State::Update(const std::shared_ptr<Registration>& registration,
+                              bool want_read,
+                              bool want_write) {
+    if (!registration) {
+        return;
+    }
+
+    std::lock_guard lock(mutex);
+    auto it = registrations.find(registration->fd);
+    if (it == registrations.end() || it->second != registration || !it->second) {
+        return;
+    }
+    it->second->want_read = want_read;
+    it->second->want_write = want_write;
+    Wake();
+}
+
+void EventLoop::State::Wake() {
+    if (!alive.load(std::memory_order_acquire) || wakeup_write_fd < 0) {
+        return;
+    }
+    const std::uint8_t byte = 1;
+    while (true) {
+        const ssize_t written = ::write(wakeup_write_fd, &byte, sizeof(byte));
+        if (written == static_cast<ssize_t>(sizeof(byte))) {
+            return;
+        }
+        if (written < 0 && errno == EINTR) {
+            continue;
+        }
+        if (written < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            return;
+        }
+        return;
+    }
+}
+
+void EventLoop::State::DrainWakeup() {
+    if (wakeup_read_fd < 0) {
+        return;
+    }
+    std::uint8_t buffer[64];
+    while (true) {
+        const ssize_t read_bytes = ::read(wakeup_read_fd, buffer, sizeof(buffer));
+        if (read_bytes > 0) {
+            continue;
+        }
+        if (read_bytes < 0 && errno == EINTR) {
+            continue;
+        }
+        if (read_bytes < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            return;
+        }
+        return;
+    }
+}
+
+std::vector<EventLoop::Callback> EventLoop::State::TakeDeferred() {
+    std::vector<Callback> callbacks;
+    {
+        std::lock_guard lock(mutex);
+        callbacks.reserve(std::min<std::size_t>(deferred.size(), kMaxDrainCallbacks));
+        while (!deferred.empty() && callbacks.size() < kMaxDrainCallbacks) {
+            callbacks.push_back(std::move(deferred.front()));
+            deferred.pop_front();
+        }
+    }
+    return callbacks;
+}
+
+std::vector<EventLoop::Callback> EventLoop::State::TakeDueTimers() {
+    const auto now = std::chrono::steady_clock::now();
+    std::vector<Callback> callbacks;
+
+    std::lock_guard lock(mutex);
+    while (!timers.empty() && callbacks.size() < kMaxDrainCallbacks) {
+        std::pop_heap(timers.begin(), timers.end(), [](const Timer& lhs, const Timer& rhs) {
+            if (lhs.due != rhs.due) {
+                return lhs.due > rhs.due;
+            }
+            return lhs.id > rhs.id;
+        });
+        auto timer = std::move(timers.back());
+        if (timer.due > now) {
+            timers.push_back(std::move(timer));
+            std::push_heap(timers.begin(), timers.end(), [](const Timer& lhs, const Timer& rhs) {
+                if (lhs.due != rhs.due) {
+                    return lhs.due > rhs.due;
+                }
+                return lhs.id > rhs.id;
+            });
+            break;
+        }
+        timers.pop_back();
+        if (timer.callback) {
+            callbacks.push_back(std::move(timer.callback));
+        }
+    }
+
+    return callbacks;
+}
+
+int EventLoop::State::ComputeTimeoutMillis() const {
+    std::lock_guard lock(mutex);
+    if (!deferred.empty()) {
+        return 0;
+    }
+    if (timers.empty()) {
+        return -1;
+    }
+
+    const auto now = std::chrono::steady_clock::now();
+    const auto& earliest = timers.front();
+    if (earliest.due <= now) {
+        return 0;
+    }
+    const auto delta = std::chrono::duration_cast<std::chrono::milliseconds>(earliest.due - now);
+    return static_cast<int>(std::max<std::chrono::milliseconds::rep>(0, delta.count()));
+}
+
+EventLoop::Handle::Handle(std::shared_ptr<State> state,
+                          std::shared_ptr<Registration> registration)
+    : state_(std::move(state)), registration_(std::move(registration)) {}
 
 EventLoop::Handle::~Handle() {
-    if (loop_ && registration_) {
-        loop_->Remove(registration_);
+    if (state_ && registration_) {
+        state_->Remove(registration_);
     }
 }
 
 void EventLoop::Handle::Update(bool want_read, bool want_write) {
-    if (loop_ && registration_) {
-        loop_->Update(registration_, want_read, want_write);
+    if (state_ && registration_) {
+        state_->Update(registration_, want_read, want_write);
     }
 }
 
@@ -72,22 +220,20 @@ int EventLoop::Handle::fd() const noexcept {
     return registration_ ? registration_->fd : -1;
 }
 
-EventLoop::EventLoop() {
+EventLoop::EventLoop() : state_(std::make_shared<State>()) {
     int fds[2] = {-1, -1};
     if (!MakePipe(fds)) {
         throw std::system_error(errno, std::generic_category(), "pipe2");
     }
-    wakeup_read_fd_ = fds[0];
-    wakeup_write_fd_ = fds[1];
+    state_->wakeup_read_fd = fds[0];
+    state_->wakeup_write_fd = fds[1];
 }
 
 EventLoop::~EventLoop() {
     Stop();
-    if (wakeup_read_fd_ >= 0) {
-        ::close(wakeup_read_fd_);
-    }
-    if (wakeup_write_fd_ >= 0) {
-        ::close(wakeup_write_fd_);
+    if (state_) {
+        state_->alive.store(false, std::memory_order_release);
+        state_.reset();
     }
 }
 
@@ -107,76 +253,82 @@ std::unique_ptr<EventLoop::Handle> EventLoop::Register(
     registration->on_error = std::move(on_error);
 
     {
-        std::lock_guard lock(mutex_);
-        auto it = registrations_.find(fd);
-        if (it != registrations_.end() && it->second) {
+        std::lock_guard lock(state_->mutex);
+        auto it = state_->registrations.find(fd);
+        if (it != state_->registrations.end() && it->second) {
             it->second->active = false;
         }
-        registrations_[fd] = registration;
+        state_->registrations[fd] = registration;
     }
-    Wake();
-    return std::unique_ptr<Handle>(new Handle(*this, std::move(registration)));
+    state_->Wake();
+    return std::unique_ptr<Handle>(new Handle(state_, std::move(registration)));
 }
 
 void EventLoop::Defer(Callback fn) {
     {
-        std::lock_guard lock(mutex_);
-        deferred_.push_back(std::move(fn));
+        std::lock_guard lock(state_->mutex);
+        state_->deferred.push_back(std::move(fn));
     }
-    Wake();
+    state_->Wake();
 }
 
 void EventLoop::Schedule(std::chrono::milliseconds delay, Callback fn) {
     {
-        std::lock_guard lock(mutex_);
-        timers_.push_back(Timer{
+        std::lock_guard lock(state_->mutex);
+        state_->timers.push_back(Timer{
             .due = std::chrono::steady_clock::now() + delay,
-            .id = next_timer_id_++,
+            .id = state_->next_timer_id++,
             .callback = std::move(fn),
         });
+        std::push_heap(state_->timers.begin(), state_->timers.end(), [](const Timer& lhs, const Timer& rhs) {
+            if (lhs.due != rhs.due) {
+                return lhs.due > rhs.due;
+            }
+            return lhs.id > rhs.id;
+        });
     }
-    Wake();
+    state_->Wake();
 }
 
 void EventLoop::Run() {
     {
-        std::lock_guard lock(mutex_);
-        if (stop_requested_.load(std::memory_order_acquire)) {
+        std::lock_guard lock(state_->mutex);
+        if (state_->stop_requested.load(std::memory_order_acquire)) {
             return;
         }
-        loop_thread_ = std::this_thread::get_id();
+        state_->loop_thread = std::this_thread::get_id();
     }
 
     struct LoopThreadReset {
-        EventLoop* self;
+        State& state;
         ~LoopThreadReset() {
-            std::lock_guard lock(self->mutex_);
-            self->loop_thread_ = std::thread::id{};
+            std::lock_guard lock(state.mutex);
+            state.loop_thread = std::thread::id{};
         }
-    } reset{this};
+    } reset{*state_};
 
-    while (!stop_requested_.load(std::memory_order_acquire)) {
-        for (auto callback : TakeDeferred()) {
+    while (!state_->stop_requested.load(std::memory_order_acquire)) {
+        for (auto callback : state_->TakeDeferred()) {
             if (callback) {
                 callback();
             }
         }
 
-        for (auto callback : TakeDueTimers()) {
+        for (auto callback : state_->TakeDueTimers()) {
             if (callback) {
                 callback();
             }
         }
 
-        if (stop_requested_.load(std::memory_order_acquire)) {
+        if (state_->stop_requested.load(std::memory_order_acquire)) {
             break;
         }
 
         std::vector<std::shared_ptr<Registration>> registrations;
         {
-            std::lock_guard lock(mutex_);
-            registrations.reserve(registrations_.size());
-            for (const auto& entry : registrations_) {
+            std::lock_guard lock(state_->mutex);
+            registrations.reserve(state_->registrations.size());
+            for (const auto& entry : state_->registrations) {
                 if (entry.second && entry.second->active) {
                     registrations.push_back(entry.second);
                 }
@@ -185,7 +337,7 @@ void EventLoop::Run() {
 
         std::vector<pollfd> pollfds;
         pollfds.reserve(registrations.size() + 1);
-        pollfds.push_back(pollfd{.fd = wakeup_read_fd_, .events = POLLIN, .revents = 0});
+        pollfds.push_back(pollfd{.fd = state_->wakeup_read_fd, .events = POLLIN, .revents = 0});
         for (const auto& registration : registrations) {
             short events = 0;
             if (registration->want_read) {
@@ -197,7 +349,7 @@ void EventLoop::Run() {
             pollfds.push_back(pollfd{.fd = registration->fd, .events = events, .revents = 0});
         }
 
-        const int timeout_ms = ComputeTimeoutMillis();
+        const int timeout_ms = state_->ComputeTimeoutMillis();
         int rc = ::poll(pollfds.data(), static_cast<nfds_t>(pollfds.size()), timeout_ms);
         if (rc < 0) {
             if (errno == EINTR) {
@@ -207,7 +359,7 @@ void EventLoop::Run() {
         }
 
         if (pollfds[0].revents != 0) {
-            DrainWakeup();
+            state_->DrainWakeup();
         }
 
         for (std::size_t i = 0; i < registrations.size(); ++i) {
@@ -244,151 +396,26 @@ void EventLoop::Run() {
                 continue;
             }
             if ((revents & POLLNVAL) != 0) {
-                Remove(registration);
+                state_->Remove(registration);
             }
         }
     }
 }
 
 void EventLoop::Stop() {
-    stop_requested_.store(true, std::memory_order_release);
-    Wake();
+    if (!state_) {
+        return;
+    }
+    state_->stop_requested.store(true, std::memory_order_release);
+    state_->Wake();
 }
 
 bool EventLoop::IsInEventLoopThread() const noexcept {
-    std::lock_guard lock(mutex_);
-    return loop_thread_ == std::this_thread::get_id();
-}
-
-void EventLoop::Remove(const std::shared_ptr<Registration>& registration) {
-    if (!registration) {
-        return;
+    if (!state_) {
+        return false;
     }
-
-    {
-        std::lock_guard lock(mutex_);
-        auto it = registrations_.find(registration->fd);
-        if (it != registrations_.end() && it->second == registration) {
-            if (it->second) {
-                it->second->active = false;
-            }
-            registrations_.erase(it);
-        }
-    }
-    Wake();
-}
-
-void EventLoop::Update(const std::shared_ptr<Registration>& registration,
-                       bool want_read,
-                       bool want_write) {
-    if (!registration) {
-        return;
-    }
-
-    std::lock_guard lock(mutex_);
-    auto it = registrations_.find(registration->fd);
-    if (it == registrations_.end() || it->second != registration || !it->second) {
-        return;
-    }
-    it->second->want_read = want_read;
-    it->second->want_write = want_write;
-    Wake();
-}
-
-void EventLoop::Wake() {
-    if (wakeup_write_fd_ < 0) {
-        return;
-    }
-    const std::uint8_t byte = 1;
-    while (true) {
-        const ssize_t written = ::write(wakeup_write_fd_, &byte, sizeof(byte));
-        if (written == static_cast<ssize_t>(sizeof(byte))) {
-            return;
-        }
-        if (written < 0 && errno == EINTR) {
-            continue;
-        }
-        if (written < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-            return;
-        }
-        return;
-    }
-}
-
-void EventLoop::DrainWakeup() {
-    if (wakeup_read_fd_ < 0) {
-        return;
-    }
-    std::uint8_t buffer[64];
-    while (true) {
-        const ssize_t read_bytes = ::read(wakeup_read_fd_, buffer, sizeof(buffer));
-        if (read_bytes > 0) {
-            continue;
-        }
-        if (read_bytes < 0 && errno == EINTR) {
-            continue;
-        }
-        if (read_bytes < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-            return;
-        }
-        return;
-    }
-}
-
-std::vector<EventLoop::Callback> EventLoop::TakeDeferred() {
-    std::vector<Callback> callbacks;
-    {
-        std::lock_guard lock(mutex_);
-        callbacks.reserve(std::min<std::size_t>(deferred_.size(), kMaxDrainCallbacks));
-        while (!deferred_.empty() && callbacks.size() < kMaxDrainCallbacks) {
-            callbacks.push_back(std::move(deferred_.front()));
-            deferred_.pop_front();
-        }
-    }
-    return callbacks;
-}
-
-std::vector<EventLoop::Callback> EventLoop::TakeDueTimers() {
-    const auto now = std::chrono::steady_clock::now();
-    std::vector<Callback> callbacks;
-
-    std::lock_guard lock(mutex_);
-    auto it = timers_.begin();
-    while (it != timers_.end() && callbacks.size() < kMaxDrainCallbacks) {
-        if (it->due > now) {
-            ++it;
-            continue;
-        }
-        if (it->callback) {
-            callbacks.push_back(std::move(it->callback));
-        }
-        it = timers_.erase(it);
-    }
-
-    return callbacks;
-}
-
-int EventLoop::ComputeTimeoutMillis() const {
-    std::lock_guard lock(mutex_);
-    if (!deferred_.empty()) {
-        return 0;
-    }
-    if (timers_.empty()) {
-        return -1;
-    }
-
-    auto earliest = std::min_element(timers_.begin(), timers_.end(), [](const Timer& lhs, const Timer& rhs) {
-        if (lhs.due != rhs.due) {
-            return lhs.due < rhs.due;
-        }
-        return lhs.id < rhs.id;
-    });
-    const auto now = std::chrono::steady_clock::now();
-    if (earliest->due <= now) {
-        return 0;
-    }
-    const auto delta = std::chrono::duration_cast<std::chrono::milliseconds>(earliest->due - now);
-    return static_cast<int>(std::max<std::chrono::milliseconds::rep>(0, delta.count()));
+    std::lock_guard lock(state_->mutex);
+    return state_->loop_thread == std::this_thread::get_id();
 }
 
 }  // namespace inline_proxy

@@ -17,6 +17,7 @@ namespace inline_proxy {
 class EventLoop {
 private:
     struct Registration;
+    struct State;
     struct Timer;
 
 public:
@@ -36,9 +37,10 @@ public:
     private:
         friend class EventLoop;
 
-        Handle(EventLoop& loop, std::shared_ptr<Registration> registration);
+        Handle(std::shared_ptr<State> state,
+               std::shared_ptr<Registration> registration);
 
-        EventLoop* loop_;
+        std::shared_ptr<State> state_;
         std::shared_ptr<Registration> registration_;
     };
 
@@ -62,25 +64,32 @@ public:
     bool IsInEventLoopThread() const noexcept;
 
 private:
-    void Remove(const std::shared_ptr<Registration>& registration);
-    void Update(const std::shared_ptr<Registration>& registration,
-                bool want_read,
-                bool want_write);
-    void Wake();
-    void DrainWakeup();
-    std::vector<Callback> TakeDeferred();
-    std::vector<Callback> TakeDueTimers();
-    int ComputeTimeoutMillis() const;
+    struct State {
+        int wakeup_read_fd = -1;
+        int wakeup_write_fd = -1;
+        mutable std::mutex mutex;
+        std::unordered_map<int, std::shared_ptr<Registration>> registrations;
+        std::deque<Callback> deferred;
+        std::vector<Timer> timers;
+        std::uint64_t next_timer_id = 0;
+        std::atomic<bool> stop_requested{false};
+        std::atomic<bool> alive{true};
+        std::thread::id loop_thread;
 
-    int wakeup_read_fd_ = -1;
-    int wakeup_write_fd_ = -1;
-    mutable std::mutex mutex_;
-    std::unordered_map<int, std::shared_ptr<Registration>> registrations_;
-    std::deque<Callback> deferred_;
-    std::vector<Timer> timers_;
-    std::uint64_t next_timer_id_ = 0;
-    std::atomic<bool> stop_requested_{false};
-    std::thread::id loop_thread_;
+        ~State();
+
+        void Remove(const std::shared_ptr<Registration>& registration);
+        void Update(const std::shared_ptr<Registration>& registration,
+                    bool want_read,
+                    bool want_write);
+        void Wake();
+        void DrainWakeup();
+        std::vector<Callback> TakeDeferred();
+        std::vector<Callback> TakeDueTimers();
+        int ComputeTimeoutMillis() const;
+    };
+
+    std::shared_ptr<State> state_;
 };
 
 }  // namespace inline_proxy

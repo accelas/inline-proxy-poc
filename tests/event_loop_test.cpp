@@ -2,6 +2,7 @@
 #include <future>
 #include <thread>
 #include <string>
+#include <vector>
 #include <unistd.h>
 
 #include <gtest/gtest.h>
@@ -124,4 +125,42 @@ TEST(EventLoopTest, LoopThreadIdentityClearsAfterRunReturns) {
     stopper.join();
 
     EXPECT_FALSE(loop.IsInEventLoopThread());
+}
+
+
+TEST(EventLoopTest, HandleOperationsAreSafeAfterLoopDestruction) {
+    std::unique_ptr<inline_proxy::EventLoop::Handle> handle;
+
+    {
+        inline_proxy::EventLoop loop;
+        int fds[2];
+        ASSERT_EQ(::pipe(fds), 0);
+        inline_proxy::ScopedFd read_fd(fds[0]);
+        inline_proxy::ScopedFd write_fd(fds[1]);
+        handle = loop.Register(read_fd.get(), true, false, {}, {}, {});
+        EXPECT_GE(handle->fd(), 0);
+        (void)write_fd;
+    }
+
+    ASSERT_NO_FATAL_FAILURE(handle->Update(false, false));
+    handle.reset();
+}
+
+TEST(EventLoopTest, DueTimersRunInDeadlineOrder) {
+    inline_proxy::EventLoop loop;
+    std::vector<int> order;
+
+    loop.Schedule(std::chrono::milliseconds(20), [&] { order.push_back(1); });
+    loop.Schedule(std::chrono::milliseconds(1), [&] { order.push_back(2); });
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(40));
+    std::thread stopper([&] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        loop.Stop();
+    });
+
+    loop.Run();
+    stopper.join();
+
+    EXPECT_EQ(order, std::vector<int>({2, 1}));
 }
