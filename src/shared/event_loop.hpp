@@ -1,21 +1,24 @@
 #pragma once
 
+#include <atomic>
 #include <chrono>
-#include <cstdint>
 #include <cstddef>
+#include <cstdint>
 #include <deque>
 #include <functional>
 #include <memory>
 #include <mutex>
-#include <string>
 #include <thread>
-#include <atomic>
 #include <unordered_map>
 #include <vector>
 
 namespace inline_proxy {
 
 class EventLoop {
+private:
+    struct Registration;
+    struct Timer;
+
 public:
     using Callback = std::function<void()>;
     using ErrorCallback = std::function<void(int)>;
@@ -33,10 +36,10 @@ public:
     private:
         friend class EventLoop;
 
-        Handle(EventLoop& loop, int fd);
+        Handle(EventLoop& loop, std::shared_ptr<Registration> registration);
 
         EventLoop* loop_;
-        int fd_;
+        std::shared_ptr<Registration> registration_;
     };
 
     EventLoop();
@@ -59,11 +62,10 @@ public:
     bool IsInEventLoopThread() const noexcept;
 
 private:
-    struct Registration;
-    struct Timer;
-
-    void Remove(int fd);
-    void Update(int fd, bool want_read, bool want_write);
+    void Remove(const std::shared_ptr<Registration>& registration);
+    void Update(const std::shared_ptr<Registration>& registration,
+                bool want_read,
+                bool want_write);
     void Wake();
     void DrainWakeup();
     std::vector<Callback> TakeDeferred();
@@ -77,7 +79,7 @@ private:
     std::deque<Callback> deferred_;
     std::vector<Timer> timers_;
     std::uint64_t next_timer_id_ = 0;
-    std::atomic<bool> running_{false};
+    std::atomic<bool> stop_requested_{false};
     std::thread::id loop_thread_;
 };
 

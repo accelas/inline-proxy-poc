@@ -20,7 +20,7 @@ public:
     AdminResponse Handle(std::string_view method, std::string_view path) const;
 
 private:
-    ProxyState* state_;
+    ProxyState& state_;
 };
 
 AdminHttp BuildAdminHttp(ProxyState& state) noexcept;

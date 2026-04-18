@@ -15,7 +15,7 @@ AdminResponse MakeTextResponse(int status, std::string body) {
 
 }  // namespace
 
-AdminHttp::AdminHttp(ProxyState& state) noexcept : state_(&state) {}
+AdminHttp::AdminHttp(ProxyState& state) noexcept : state_(state) {}
 
 AdminResponse AdminHttp::Handle(std::string_view method, std::string_view path) const {
     if (method != "GET") {
@@ -26,22 +26,21 @@ AdminResponse AdminHttp::Handle(std::string_view method, std::string_view path) 
         return MakeTextResponse(200, "ok\n");
     }
     if (path == "/readyz") {
-        return state_ && state_->ready()
-                   ? MakeTextResponse(200, "ready\n")
-                   : MakeTextResponse(503, "not ready\n");
+        return state_.ready() ? MakeTextResponse(200, "ready\n")
+                              : MakeTextResponse(503, "not ready\n");
     }
     if (path == "/metrics") {
         return AdminResponse{
             .status = 200,
             .content_type = "text/plain; version=0.0.4; charset=utf-8",
-            .body = state_ ? state_->MetricsText() : std::string(),
+            .body = state_.MetricsText(),
         };
     }
     if (path == "/sessions") {
         return AdminResponse{
             .status = 200,
             .content_type = "text/plain; charset=utf-8",
-            .body = state_ ? state_->SessionsText() : std::string(),
+            .body = state_.SessionsText(),
         };
     }
 

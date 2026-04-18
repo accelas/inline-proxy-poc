@@ -40,3 +40,13 @@ cc_test(
         "//src/proxy:proxy",
     ],
 )
+
+
+cc_test(
+    name = "event_loop_test",
+    srcs = ["event_loop_test.cpp"],
+    deps = [
+        "@googletest//:gtest_main",
+        "//src/shared:shared",
+    ],
+)

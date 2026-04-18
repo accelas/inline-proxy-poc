@@ -2,10 +2,7 @@
 
 #include <algorithm>
 #include <cerrno>
-#include <chrono>
 #include <cstdint>
-#include <cstdio>
-#include <cstring>
 #include <fcntl.h>
 #include <poll.h>
 #include <stdexcept>
@@ -56,22 +53,23 @@ struct EventLoop::Timer {
     Callback callback;
 };
 
-EventLoop::Handle::Handle(EventLoop& loop, int fd) : loop_(&loop), fd_(fd) {}
+EventLoop::Handle::Handle(EventLoop& loop, std::shared_ptr<Registration> registration)
+    : loop_(&loop), registration_(std::move(registration)) {}
 
 EventLoop::Handle::~Handle() {
-    if (loop_) {
-        loop_->Remove(fd_);
+    if (loop_ && registration_) {
+        loop_->Remove(registration_);
     }
 }
 
 void EventLoop::Handle::Update(bool want_read, bool want_write) {
-    if (loop_) {
-        loop_->Update(fd_, want_read, want_write);
+    if (loop_ && registration_) {
+        loop_->Update(registration_, want_read, want_write);
     }
 }
 
 int EventLoop::Handle::fd() const noexcept {
-    return fd_;
+    return registration_ ? registration_->fd : -1;
 }
 
 EventLoop::EventLoop() {
@@ -110,10 +108,14 @@ std::unique_ptr<EventLoop::Handle> EventLoop::Register(
 
     {
         std::lock_guard lock(mutex_);
+        auto it = registrations_.find(fd);
+        if (it != registrations_.end() && it->second) {
+            it->second->active = false;
+        }
         registrations_[fd] = registration;
     }
     Wake();
-    return std::unique_ptr<Handle>(new Handle(*this, fd));
+    return std::unique_ptr<Handle>(new Handle(*this, std::move(registration)));
 }
 
 void EventLoop::Defer(Callback fn) {
@@ -139,11 +141,13 @@ void EventLoop::Schedule(std::chrono::milliseconds delay, Callback fn) {
 void EventLoop::Run() {
     {
         std::lock_guard lock(mutex_);
+        if (stop_requested_.load(std::memory_order_acquire)) {
+            return;
+        }
         loop_thread_ = std::this_thread::get_id();
     }
-    running_.store(true);
 
-    while (running_.load()) {
+    while (!stop_requested_.load(std::memory_order_acquire)) {
         for (auto callback : TakeDeferred()) {
             if (callback) {
                 callback();
@@ -156,7 +160,7 @@ void EventLoop::Run() {
             }
         }
 
-        if (!running_.load()) {
+        if (stop_requested_.load(std::memory_order_acquire)) {
             break;
         }
 
@@ -230,7 +234,7 @@ void EventLoop::Run() {
 }
 
 void EventLoop::Stop() {
-    running_.store(false);
+    stop_requested_.store(true, std::memory_order_release);
     Wake();
 }
 
@@ -239,11 +243,15 @@ bool EventLoop::IsInEventLoopThread() const noexcept {
     return loop_thread_ == std::this_thread::get_id();
 }
 
-void EventLoop::Remove(int fd) {
+void EventLoop::Remove(const std::shared_ptr<Registration>& registration) {
+    if (!registration) {
+        return;
+    }
+
     {
         std::lock_guard lock(mutex_);
-        auto it = registrations_.find(fd);
-        if (it != registrations_.end()) {
+        auto it = registrations_.find(registration->fd);
+        if (it != registrations_.end() && it->second == registration) {
             if (it->second) {
                 it->second->active = false;
             }
@@ -253,10 +261,16 @@ void EventLoop::Remove(int fd) {
     Wake();
 }
 
-void EventLoop::Update(int fd, bool want_read, bool want_write) {
+void EventLoop::Update(const std::shared_ptr<Registration>& registration,
+                       bool want_read,
+                       bool want_write) {
+    if (!registration) {
+        return;
+    }
+
     std::lock_guard lock(mutex_);
-    auto it = registrations_.find(fd);
-    if (it == registrations_.end() || !it->second) {
+    auto it = registrations_.find(registration->fd);
+    if (it == registrations_.end() || it->second != registration || !it->second) {
         return;
     }
     it->second->want_read = want_read;
@@ -274,7 +288,7 @@ void EventLoop::Wake() {
         if (written == static_cast<ssize_t>(sizeof(byte))) {
             return;
         }
-        if (written < 0 && (errno == EINTR)) {
+        if (written < 0 && errno == EINTR) {
             continue;
         }
         if (written < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
