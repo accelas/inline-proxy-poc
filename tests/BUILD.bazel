@@ -50,3 +50,24 @@ cc_test(
         "//src/shared:shared",
     ],
 )
+
+
+cc_test(
+    name = "transparent_socket_test",
+    srcs = ["transparent_socket_test.cpp"],
+    deps = [
+        "@googletest//:gtest_main",
+        "//src/proxy:proxy",
+        "//src/shared:shared",
+    ],
+)
+
+cc_test(
+    name = "relay_session_test",
+    srcs = ["relay_session_test.cpp"],
+    deps = [
+        "@googletest//:gtest_main",
+        "//src/proxy:proxy",
+        "//src/shared:shared",
+    ],
+)

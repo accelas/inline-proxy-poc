@@ -7,10 +7,16 @@ cc_library(
     srcs = [
         "admin_http.cpp",
         "proxy_state.cpp",
+        "relay_session.cpp",
+        "transparent_listener.cpp",
+        "transparent_socket.cpp",
     ],
     hdrs = [
         "admin_http.hpp",
         "proxy_state.hpp",
+        "relay_session.hpp",
+        "transparent_listener.hpp",
+        "transparent_socket.hpp",
     ],
     deps = [
         "//src/shared:shared",
