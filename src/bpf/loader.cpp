@@ -453,10 +453,12 @@ bool BpfLoader::DetachIngress(std::string_view interface_name) {
 
     const auto ifindex = LinkIndex(iface_name);
     if (!ifindex || *ifindex == 0) {
+        attached_interfaces_.erase(attached);
         return false;
     }
 
     if (!RemoveIngressFilter(*ifindex)) {
+        attached_interfaces_.erase(attached);
         return false;
     }
 
@@ -514,6 +516,10 @@ std::uint32_t BpfLoader::listener_port() const noexcept {
 
 std::vector<bpf_insn> BpfLoader::BuildIngressProgramForTesting() const {
     return BuildIngressProgram(0);
+}
+
+void BpfLoader::MarkIngressAttachedForTesting(std::string_view interface_name) {
+    attached_interfaces_.insert(std::string(interface_name));
 }
 
 bool BpfLoader::IsIngressAttached(std::string_view interface_name) const {

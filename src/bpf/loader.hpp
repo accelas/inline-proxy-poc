@@ -28,6 +28,7 @@ public:
     bool IsIngressAttached(std::string_view interface_name) const;
 
     std::vector<bpf_insn> BuildIngressProgramForTesting() const;
+    void MarkIngressAttachedForTesting(std::string_view interface_name);
 
 private:
     std::set<std::string> attached_interfaces_;

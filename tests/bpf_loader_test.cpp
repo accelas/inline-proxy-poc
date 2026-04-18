@@ -67,6 +67,15 @@ TEST(BpfLoaderTest, RejectsConfigureListenerSocketWhenGetsocknameFails) {
     ::close(pipe_fds[1]);
 }
 
+TEST(BpfLoaderTest, ClearsStaleAttachedStateWhenDetachFails) {
+    inline_proxy::BpfLoader loader;
+    loader.MarkIngressAttachedForTesting("wan_eth0");
+
+    EXPECT_TRUE(loader.IsIngressAttached("wan_eth0"));
+    EXPECT_FALSE(loader.DetachIngress("wan_eth0"));
+    EXPECT_FALSE(loader.IsIngressAttached("wan_eth0"));
+}
+
 TEST(BpfLoaderTest, GeneratedProgramUsesConfiguredListenerPort) {
     inline_proxy::BpfLoader loader;
     const auto insns = loader.BuildIngressProgramForTesting();

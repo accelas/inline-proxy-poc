@@ -68,9 +68,12 @@ bool InterfaceRegistry::RemoveInterface(std::string_view name) {
     };
 
     if (HasPrefix(name, "wan_")) {
-        const bool removed = remove_from(wan_interfaces_);
-        (void)bpf_loader_.DetachIngress(name);
-        return removed;
+        const bool loader_thinks_attached = bpf_loader_.IsIngressAttached(name);
+        const bool detached = bpf_loader_.DetachIngress(name);
+        if (loader_thinks_attached && !detached) {
+            return false;
+        }
+        return remove_from(wan_interfaces_);
     }
     if (HasPrefix(name, "lan_")) {
         return remove_from(lan_interfaces_);
