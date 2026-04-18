@@ -1,4 +1,4 @@
-# C++ Toolchain for mango-PROJECT_NAME
+# C++ Toolchain for inline_proxy_poc
 #
 # GCC 14+ toolchain with:
 # - C++23 standard (-std=c++23)
@@ -21,7 +21,7 @@ cc_toolchain_config(name = "cc_toolchain_config")
 
 cc_toolchain(
     name = "cc_toolchain_impl",
-    toolchain_identifier = "mango-toolchain",
+    toolchain_identifier = "inline_proxy_poc_toolchain",
     toolchain_config = ":cc_toolchain_config",
     all_files = ":empty",
     compiler_files = ":empty",

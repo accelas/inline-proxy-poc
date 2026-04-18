@@ -349,7 +349,7 @@ def _impl(ctx):
 
     return cc_common.create_cc_toolchain_config_info(
         ctx = ctx,
-        toolchain_identifier = "mango-toolchain",
+        toolchain_identifier = "inline_proxy_poc_toolchain",
         host_system_name = "local",
         target_system_name = "local",
         target_cpu = "k8",

@@ -1,0 +1,4 @@
+module(
+    name = "yajl",
+    version = "0.0.0",
+)

@@ -11,6 +11,11 @@ module(
 
 bazel_dep(name = "rules_cc", version = "0.0.17")
 bazel_dep(name = "rules_pkg", version = "1.0.1")
+bazel_dep(name = "yajl", version = "0.0.0")
+bazel_dep(name = "libbpf", version = "0.0.0")
+
+local_path_override(module_name = "yajl", path = "third_party/yajl")
+local_path_override(module_name = "libbpf", path = "third_party/libbpf")
 
 # ============================================================================
 # Testing
@@ -22,9 +27,6 @@ bazel_dep(name = "rules_pkg", version = "1.0.1")
 # ============================================================================
 # Common Dependencies (uncomment as needed)
 # ============================================================================
-
-# Local placeholder support packages for the upcoming CNI and BPF work live
-# under third_party/yajl and third_party/libbpf.
 
 # Logging
 # bazel_dep(name = "spdlog", version = "1.15.3")
