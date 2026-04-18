@@ -89,3 +89,13 @@ cc_test(
         "//src/proxy:proxy",
     ],
 )
+
+cc_test(
+    name = "admin_connection_send_test",
+    srcs = ["admin_connection_send_test.cpp"],
+    deps = [
+        "@googletest//:gtest_main",
+        "//src/proxy:proxy",
+        "//src/shared:shared",
+    ],
+)

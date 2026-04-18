@@ -72,6 +72,20 @@ TEST(ProxyConfigTest, ParsesCliOverridesForPorts) {
     EXPECT_EQ(cfg.transparent_port, 35001);
 }
 
+TEST(ProxyConfigTest, CliOverridesTakePrecedenceOverInvalidEnvValuesForSameField) {
+    ScopedEnvVar admin_env("INLINE_PROXY_ADMIN_PORT", "not-a-number");
+    ScopedEnvVar transparent_env("INLINE_PROXY_TRANSPARENT_PORT", "29001");
+
+    char arg0[] = "proxy_daemon";
+    char arg1[] = "--admin-port=28080";
+    char* argv[] = {arg0, arg1};
+
+    auto cfg = inline_proxy::ProxyConfig::FromArgs(2, argv);
+
+    EXPECT_EQ(cfg.admin_port, 28080);
+    EXPECT_EQ(cfg.transparent_port, 29001);
+}
+
 TEST(ProxyConfigTest, RejectsInvalidEnvPortValues) {
     ScopedEnvVar admin_env("INLINE_PROXY_ADMIN_PORT", "not-a-number");
     ScopedEnvVar transparent_env("INLINE_PROXY_TRANSPARENT_PORT", nullptr);
@@ -86,6 +100,17 @@ TEST(ProxyConfigTest, RejectsInvalidCliPortValues) {
     ScopedEnvVar transparent_env("INLINE_PROXY_TRANSPARENT_PORT", nullptr);
     char arg0[] = "proxy_daemon";
     char arg1[] = "--admin-port=abc";
+    char* argv[] = {arg0, arg1};
+
+    EXPECT_THROW((void)inline_proxy::ProxyConfig::FromArgs(2, argv), std::invalid_argument);
+}
+
+TEST(ProxyConfigTest, RejectsUnknownCliFlags) {
+    ScopedEnvVar admin_env("INLINE_PROXY_ADMIN_PORT", nullptr);
+    ScopedEnvVar transparent_env("INLINE_PROXY_TRANSPARENT_PORT", nullptr);
+
+    char arg0[] = "proxy_daemon";
+    char arg1[] = "--unknown-flag";
     char* argv[] = {arg0, arg1};
 
     EXPECT_THROW((void)inline_proxy::ProxyConfig::FromArgs(2, argv), std::invalid_argument);

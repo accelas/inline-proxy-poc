@@ -1,6 +1,7 @@
 #include "proxy/config.hpp"
 
 #include <algorithm>
+#include <cstddef>
 #include <charconv>
 #include <cerrno>
 #include <chrono>
@@ -34,6 +35,11 @@ constexpr std::string_view kTransparentPortEnv = "INLINE_PROXY_TRANSPARENT_PORT"
 constexpr std::string_view kAdminPrefix = "--admin-port=";
 constexpr std::string_view kTransparentPrefix = "--transparent-port=";
 
+AdminSendHook& AdminSendHookRef() {
+    static AdminSendHook hook = nullptr;
+    return hook;
+}
+
 struct PlainListener {
     ScopedFd fd;
 
@@ -61,6 +67,30 @@ std::uint16_t ParsePortOrThrow(std::string_view value, std::string_view source) 
     return static_cast<std::uint16_t>(parsed);
 }
 
+struct CliParseResult {
+    bool admin_seen = false;
+    bool transparent_seen = false;
+};
+
+CliParseResult ParseCliOverrides(ProxyConfig& cfg, int argc, char** argv) {
+    CliParseResult seen;
+    for (int i = 1; i < argc; ++i) {
+        const std::string_view arg(argv[i] ? argv[i] : "");
+        if (arg.rfind(kAdminPrefix, 0) == 0) {
+            cfg.admin_port = ParsePortOrThrow(arg.substr(kAdminPrefix.size()), kAdminPrefix);
+            seen.admin_seen = true;
+            continue;
+        }
+        if (arg.rfind(kTransparentPrefix, 0) == 0) {
+            cfg.transparent_port = ParsePortOrThrow(arg.substr(kTransparentPrefix.size()), kTransparentPrefix);
+            seen.transparent_seen = true;
+            continue;
+        }
+        throw std::invalid_argument(std::string("unknown CLI flag: ") + std::string(arg));
+    }
+    return seen;
+}
+
 void ApplyOverride(ProxyConfig& cfg, std::string_view name, std::string_view value) {
     if (name == kAdminPortEnv) {
         cfg.admin_port = ParsePortOrThrow(value, kAdminPortEnv);
@@ -71,31 +101,9 @@ void ApplyOverride(ProxyConfig& cfg, std::string_view name, std::string_view val
     }
 }
 
-void ApplyProcessEnv(ProxyConfig& cfg) {
-    if (const char* value = std::getenv("INLINE_PROXY_ADMIN_PORT")) {
-        cfg.admin_port = ParsePortOrThrow(value, kAdminPortEnv);
-    }
-    if (const char* value = std::getenv("INLINE_PROXY_TRANSPARENT_PORT")) {
-        cfg.transparent_port = ParsePortOrThrow(value, kTransparentPortEnv);
-    }
-}
-
 void ApplyEnvOverrides(ProxyConfig& cfg, std::initializer_list<ProxyConfig::EnvOverride> env) {
     for (const auto& [name, value] : env) {
         ApplyOverride(cfg, name, value);
-    }
-}
-
-void ApplyCliOverrides(ProxyConfig& cfg, int argc, char** argv) {
-    for (int i = 1; i < argc; ++i) {
-        const std::string_view arg(argv[i] ? argv[i] : "");
-        if (arg.rfind(kAdminPrefix, 0) == 0) {
-            cfg.admin_port = ParsePortOrThrow(arg.substr(kAdminPrefix.size()), kAdminPrefix);
-            continue;
-        }
-        if (arg.rfind(kTransparentPrefix, 0) == 0) {
-            cfg.transparent_port = ParsePortOrThrow(arg.substr(kTransparentPrefix.size()), kTransparentPrefix);
-        }
     }
 }
 
@@ -253,9 +261,10 @@ private:
 
     void OnWritable() {
         while (response_offset_ < response_.size()) {
-            const ssize_t n = ::write(fd_.get(),
-                                      response_.data() + response_offset_,
-                                      response_.size() - response_offset_);
+            const ssize_t n = DoAdminSend(fd_.get(),
+                                          response_.data() + response_offset_,
+                                          response_.size() - response_offset_,
+                                          MSG_NOSIGNAL);
             if (n > 0) {
                 response_offset_ += static_cast<std::size_t>(n);
                 continue;
@@ -347,6 +356,17 @@ void PruneClosedConnections(std::list<std::shared_ptr<T>>& items) {
 
 }  // namespace
 
+void SetAdminSendHookForTesting(AdminSendHook hook) {
+    AdminSendHookRef() = hook;
+}
+
+ssize_t DoAdminSend(int fd, const void* buffer, size_t length, int flags) {
+    if (auto hook = AdminSendHookRef()) {
+        return hook(fd, buffer, length, flags);
+    }
+    return ::send(fd, buffer, length, flags);
+}
+
 ProxyConfig ProxyConfig::FromEnv(std::initializer_list<EnvOverride> env) {
     ProxyConfig cfg;
     ApplyEnvOverrides(cfg, env);
@@ -355,8 +375,19 @@ ProxyConfig ProxyConfig::FromEnv(std::initializer_list<EnvOverride> env) {
 
 ProxyConfig ProxyConfig::FromArgs(int argc, char** argv) {
     ProxyConfig cfg;
-    ApplyProcessEnv(cfg);
-    ApplyCliOverrides(cfg, argc, argv);
+    const CliParseResult cli = ParseCliOverrides(cfg, argc, argv);
+
+    if (!cli.admin_seen) {
+        if (const char* value = std::getenv("INLINE_PROXY_ADMIN_PORT")) {
+            cfg.admin_port = ParsePortOrThrow(value, kAdminPortEnv);
+        }
+    }
+    if (!cli.transparent_seen) {
+        if (const char* value = std::getenv("INLINE_PROXY_TRANSPARENT_PORT")) {
+            cfg.transparent_port = ParsePortOrThrow(value, kTransparentPortEnv);
+        }
+    }
+
     return cfg;
 }
 
