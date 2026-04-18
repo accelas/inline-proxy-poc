@@ -81,5 +81,5 @@ TEST(InterfaceRegistryTest, KeepsWanInterfaceWhenDetachFailsAfterLoaderHadBeenAt
     EXPECT_FALSE(registry.RemoveInterface("wan_eth1"));
     EXPECT_NE(std::find(registry.wan_interfaces().begin(), registry.wan_interfaces().end(), "wan_eth1"),
               registry.wan_interfaces().end());
-    EXPECT_FALSE(loader.IsIngressAttached("wan_eth1"));
+    EXPECT_TRUE(loader.IsIngressAttached("wan_eth1"));
 }

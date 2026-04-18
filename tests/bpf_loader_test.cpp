@@ -67,13 +67,13 @@ TEST(BpfLoaderTest, RejectsConfigureListenerSocketWhenGetsocknameFails) {
     ::close(pipe_fds[1]);
 }
 
-TEST(BpfLoaderTest, ClearsStaleAttachedStateWhenDetachFails) {
+TEST(BpfLoaderTest, PreservesAttachedStateWhenDetachFails) {
     inline_proxy::BpfLoader loader;
     loader.MarkIngressAttachedForTesting("wan_eth0");
 
     EXPECT_TRUE(loader.IsIngressAttached("wan_eth0"));
     EXPECT_FALSE(loader.DetachIngress("wan_eth0"));
-    EXPECT_FALSE(loader.IsIngressAttached("wan_eth0"));
+    EXPECT_TRUE(loader.IsIngressAttached("wan_eth0"));
 }
 
 TEST(BpfLoaderTest, GeneratedProgramUsesConfiguredListenerPort) {
@@ -86,6 +86,7 @@ TEST(BpfLoaderTest, GeneratedProgramUsesConfiguredListenerPort) {
     bool saw_dynamic_tcp_offset = false;
     bool saw_listener_port_load = false;
     bool saw_hardcoded_tcp_offset = false;
+    bool saw_listener_port_direct_compare = false;
 
     for (std::size_t i = 0; i < insns.size(); ++i) {
         const auto& insn = insns[i];
@@ -129,6 +130,10 @@ TEST(BpfLoaderTest, GeneratedProgramUsesConfiguredListenerPort) {
         if (insn.code == (BPF_LDX | BPF_MEM | BPF_H) && insn.dst_reg == BPF_REG_1 &&
             insn.src_reg == BPF_REG_6 && insn.off == 4) {
             saw_listener_port_load = true;
+            if (i + 1 < insns.size() && insns[i + 1].code == (BPF_JMP | BPF_JNE | BPF_X) &&
+                insns[i + 1].dst_reg == BPF_REG_7 && insns[i + 1].src_reg == BPF_REG_1) {
+                saw_listener_port_direct_compare = true;
+            }
         }
     }
 
@@ -137,5 +142,6 @@ TEST(BpfLoaderTest, GeneratedProgramUsesConfiguredListenerPort) {
     EXPECT_TRUE(saw_ihl_shift);
     EXPECT_TRUE(saw_dynamic_tcp_offset);
     EXPECT_TRUE(saw_listener_port_load);
+    EXPECT_TRUE(saw_listener_port_direct_compare);
     EXPECT_FALSE(saw_hardcoded_tcp_offset);
 }
