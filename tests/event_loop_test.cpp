@@ -1,6 +1,7 @@
 #include <chrono>
 #include <future>
 #include <thread>
+#include <string>
 #include <unistd.h>
 
 #include <gtest/gtest.h>
@@ -70,4 +71,57 @@ TEST(EventLoopTest, EarlyStopIsHonoredBeforeRunStarts) {
 
     EXPECT_EQ(status, std::future_status::ready)
         << "run loop ignored a pre-start stop request";
+}
+
+
+TEST(EventLoopTest, ReadCallbackStillRunsWhenHangupArrivesWithBufferedData) {
+    inline_proxy::EventLoop loop;
+
+    int fds[2];
+    ASSERT_EQ(::pipe(fds), 0);
+    inline_proxy::ScopedFd read_fd(fds[0]);
+    inline_proxy::ScopedFd write_fd(fds[1]);
+
+    std::promise<void> read_seen;
+    std::string bytes;
+
+    auto handle = loop.Register(read_fd.get(), true, false,
+                                [&] {
+                                    char buffer[16] = {};
+                                    const ssize_t n = ::read(read_fd.get(), buffer, sizeof(buffer));
+                                    if (n > 0) {
+                                        bytes.append(buffer, buffer + n);
+                                        read_seen.set_value();
+                                        loop.Stop();
+                                    }
+                                },
+                                {},
+                                {});
+
+    const char payload[] = {'h', 'i'};
+    ASSERT_EQ(::write(write_fd.get(), payload, sizeof(payload)), static_cast<ssize_t>(sizeof(payload)));
+    write_fd.reset();
+
+    auto future = read_seen.get_future();
+    std::thread runner([&] { loop.Run(); });
+    ASSERT_EQ(future.wait_for(std::chrono::seconds(1)), std::future_status::ready)
+        << "read callback did not run when POLLHUP arrived with POLLIN";
+    runner.join();
+
+    EXPECT_EQ(bytes, "hi");
+    (void)handle;
+}
+
+TEST(EventLoopTest, LoopThreadIdentityClearsAfterRunReturns) {
+    inline_proxy::EventLoop loop;
+
+    std::thread stopper([&] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        loop.Stop();
+    });
+
+    loop.Run();
+    stopper.join();
+
+    EXPECT_FALSE(loop.IsInEventLoopThread());
 }

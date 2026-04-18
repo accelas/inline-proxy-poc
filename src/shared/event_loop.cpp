@@ -147,6 +147,14 @@ void EventLoop::Run() {
         loop_thread_ = std::this_thread::get_id();
     }
 
+    struct LoopThreadReset {
+        EventLoop* self;
+        ~LoopThreadReset() {
+            std::lock_guard lock(self->mutex_);
+            self->loop_thread_ = std::thread::id{};
+        }
+    } reset{this};
+
     while (!stop_requested_.load(std::memory_order_acquire)) {
         for (auto callback : TakeDeferred()) {
             if (callback) {
@@ -213,21 +221,30 @@ void EventLoop::Run() {
                 continue;
             }
 
-            if (revents & (POLLERR | POLLHUP | POLLNVAL)) {
-                if (registration->on_error) {
-                    registration->on_error(revents);
-                }
-                continue;
-            }
+            const bool want_read = registration->want_read && (revents & POLLIN);
+            const bool want_write = registration->want_write && (revents & POLLOUT);
+            const bool terminal = revents & (POLLERR | POLLHUP | POLLNVAL);
 
-            if ((revents & POLLIN) && registration->want_read && registration->on_read) {
+            if (want_read && registration->on_read) {
                 registration->on_read();
             }
             if (!registration->active) {
                 continue;
             }
-            if ((revents & POLLOUT) && registration->want_write && registration->on_write) {
+            if (want_write && registration->on_write) {
                 registration->on_write();
+            }
+            if (!registration->active) {
+                continue;
+            }
+            if (terminal && registration->on_error) {
+                registration->on_error(revents);
+            }
+            if (!registration->active) {
+                continue;
+            }
+            if ((revents & POLLNVAL) != 0) {
+                Remove(registration);
             }
         }
     }
