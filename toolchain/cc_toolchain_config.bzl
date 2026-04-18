@@ -381,6 +381,8 @@ def _impl(ctx):
             "/usr/include/x86_64-linux-gnu/c++/14",
             "/usr/include/c++/14/backward",
             "/usr/lib/gcc/x86_64-linux-gnu/14/include",
+            "/usr/lib/linux/uapi/x86",
+            "/usr/lib/linux/uapi/x86/asm",
             "/usr/local/include",
             "/usr/include/x86_64-linux-gnu",
             "/usr/include",

@@ -1,0 +1,7 @@
+exports_files(["BUILD.bazel"])
+
+cc_binary(
+    name = "proxy_daemon",
+    srcs = ["main.cpp"],
+    deps = ["//src/shared:core"],
+)

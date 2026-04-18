@@ -1,7 +1,7 @@
-"""Bazel module configuration for mango-PROJECT_NAME."""
+"""Bazel module configuration for the inline proxy PoC."""
 
 module(
-    name = "mango-PROJECT_NAME",
+    name = "inline_proxy_poc",
     version = "0.1.0",
 )
 
@@ -16,11 +16,15 @@ bazel_dep(name = "rules_pkg", version = "1.0.1")
 # Testing
 # ============================================================================
 
-bazel_dep(name = "googletest", version = "1.15.2")
+# The repo carries a tiny local gtest-compatible shim under third_party/ so the
+# layout regression test can run without pulling the full upstream dependency.
 
 # ============================================================================
 # Common Dependencies (uncomment as needed)
 # ============================================================================
+
+# Local placeholder support packages for the upcoming CNI and BPF work live
+# under third_party/yajl and third_party/libbpf.
 
 # Logging
 # bazel_dep(name = "spdlog", version = "1.15.3")

@@ -1,0 +1,10 @@
+package(default_visibility = ["//visibility:public"])
+
+exports_files(["BUILD.bazel"])
+
+cc_library(
+    name = "loader",
+    srcs = ["loader.cpp"],
+    hdrs = ["loader.hpp"],
+    deps = ["//src/shared:core"],
+)

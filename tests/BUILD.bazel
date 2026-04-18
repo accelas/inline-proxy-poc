@@ -1,8 +1,14 @@
 cc_test(
-    name = "lib_test",
-    srcs = ["lib_test.cpp"],
+    name = "project_layout_test",
+    srcs = ["project_layout_test.cpp"],
     deps = [
-        "//src:lib",
-        "@googletest//:gtest_main",
+        "//third_party/googletest:gtest_main",
+    ],
+    data = [
+        "//src/shared:BUILD.bazel",
+        "//src/proxy:BUILD.bazel",
+        "//src/cni:BUILD.bazel",
+        "//src/bpf:BUILD.bazel",
+        "//deploy:README.md",
     ],
 )

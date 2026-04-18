@@ -1,12 +1,2 @@
-cc_library(
-    name = "lib",
-    srcs = ["lib.c"],
-    hdrs = ["lib.h"],
-    visibility = ["//visibility:public"],
-)
-
-cc_binary(
-    name = "main",
-    srcs = ["main.c"],
-    deps = [":lib"],
-)
+# Source package root.
+# Concrete targets live in subpackages.

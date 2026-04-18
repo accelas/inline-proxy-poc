@@ -1,0 +1,7 @@
+exports_files(["BUILD.bazel"])
+
+cc_binary(
+    name = "inline_proxy_cni",
+    srcs = ["main.cpp"],
+    deps = ["//src/shared:core"],
+)

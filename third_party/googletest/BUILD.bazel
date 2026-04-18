@@ -1,0 +1,13 @@
+package(default_visibility = ["//visibility:public"])
+
+cc_library(
+    name = "gtest",
+    hdrs = ["include/gtest/gtest.h"],
+    includes = ["include"],
+)
+
+cc_library(
+    name = "gtest_main",
+    srcs = ["src/gtest_main.cc"],
+    deps = [":gtest"],
+)
