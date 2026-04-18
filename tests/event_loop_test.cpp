@@ -158,6 +158,83 @@ TEST(EventLoopTest, TerminalReadCallbackWithoutErrorDoesNotSpin) {
     (void)handle;
 }
 
+TEST(EventLoopTest, StopBeforeDispatchSkipsOtherReadyFdsAfterWakeupDrain) {
+    inline_proxy::EventLoop loop;
+
+    int fds[2];
+    ASSERT_EQ(::pipe(fds), 0);
+    inline_proxy::ScopedFd read_fd(fds[0]);
+    inline_proxy::ScopedFd write_fd(fds[1]);
+
+    std::atomic<int> read_hits{0};
+    std::promise<void> stop_requested;
+    auto stop_requested_future = stop_requested.get_future();
+
+    auto handle = loop.Register(read_fd.get(), true, false,
+                                [&] {
+                                    ++read_hits;
+                                    char buffer[16] = {};
+                                    const ssize_t n = ::read(read_fd.get(), buffer, sizeof(buffer));
+                                    (void)n;
+                                },
+                                {},
+                                {});
+
+    std::thread runner([&] { loop.Run(); });
+
+    std::thread stopper([&] {
+        const char payload[] = {'o', 'k'};
+        ASSERT_EQ(::write(write_fd.get(), payload, sizeof(payload)), static_cast<ssize_t>(sizeof(payload)));
+        stop_requested.set_value();
+        loop.Stop();
+        for (int i = 0; i < 2000; ++i) {
+            handle->Update(true, false);
+        }
+    });
+
+    ASSERT_EQ(stop_requested_future.wait_for(std::chrono::seconds(1)), std::future_status::ready)
+        << "stop thread did not reach loop.Stop()";
+    stopper.join();
+    runner.join();
+
+    EXPECT_EQ(read_hits.load(std::memory_order_relaxed), 0)
+        << "ready fd was dispatched after stop had already been requested";
+    (void)handle;
+}
+
+TEST(EventLoopTest, DestructorDoesNotSelfDeadlockOnEventLoopThread) {
+    std::promise<void> deleted;
+    auto deleted_future = deleted.get_future();
+    std::thread runner([&] {
+        auto* loop = new inline_proxy::EventLoop();
+        int fds[2];
+        ASSERT_EQ(::pipe(fds), 0);
+        inline_proxy::ScopedFd read_fd(fds[0]);
+        inline_proxy::ScopedFd write_fd(fds[1]);
+
+        auto handle = loop->Register(read_fd.get(), true, false,
+                                     [&, loop] {
+                                         char buffer[16] = {};
+                                         const ssize_t n = ::read(read_fd.get(), buffer, sizeof(buffer));
+                                         (void)n;
+                                         delete loop;
+                                         deleted.set_value();
+                                     },
+                                     {},
+                                     {});
+
+        const char payload[] = {'x'};
+        ASSERT_EQ(::write(write_fd.get(), payload, sizeof(payload)), static_cast<ssize_t>(sizeof(payload)));
+        loop->Run();
+        (void)handle;
+    });
+
+    ASSERT_EQ(deleted_future.wait_for(std::chrono::seconds(1)), std::future_status::ready)
+        << "event-loop-thread destructor deadlocked";
+    runner.join();
+}
+
+
 TEST(EventLoopTest, DestructorWaitsForInFlightRunToExit) {
     auto* loop = new inline_proxy::EventLoop();
 

@@ -248,11 +248,14 @@ EventLoop::~EventLoop() {
         return;
     }
 
+    const bool self_destruct = IsInEventLoopThread();
     Stop();
 
-    {
-        std::unique_lock lock(state->mutex);
-        state->run_cv.wait(lock, [&state] { return !state->run_active; });
+    if (!self_destruct) {
+        {
+            std::unique_lock lock(state->mutex);
+            state->run_cv.wait(lock, [&state] { return !state->run_active; });
+        }
     }
 
     state->alive.store(false, std::memory_order_release);
@@ -405,6 +408,10 @@ void EventLoop::Run() {
 
         if (pollfds[0].revents != 0) {
             state->DrainWakeup();
+        }
+
+        if (state->stop_requested.load(std::memory_order_acquire)) {
+            continue;
         }
 
         for (std::size_t i = 0; i < registrations.size(); ++i) {
