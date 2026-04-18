@@ -1,8 +1,9 @@
+#include <atomic>
 #include <chrono>
-#include <limits>
 #include <future>
-#include <thread>
+#include <limits>
 #include <string>
+#include <thread>
 #include <sys/socket.h>
 #include <vector>
 #include <unistd.h>
@@ -114,6 +115,99 @@ TEST(EventLoopTest, ReadCallbackStillRunsWhenHangupArrivesWithBufferedData) {
     EXPECT_EQ(bytes, "hi");
     (void)handle;
 }
+
+TEST(EventLoopTest, TerminalReadCallbackWithoutErrorDoesNotSpin) {
+    inline_proxy::EventLoop loop;
+
+    int fds[2];
+    ASSERT_EQ(::pipe(fds), 0);
+    inline_proxy::ScopedFd read_fd(fds[0]);
+    inline_proxy::ScopedFd write_fd(fds[1]);
+
+    std::promise<void> first_read_seen;
+    auto first_read_future = first_read_seen.get_future();
+    std::atomic<int> read_hits{0};
+
+    auto handle = loop.Register(read_fd.get(), true, false,
+                                [&] {
+                                    const int hits = read_hits.fetch_add(1, std::memory_order_relaxed) + 1;
+                                    char buffer[16] = {};
+                                    const ssize_t n = ::read(read_fd.get(), buffer, sizeof(buffer));
+                                    (void)n;
+                                    if (hits == 1) {
+                                        first_read_seen.set_value();
+                                    }
+                                },
+                                {},
+                                {});
+
+    const char payload[] = {'h', 'i'};
+    ASSERT_EQ(::write(write_fd.get(), payload, sizeof(payload)), static_cast<ssize_t>(sizeof(payload)));
+    write_fd.reset();
+
+    std::thread runner([&] { loop.Run(); });
+    ASSERT_EQ(first_read_future.wait_for(std::chrono::seconds(1)), std::future_status::ready)
+        << "initial read callback did not run";
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    EXPECT_EQ(read_hits.load(std::memory_order_relaxed), 1)
+        << "terminal registration kept spinning after final read";
+
+    loop.Stop();
+    runner.join();
+    (void)handle;
+}
+
+TEST(EventLoopTest, DestructorWaitsForInFlightRunToExit) {
+    auto* loop = new inline_proxy::EventLoop();
+
+    int fds[2];
+    ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM, 0, fds), 0);
+    inline_proxy::ScopedFd read_fd(fds[0]);
+    inline_proxy::ScopedFd write_fd(fds[1]);
+
+    std::promise<void> callback_entered;
+    auto callback_entered_future = callback_entered.get_future();
+    std::promise<void> release_callback;
+    auto release_callback_future = release_callback.get_future().share();
+
+    auto handle = loop->Register(read_fd.get(), true, false,
+                                 [&] {
+                                     char buffer[1];
+                                     (void)::read(read_fd.get(), buffer, sizeof(buffer));
+                                     callback_entered.set_value();
+                                     release_callback_future.wait();
+                                 },
+                                 {},
+                                 {});
+
+    const char byte = 'x';
+    ASSERT_EQ(::write(write_fd.get(), &byte, 1), 1);
+
+    std::thread runner([&] { loop->Run(); });
+    ASSERT_EQ(callback_entered_future.wait_for(std::chrono::seconds(1)), std::future_status::ready)
+        << "event loop callback did not start";
+
+    std::promise<void> delete_done;
+    auto delete_done_future = delete_done.get_future();
+    std::thread deleter([&] {
+        delete loop;
+        delete_done.set_value();
+    });
+
+    EXPECT_EQ(delete_done_future.wait_for(std::chrono::milliseconds(50)), std::future_status::timeout)
+        << "destructor returned before the in-flight Run() exited";
+
+    release_callback.set_value();
+
+    ASSERT_EQ(delete_done_future.wait_for(std::chrono::seconds(1)), std::future_status::ready)
+        << "destructor did not finish after the callback was released";
+
+    deleter.join();
+    runner.join();
+    (void)handle;
+}
+
 
 TEST(EventLoopTest, LoopThreadIdentityClearsAfterRunReturns) {
     inline_proxy::EventLoop loop;

@@ -3,10 +3,10 @@
 #include <algorithm>
 #include <cerrno>
 #include <cstdint>
+#include <condition_variable>
 #include <fcntl.h>
-#include <poll.h>
 #include <limits>
-#include <stdexcept>
+#include <poll.h>
 #include <system_error>
 #include <unistd.h>
 
@@ -68,6 +68,7 @@ void EventLoop::State::Remove(const std::shared_ptr<Registration>& registration)
         return;
     }
 
+    bool removed = false;
     {
         std::lock_guard lock(mutex);
         auto it = registrations.find(registration->fd);
@@ -76,9 +77,13 @@ void EventLoop::State::Remove(const std::shared_ptr<Registration>& registration)
                 it->second->active.store(false, std::memory_order_release);
             }
             registrations.erase(it);
+            removed = true;
         }
     }
-    Wake();
+
+    if (removed) {
+        Wake();
+    }
 }
 
 void EventLoop::State::Update(const std::shared_ptr<Registration>& registration,
@@ -88,20 +93,27 @@ void EventLoop::State::Update(const std::shared_ptr<Registration>& registration,
         return;
     }
 
-    std::lock_guard lock(mutex);
-    auto it = registrations.find(registration->fd);
-    if (it == registrations.end() || it->second != registration || !it->second) {
-        return;
+    bool updated = false;
+    {
+        std::lock_guard lock(mutex);
+        auto it = registrations.find(registration->fd);
+        if (it != registrations.end() && it->second == registration && it->second) {
+            it->second->want_read.store(want_read, std::memory_order_release);
+            it->second->want_write.store(want_write, std::memory_order_release);
+            updated = true;
+        }
     }
-    it->second->want_read.store(want_read, std::memory_order_release);
-    it->second->want_write.store(want_write, std::memory_order_release);
-    Wake();
+
+    if (updated) {
+        Wake();
+    }
 }
 
 void EventLoop::State::Wake() {
     if (!alive.load(std::memory_order_acquire) || wakeup_write_fd < 0) {
         return;
     }
+
     const std::uint8_t byte = 1;
     while (true) {
         const ssize_t written = ::write(wakeup_write_fd, &byte, sizeof(byte));
@@ -122,6 +134,7 @@ void EventLoop::State::DrainWakeup() {
     if (wakeup_read_fd < 0) {
         return;
     }
+
     std::uint8_t buffer[64];
     while (true) {
         const ssize_t read_bytes = ::read(wakeup_read_fd, buffer, sizeof(buffer));
@@ -155,17 +168,19 @@ std::vector<EventLoop::Callback> EventLoop::State::TakeDueTimers() {
     const auto now = std::chrono::steady_clock::now();
     std::vector<Callback> callbacks;
 
+    auto timer_heap_less = [](const Timer& lhs, const Timer& rhs) {
+        if (lhs.due != rhs.due) {
+            return lhs.due > rhs.due;
+        }
+        return lhs.id > rhs.id;
+    };
+
     std::lock_guard lock(mutex);
     while (!timers.empty() && callbacks.size() < kMaxDrainCallbacks) {
         if (timers.front().due > now) {
             break;
         }
-        std::pop_heap(timers.begin(), timers.end(), [](const Timer& lhs, const Timer& rhs) {
-            if (lhs.due != rhs.due) {
-                return lhs.due > rhs.due;
-            }
-            return lhs.id > rhs.id;
-        });
+        std::pop_heap(timers.begin(), timers.end(), timer_heap_less);
         auto timer = std::move(timers.back());
         timers.pop_back();
         if (timer.callback) {
@@ -190,6 +205,7 @@ int EventLoop::State::ComputeTimeoutMillis() const {
     if (earliest.due <= now) {
         return 0;
     }
+
     const auto delta = std::chrono::duration_cast<std::chrono::milliseconds>(earliest.due - now);
     if (delta.count() > static_cast<std::chrono::milliseconds::rep>(std::numeric_limits<int>::max())) {
         return std::numeric_limits<int>::max();
@@ -227,11 +243,20 @@ EventLoop::EventLoop() : state_(std::make_shared<State>()) {
 }
 
 EventLoop::~EventLoop() {
-    Stop();
-    if (state_) {
-        state_->alive.store(false, std::memory_order_release);
-        state_.reset();
+    auto state = state_;
+    if (!state) {
+        return;
     }
+
+    Stop();
+
+    {
+        std::unique_lock lock(state->mutex);
+        state->run_cv.wait(lock, [&state] { return !state->run_active; });
+    }
+
+    state->alive.store(false, std::memory_order_release);
+    state_.reset();
 }
 
 std::unique_ptr<EventLoop::Handle> EventLoop::Register(
@@ -277,65 +302,78 @@ void EventLoop::Schedule(std::chrono::milliseconds delay, Callback fn) {
             .id = state_->next_timer_id++,
             .callback = std::move(fn),
         });
-        std::push_heap(state_->timers.begin(), state_->timers.end(), [](const Timer& lhs, const Timer& rhs) {
+        auto timer_heap_less = [](const Timer& lhs, const Timer& rhs) {
             if (lhs.due != rhs.due) {
                 return lhs.due > rhs.due;
             }
             return lhs.id > rhs.id;
-        });
+        };
+        std::push_heap(state_->timers.begin(), state_->timers.end(), timer_heap_less);
     }
     state_->Wake();
 }
 
 void EventLoop::Run() {
-    {
-        std::lock_guard lock(state_->mutex);
-        if (state_->stop_requested.load(std::memory_order_acquire)) {
-            return;
-        }
-        state_->loop_thread = std::this_thread::get_id();
+    auto state = state_;
+    if (!state) {
+        return;
     }
 
-    struct LoopThreadReset {
-        State& state;
-        ~LoopThreadReset() {
-            std::lock_guard lock(state.mutex);
-            state.loop_thread = std::thread::id{};
+    {
+        std::lock_guard lock(state->mutex);
+        if (state->stop_requested.load(std::memory_order_acquire)) {
+            return;
         }
-    } reset{*state_};
+        state->loop_thread = std::this_thread::get_id();
+        state->run_active = true;
+    }
 
-    while (!state_->stop_requested.load(std::memory_order_acquire)) {
-        for (auto callback : state_->TakeDeferred()) {
-            if (callback) {
-                callback();
-                if (state_->stop_requested.load(std::memory_order_acquire)) {
-                    break;
-                }
+    struct RunReset {
+        std::shared_ptr<State> state;
+        ~RunReset() {
+            {
+                std::lock_guard lock(state->mutex);
+                state->run_active = false;
+                state->loop_thread = std::thread::id{};
+            }
+            state->run_cv.notify_all();
+        }
+    } reset{state};
+
+    while (!state->stop_requested.load(std::memory_order_acquire)) {
+        for (auto callback : state->TakeDeferred()) {
+            if (!callback) {
+                continue;
+            }
+            callback();
+            if (state->stop_requested.load(std::memory_order_acquire)) {
+                break;
             }
         }
 
-        if (state_->stop_requested.load(std::memory_order_acquire)) {
+        if (state->stop_requested.load(std::memory_order_acquire)) {
             break;
         }
 
-        for (auto callback : state_->TakeDueTimers()) {
-            if (callback) {
-                callback();
-                if (state_->stop_requested.load(std::memory_order_acquire)) {
-                    break;
-                }
+        for (auto callback : state->TakeDueTimers()) {
+            if (!callback) {
+                continue;
+            }
+            callback();
+            if (state->stop_requested.load(std::memory_order_acquire)) {
+                break;
             }
         }
 
-        if (state_->stop_requested.load(std::memory_order_acquire)) {
+        if (state->stop_requested.load(std::memory_order_acquire)) {
             break;
         }
 
         std::vector<std::shared_ptr<Registration>> registrations;
         {
-            std::lock_guard lock(state_->mutex);
-            registrations.reserve(state_->registrations.size());
-            for (const auto& entry : state_->registrations) {
+            std::lock_guard lock(state->mutex);
+            registrations.reserve(state->registrations.size());
+            for (const auto& entry : state->registrations) {
                 if (entry.second && entry.second->active.load(std::memory_order_acquire)) {
                     registrations.push_back(entry.second);
                 }
@@ -344,20 +382,20 @@ void EventLoop::Run() {
 
         std::vector<pollfd> pollfds;
         pollfds.reserve(registrations.size() + 1);
-        pollfds.push_back(pollfd{.fd = state_->wakeup_read_fd, .events = POLLIN, .revents = 0});
+        pollfds.push_back(pollfd{.fd = state->wakeup_read_fd, .events = POLLIN, .revents = 0});
         for (const auto& registration : registrations) {
             short events = 0;
-            if (registration->want_read) {
+            if (registration->want_read.load(std::memory_order_acquire)) {
                 events |= POLLIN;
             }
-            if (registration->want_write) {
+            if (registration->want_write.load(std::memory_order_acquire)) {
                 events |= POLLOUT;
             }
             pollfds.push_back(pollfd{.fd = registration->fd, .events = events, .revents = 0});
         }
 
-        const int timeout_ms = state_->ComputeTimeoutMillis();
-        int rc = ::poll(pollfds.data(), static_cast<nfds_t>(pollfds.size()), timeout_ms);
+        const int timeout_ms = state->ComputeTimeoutMillis();
+        const int rc = ::poll(pollfds.data(), static_cast<nfds_t>(pollfds.size()), timeout_ms);
         if (rc < 0) {
             if (errno == EINTR) {
                 continue;
@@ -366,7 +404,7 @@ void EventLoop::Run() {
         }
 
         if (pollfds[0].revents != 0) {
-            state_->DrainWakeup();
+            state->DrainWakeup();
         }
 
         for (std::size_t i = 0; i < registrations.size(); ++i) {
@@ -380,37 +418,39 @@ void EventLoop::Run() {
                 continue;
             }
 
-            const bool terminal = revents & (POLLERR | POLLHUP | POLLNVAL);
+            const bool terminal = (revents & (POLLERR | POLLHUP | POLLNVAL)) != 0;
+            bool should_stop = false;
 
-            if ((revents & POLLIN) && registration->want_read.load(std::memory_order_acquire) && registration->on_read) {
+            if ((revents & POLLIN) != 0 &&
+                registration->want_read.load(std::memory_order_acquire) &&
+                registration->on_read) {
                 registration->on_read();
-                if (state_->stop_requested.load(std::memory_order_acquire)) {
-                    break;
-                }
+                should_stop = state->stop_requested.load(std::memory_order_acquire);
             }
-            if (!registration->active.load(std::memory_order_acquire) || state_->stop_requested.load(std::memory_order_acquire)) {
-                continue;
-            }
-            if ((revents & POLLOUT) && registration->want_write.load(std::memory_order_acquire) && registration->on_write) {
+
+            if (!should_stop &&
+                registration->active.load(std::memory_order_acquire) &&
+                (revents & POLLOUT) != 0 &&
+                registration->want_write.load(std::memory_order_acquire) &&
+                registration->on_write) {
                 registration->on_write();
-                if (state_->stop_requested.load(std::memory_order_acquire)) {
-                    break;
-                }
+                should_stop = state->stop_requested.load(std::memory_order_acquire);
             }
-            if (!registration->active.load(std::memory_order_acquire) || state_->stop_requested.load(std::memory_order_acquire)) {
-                continue;
-            }
-            if (terminal && registration->on_error) {
+
+            if (!should_stop &&
+                registration->active.load(std::memory_order_acquire) &&
+                terminal &&
+                registration->on_error) {
                 registration->on_error(revents);
-                if (state_->stop_requested.load(std::memory_order_acquire)) {
-                    break;
-                }
+                should_stop = state->stop_requested.load(std::memory_order_acquire);
             }
-            if (!registration->active.load(std::memory_order_acquire) || state_->stop_requested.load(std::memory_order_acquire)) {
-                continue;
+
+            if (terminal && registration->active.load(std::memory_order_acquire)) {
+                state->Remove(registration);
             }
-            if ((revents & POLLNVAL) != 0) {
-                state_->Remove(registration);
+
+            if (should_stop) {
+                break;
             }
         }
     }

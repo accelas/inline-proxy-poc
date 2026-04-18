@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <condition_variable>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -75,6 +76,8 @@ private:
         std::atomic<bool> stop_requested{false};
         std::atomic<bool> alive{true};
         std::thread::id loop_thread;
+        std::condition_variable run_cv;
+        bool run_active = false;
 
         ~State();
 
