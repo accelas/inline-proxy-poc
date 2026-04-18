@@ -5,10 +5,14 @@
 #include <string_view>
 #include <vector>
 
+#include "bpf/loader.hpp"
+
 namespace inline_proxy {
 
 class InterfaceRegistry {
 public:
+    void ConfigureIngressListener(int listener_fd);
+
     void RecordInterface(std::string_view name);
     void RemoveInterface(std::string_view name);
 
@@ -18,6 +22,7 @@ public:
     std::size_t active_sessions() const noexcept;
     const std::vector<std::string>& wan_interfaces() const noexcept;
     const std::vector<std::string>& lan_interfaces() const noexcept;
+    const BpfLoader& bpf_loader() const noexcept;
 
     std::string SummaryText() const;
 
@@ -31,6 +36,7 @@ private:
     std::vector<std::string> wan_interfaces_;
     std::vector<std::string> lan_interfaces_;
     std::size_t active_sessions_ = 0;
+    BpfLoader bpf_loader_;
 };
 
 }  // namespace inline_proxy

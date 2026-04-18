@@ -109,3 +109,12 @@ cc_test(
         "//src/shared:shared",
     ],
 )
+
+cc_test(
+    name = "bpf_loader_test",
+    srcs = ["bpf_loader_test.cpp"],
+    deps = [
+        "@googletest//:gtest_main",
+        "//src/bpf:loader",
+    ],
+)

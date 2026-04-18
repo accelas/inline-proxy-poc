@@ -429,6 +429,8 @@ int RunProxyDaemon(const ProxyConfig& cfg) {
         return 1;
     }
 
+    registry.ConfigureIngressListener(transparent_listener.fd());
+
     const std::string admin_interface_name = "lan_listener_" + std::to_string(cfg.admin_port);
     const std::string transparent_interface_name = "wan_listener_" + std::to_string(cfg.transparent_port);
     registry.RecordInterface(admin_interface_name);

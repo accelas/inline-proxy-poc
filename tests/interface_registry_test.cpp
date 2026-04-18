@@ -1,5 +1,7 @@
 #include <gtest/gtest.h>
 
+#include <sys/socket.h>
+#include <unistd.h>
 #include <string>
 
 #include "proxy/interface_registry.hpp"
@@ -23,4 +25,16 @@ TEST(InterfaceRegistryTest, TracksAndRemovesWanAndLanInterfaces) {
     registry.DecrementSessions();
 
     EXPECT_EQ(registry.SummaryText(), "wan_interfaces=none\nlan_interfaces=none\nactive_sessions=0\n");
+}
+
+TEST(InterfaceRegistryTest, ConfiguresIngressListenerOnLoader) {
+    inline_proxy::InterfaceRegistry registry;
+
+    const int listener_fd = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    ASSERT_GE(listener_fd, 0);
+
+    registry.ConfigureIngressListener(listener_fd);
+    EXPECT_EQ(registry.bpf_loader().listener_socket_fd(), listener_fd);
+
+    ::close(listener_fd);
 }

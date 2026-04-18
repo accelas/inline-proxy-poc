@@ -1,10 +1,19 @@
 package(default_visibility = ["//visibility:public"])
 
-exports_files(["BUILD.bazel"])
+exports_files([
+    "BUILD.bazel",
+    "ingress_redirect.bpf.c",
+])
 
 cc_library(
     name = "loader",
     srcs = ["loader.cpp"],
     hdrs = ["loader.hpp"],
-    deps = ["//src/shared:core"],
+    deps = ["//src/shared:shared"],
+    include_prefix = "bpf",
+)
+
+filegroup(
+    name = "ingress_redirect_bpf",
+    srcs = ["ingress_redirect.bpf.c"],
 )

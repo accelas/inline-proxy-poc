@@ -23,6 +23,7 @@ cc_library(
         "transparent_socket.hpp",
     ],
     deps = [
+        "//src/bpf:loader",
         "//src/shared:shared",
     ],
     include_prefix = "proxy",

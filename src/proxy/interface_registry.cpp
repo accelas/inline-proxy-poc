@@ -4,6 +4,10 @@
 #include <string>
 
 namespace inline_proxy {
+void InterfaceRegistry::ConfigureIngressListener(int listener_fd) {
+    bpf_loader_.ConfigureListenerSocket(listener_fd);
+}
+
 bool InterfaceRegistry::HasPrefix(std::string_view name, std::string_view prefix) {
     return name.size() >= prefix.size() && name.substr(0, prefix.size()) == prefix;
 }
@@ -42,6 +46,7 @@ void InterfaceRegistry::AppendList(std::string& out,
 void InterfaceRegistry::RecordInterface(std::string_view name) {
     if (HasPrefix(name, "wan_")) {
         AppendUnique(wan_interfaces_, name);
+        bpf_loader_.AttachIngress(name);
         return;
     }
     if (HasPrefix(name, "lan_")) {
@@ -61,6 +66,7 @@ void InterfaceRegistry::RemoveInterface(std::string_view name) {
 
     if (HasPrefix(name, "wan_")) {
         remove_from(wan_interfaces_);
+        bpf_loader_.DetachIngress(name);
         return;
     }
     if (HasPrefix(name, "lan_")) {
@@ -89,6 +95,10 @@ const std::vector<std::string>& InterfaceRegistry::wan_interfaces() const noexce
 
 const std::vector<std::string>& InterfaceRegistry::lan_interfaces() const noexcept {
     return lan_interfaces_;
+}
+
+const BpfLoader& InterfaceRegistry::bpf_loader() const noexcept {
+    return bpf_loader_;
 }
 
 std::string InterfaceRegistry::SummaryText() const {
