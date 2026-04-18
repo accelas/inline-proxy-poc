@@ -12,3 +12,12 @@ cc_test(
         "//deploy:README.md",
     ],
 )
+
+cc_test(
+    name = "shared_linux_test",
+    srcs = ["shared_linux_test.cpp"],
+    deps = [
+        "@googletest//:gtest_main",
+        "//src/shared:shared",
+    ],
+)

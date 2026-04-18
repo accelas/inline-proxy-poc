@@ -1,0 +1,15 @@
+#pragma once
+
+#include <optional>
+#include <string>
+
+namespace inline_proxy {
+
+std::optional<unsigned int> LinkIndex(const std::string& ifname) noexcept;
+bool SetLinkUp(const std::string& ifname, bool up = true);
+bool RenameLink(const std::string& ifname, const std::string& new_name);
+bool DeleteLink(const std::string& ifname);
+bool MoveLinkToNetns(const std::string& ifname, int netns_fd);
+bool CreateVethPair(const std::string& left_ifname, const std::string& right_ifname);
+
+}  // namespace inline_proxy

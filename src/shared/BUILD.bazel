@@ -3,6 +3,28 @@ package(default_visibility = ["//visibility:public"])
 exports_files(["BUILD.bazel"])
 
 cc_library(
+    name = "shared",
+    srcs = [
+        "netlink.cpp",
+        "netns.cpp",
+        "scoped_fd.cpp",
+        "sockaddr.cpp",
+        "state_store.cpp",
+    ],
+    hdrs = [
+        "core.hpp",
+        "netlink.hpp",
+        "netns.hpp",
+        "scoped_fd.hpp",
+        "sockaddr.hpp",
+        "state_store.hpp",
+    ],
+    include_prefix = "shared",
+)
+
+cc_library(
     name = "core",
     hdrs = ["core.hpp"],
+    deps = [":shared"],
+    include_prefix = "shared",
 )
