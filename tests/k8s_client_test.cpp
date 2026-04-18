@@ -1,10 +1,15 @@
 #include <atomic>
 #include <chrono>
 #include <cerrno>
+#include <cstdlib>
+#include <cstring>
+#include <dlfcn.h>
+#include <cstdio>
 #include <filesystem>
 #include <fstream>
 #include <future>
 #include <memory>
+#include <netdb.h>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -25,6 +30,131 @@
 #include <openssl/x509.h>
 
 #include "cni/k8s_client.hpp"
+
+namespace {
+
+std::atomic<bool> g_delay_localhost_dns{false};
+
+using RealGetAddrInfoFn = int (*)(const char*, const char*, const addrinfo*, addrinfo**);
+
+RealGetAddrInfoFn RealGetAddrInfo() {
+    static const RealGetAddrInfoFn fn = []() -> RealGetAddrInfoFn {
+        dlerror();
+        void* symbol = dlsym(RTLD_NEXT, "getaddrinfo");
+        if (!symbol) {
+            std::fprintf(stderr, "failed to resolve real getaddrinfo: %s\n", dlerror());
+            std::abort();
+        }
+        return reinterpret_cast<RealGetAddrInfoFn>(symbol);
+    }();
+    return fn;
+}
+
+int ParsePort(const char* service, uint16_t* port) {
+    if (!service || *service == '\0') {
+        return 0;
+    }
+    char* end = nullptr;
+    const long parsed = std::strtol(service, &end, 10);
+    if (!end || *end != '\0' || parsed < 0 || parsed > 65535) {
+        return EAI_SERVICE;
+    }
+    *port = static_cast<uint16_t>(parsed);
+    return 0;
+}
+
+addrinfo* MakeAddrInfoNode(int family, uint16_t port, const addrinfo* hints) {
+    auto* node = static_cast<addrinfo*>(std::calloc(1, sizeof(addrinfo)));
+    if (!node) {
+        return nullptr;
+    }
+
+    node->ai_family = family;
+    node->ai_socktype = hints ? hints->ai_socktype : SOCK_STREAM;
+    node->ai_protocol = hints ? hints->ai_protocol : 0;
+
+    if (family == AF_INET6) {
+        auto* address = static_cast<sockaddr_in6*>(std::calloc(1, sizeof(sockaddr_in6)));
+        if (!address) {
+            std::free(node);
+            return nullptr;
+        }
+        address->sin6_family = AF_INET6;
+        address->sin6_port = htons(port);
+        if (::inet_pton(AF_INET6, "::1", &address->sin6_addr) != 1) {
+            std::free(address);
+            std::free(node);
+            return nullptr;
+        }
+        node->ai_addrlen = sizeof(sockaddr_in6);
+        node->ai_addr = reinterpret_cast<sockaddr*>(address);
+    } else {
+        auto* address = static_cast<sockaddr_in*>(std::calloc(1, sizeof(sockaddr_in)));
+        if (!address) {
+            std::free(node);
+            return nullptr;
+        }
+        address->sin_family = AF_INET;
+        address->sin_port = htons(port);
+        if (::inet_pton(AF_INET, "127.0.0.1", &address->sin_addr) != 1) {
+            std::free(address);
+            std::free(node);
+            return nullptr;
+        }
+        node->ai_addrlen = sizeof(sockaddr_in);
+        node->ai_addr = reinterpret_cast<sockaddr*>(address);
+    }
+
+    return node;
+}
+
+int ResolveLocalhostForTests(const char* service, const addrinfo* hints, addrinfo** res) {
+    *res = nullptr;
+
+    uint16_t port = 0;
+    const int port_rc = ParsePort(service, &port);
+    if (port_rc != 0) {
+        return port_rc;
+    }
+
+    const bool want_v6 = !hints || hints->ai_family == AF_UNSPEC || hints->ai_family == AF_INET6;
+    const bool want_v4 = !hints || hints->ai_family == AF_UNSPEC || hints->ai_family == AF_INET;
+
+    addrinfo* head = nullptr;
+    addrinfo** tail = &head;
+
+    if (want_v6) {
+        *tail = MakeAddrInfoNode(AF_INET6, port, hints);
+        if (!*tail) {
+            ::freeaddrinfo(head);
+            return EAI_MEMORY;
+        }
+        tail = &((*tail)->ai_next);
+    }
+
+    if (want_v4) {
+        *tail = MakeAddrInfoNode(AF_INET, port, hints);
+        if (!*tail) {
+            ::freeaddrinfo(head);
+            return EAI_MEMORY;
+        }
+    }
+
+    *res = head;
+    return 0;
+}
+
+}  // namespace
+
+extern "C" int getaddrinfo(const char* node, const char* service, const struct addrinfo* hints, struct addrinfo** res) {
+    if (node && std::strcmp(node, "localhost") == 0) {
+        if (g_delay_localhost_dns.load(std::memory_order_relaxed)) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(250));
+        }
+        return ResolveLocalhostForTests(service, hints, res);
+    }
+    return RealGetAddrInfo()(node, service, hints, res);
+}
 
 namespace {
 
@@ -477,6 +607,32 @@ TEST(K8sClientTest, EnforcesSingleTimeoutBudgetAcrossResolvedAddresses) {
     auto bundle = CreateTempCertBundle();
     WritePemFiles(bundle);
     BackloggedDualStackServer server;
+
+    inline_proxy::K8sClientOptions options;
+    options.api_server_host = "localhost";
+    options.api_server_port = std::to_string(server.port());
+    options.token_path = bundle.token_path;
+    options.ca_path = bundle.cert_path;
+    options.timeout = std::chrono::milliseconds(100);
+
+    const inline_proxy::K8sQuery query{.namespace_name = "inline-proxy-system", .pod_name = "proxy-1"};
+
+    const auto start = std::chrono::steady_clock::now();
+    EXPECT_THROW((inline_proxy::FetchPodInfo(query, options)), std::runtime_error);
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start);
+    EXPECT_LT(elapsed.count(), 160) << "elapsed=" << elapsed.count() << "ms";
+}
+
+TEST(K8sClientTest, TimesOutAcrossDnsResolutionAndRequestPhases) {
+    auto bundle = CreateTempCertBundle();
+    WritePemFiles(bundle);
+    StallingTlsServer server(bundle);
+
+    struct DnsDelayGuard {
+        ~DnsDelayGuard() { g_delay_localhost_dns.store(false, std::memory_order_relaxed); }
+    } guard;
+
+    g_delay_localhost_dns.store(true, std::memory_order_relaxed);
 
     inline_proxy::K8sClientOptions options;
     options.api_server_host = "localhost";

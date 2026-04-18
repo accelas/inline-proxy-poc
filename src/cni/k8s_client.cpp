@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cerrno>
+#include <condition_variable>
 #include <fstream>
 #include <mutex>
 #include <memory>
@@ -17,6 +18,7 @@
 #include <stdexcept>
 #include <string>
 #include <utility>
+#include <thread>
 
 #include <nlohmann/json.hpp>
 
@@ -117,6 +119,75 @@ std::string BuildHttpRequest(const K8sClientOptions& options, const K8sQuery& qu
 
 bool IsTimeoutErrno(int error) {
     return error == EAGAIN || error == EWOULDBLOCK || error == ETIMEDOUT;
+}
+
+struct AddrInfoDeleter {
+    void operator()(addrinfo* results) const {
+        if (results) {
+            ::freeaddrinfo(results);
+        }
+    }
+};
+
+using UniqueAddrInfo = std::unique_ptr<addrinfo, AddrInfoDeleter>;
+
+struct ResolveState {
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool ready = false;
+    bool cancelled = false;
+    int rc = 0;
+    addrinfo* results = nullptr;
+};
+
+// getaddrinfo() is blocking, so resolve it on a helper thread and enforce the
+// same absolute deadline that governs connect, TLS, write, and read.
+UniqueAddrInfo ResolveHostWithDeadline(const std::string& host,
+                                       const std::string& port,
+                                       std::chrono::steady_clock::time_point deadline) {
+    addrinfo hints{};
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_family = AF_UNSPEC;
+
+    auto state = std::make_shared<ResolveState>();
+    std::thread resolver([state, host, port, hints]() mutable {
+        addrinfo* results = nullptr;
+        const int rc = ::getaddrinfo(host.c_str(), port.c_str(), &hints, &results);
+
+        std::unique_lock lock(state->mutex);
+        if (state->cancelled) {
+            lock.unlock();
+            if (results) {
+                ::freeaddrinfo(results);
+            }
+            return;
+        }
+
+        state->rc = rc;
+        state->results = results;
+        state->ready = true;
+        lock.unlock();
+        state->cv.notify_one();
+    });
+
+    std::unique_lock lock(state->mutex);
+    if (!state->cv.wait_until(lock, deadline, [&] { return state->ready; })) {
+        state->cancelled = true;
+        lock.unlock();
+        resolver.detach();
+        throw std::runtime_error("failed to connect to Kubernetes API server within timeout");
+    }
+
+    const int rc = state->rc;
+    addrinfo* results = state->results;
+    lock.unlock();
+    resolver.join();
+
+    if (rc != 0) {
+        throw std::runtime_error(std::string("getaddrinfo failed: ") + ::gai_strerror(rc));
+    }
+
+    return UniqueAddrInfo(results);
 }
 
 bool WaitForFd(int fd, short events, std::chrono::steady_clock::time_point deadline) {
@@ -231,20 +302,14 @@ std::string SslReadAllWithTimeout(SSL* ssl, int fd, std::chrono::steady_clock::t
     return response;
 }
 
-int ConnectTcp(const std::string& host, const std::string& port, std::chrono::milliseconds timeout) {
-    addrinfo hints{};
-    hints.ai_socktype = SOCK_STREAM;
-    hints.ai_family = AF_UNSPEC;
-
-    addrinfo* results = nullptr;
-    const int rc = ::getaddrinfo(host.c_str(), port.c_str(), &hints, &results);
-    if (rc != 0) {
-        throw std::runtime_error(std::string("getaddrinfo failed: ") + ::gai_strerror(rc));
+int ConnectTcp(const std::string& host, const std::string& port, std::chrono::steady_clock::time_point deadline) {
+    if (std::chrono::steady_clock::now() >= deadline) {
+        throw std::runtime_error("failed to connect to Kubernetes API server within timeout");
     }
 
-    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    const UniqueAddrInfo results = ResolveHostWithDeadline(host, port, deadline);
     int fd = -1;
-    for (addrinfo* it = results; it != nullptr; it = it->ai_next) {
+    for (addrinfo* it = results.get(); it != nullptr; it = it->ai_next) {
         if (std::chrono::steady_clock::now() >= deadline) {
             break;
         }
@@ -274,7 +339,6 @@ int ConnectTcp(const std::string& host, const std::string& port, std::chrono::mi
         }
         break;
     }
-    ::freeaddrinfo(results);
     if (fd < 0) {
         throw std::runtime_error("failed to connect to Kubernetes API server within timeout");
     }
@@ -315,7 +379,8 @@ std::string PerformHttpsGet(const K8sClientOptions& options, const K8sQuery& que
         int fd_ = -1;
     };
 
-    const UniqueFd fd(ConnectTcp(options.api_server_host, options.api_server_port, options.timeout));
+    const auto deadline = std::chrono::steady_clock::now() + options.timeout;
+    const UniqueFd fd(ConnectTcp(options.api_server_host, options.api_server_port, deadline));
 
     std::unique_ptr<SSL_CTX, decltype(&SSL_CTX_free)> ctx(SSL_CTX_new(TLS_client_method()), &SSL_CTX_free);
     if (!ctx) {
@@ -340,7 +405,6 @@ std::string PerformHttpsGet(const K8sClientOptions& options, const K8sQuery& que
         throw std::runtime_error("failed to configure TLS hostname verification");
     }
 
-    const auto deadline = std::chrono::steady_clock::now() + options.timeout;
     SslConnectWithTimeout(ssl.get(), fd.get(), deadline);
 
     const std::string request = BuildHttpRequest(options, query, token);
