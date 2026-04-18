@@ -27,6 +27,8 @@
 #include "shared/scoped_fd.hpp"
 #include "shared/sockaddr.hpp"
 
+extern char** environ;
+
 namespace inline_proxy {
 namespace {
 
@@ -34,6 +36,7 @@ constexpr std::string_view kAdminPortEnv = "INLINE_PROXY_ADMIN_PORT";
 constexpr std::string_view kTransparentPortEnv = "INLINE_PROXY_TRANSPARENT_PORT";
 constexpr std::string_view kAdminPrefix = "--admin-port=";
 constexpr std::string_view kTransparentPrefix = "--transparent-port=";
+constexpr std::string_view kInlineProxyPrefix = "INLINE_PROXY_";
 
 AdminSendHook& AdminSendHookRef() {
     static AdminSendHook hook = nullptr;
@@ -106,6 +109,37 @@ void ApplyOverride(ProxyConfig& cfg, std::string_view name, std::string_view val
 void ApplyEnvOverrides(ProxyConfig& cfg, std::initializer_list<ProxyConfig::EnvOverride> env) {
     for (const auto& [name, value] : env) {
         ApplyOverride(cfg, name, value);
+    }
+}
+
+void ApplyProcessEnvOverrides(ProxyConfig& cfg, const CliParseResult& cli) {
+    for (char** env = environ; env != nullptr && *env != nullptr; ++env) {
+        std::string_view entry(*env);
+        const std::size_t eq = entry.find('=');
+        if (eq == std::string_view::npos) {
+            continue;
+        }
+
+        const std::string_view name = entry.substr(0, eq);
+        if (name.rfind(kInlineProxyPrefix, 0) != 0) {
+            continue;
+        }
+
+        if (name == kAdminPortEnv) {
+            if (!cli.admin_seen) {
+                cfg.admin_port = ParsePortOrThrow(entry.substr(eq + 1), kAdminPortEnv);
+            }
+            continue;
+        }
+
+        if (name == kTransparentPortEnv) {
+            if (!cli.transparent_seen) {
+                cfg.transparent_port = ParsePortOrThrow(entry.substr(eq + 1), kTransparentPortEnv);
+            }
+            continue;
+        }
+
+        throw std::invalid_argument(std::string("unknown env key: ") + std::string(name));
     }
 }
 
@@ -374,18 +408,7 @@ ProxyConfig ProxyConfig::FromEnv(std::initializer_list<EnvOverride> env) {
 ProxyConfig ProxyConfig::FromArgs(int argc, char** argv) {
     ProxyConfig cfg;
     const CliParseResult cli = ParseCliOverrides(cfg, argc, argv);
-
-    if (!cli.admin_seen) {
-        if (const char* value = std::getenv("INLINE_PROXY_ADMIN_PORT")) {
-            cfg.admin_port = ParsePortOrThrow(value, kAdminPortEnv);
-        }
-    }
-    if (!cli.transparent_seen) {
-        if (const char* value = std::getenv("INLINE_PROXY_TRANSPARENT_PORT")) {
-            cfg.transparent_port = ParsePortOrThrow(value, kTransparentPortEnv);
-        }
-    }
-
+    ApplyProcessEnvOverrides(cfg, cli);
     return cfg;
 }
 

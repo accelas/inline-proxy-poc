@@ -123,3 +123,14 @@ TEST(ProxyConfigTest, RejectsUnknownInjectedEnvKeys) {
                  }),
                  std::invalid_argument);
 }
+
+TEST(ProxyConfigTest, RejectsUnknownRuntimeEnvKeys) {
+    ScopedEnvVar unknown_env("INLINE_PROXY_EXTRA", "1");
+    ScopedEnvVar admin_env("INLINE_PROXY_ADMIN_PORT", nullptr);
+    ScopedEnvVar transparent_env("INLINE_PROXY_TRANSPARENT_PORT", nullptr);
+
+    char arg0[] = "proxy_daemon";
+    char* argv[] = {arg0};
+
+    EXPECT_THROW((void)inline_proxy::ProxyConfig::FromArgs(1, argv), std::invalid_argument);
+}
