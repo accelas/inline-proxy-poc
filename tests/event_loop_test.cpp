@@ -2,6 +2,7 @@
 #include <future>
 #include <thread>
 #include <string>
+#include <sys/socket.h>
 #include <vector>
 #include <unistd.h>
 
@@ -163,4 +164,63 @@ TEST(EventLoopTest, DueTimersRunInDeadlineOrder) {
     stopper.join();
 
     EXPECT_EQ(order, std::vector<int>({2, 1}));
+}
+
+
+TEST(EventLoopTest, DeferredCallbacksStopPreventsLaterDeferredCallbacks) {
+    inline_proxy::EventLoop loop;
+    std::vector<int> order;
+
+    loop.Defer([&] {
+        order.push_back(1);
+        loop.Stop();
+    });
+    loop.Defer([&] { order.push_back(2); });
+
+    loop.Run();
+
+    EXPECT_EQ(order, std::vector<int>({1}));
+}
+
+TEST(EventLoopTest, TimerCallbacksStopPreventsLaterTimerCallbacks) {
+    inline_proxy::EventLoop loop;
+    std::vector<int> order;
+
+    loop.Schedule(std::chrono::milliseconds(0), [&] {
+        order.push_back(1);
+        loop.Stop();
+    });
+    loop.Schedule(std::chrono::milliseconds(0), [&] { order.push_back(2); });
+
+    loop.Run();
+
+    EXPECT_EQ(order, std::vector<int>({1}));
+}
+
+TEST(EventLoopTest, PollCallbacksStopPreventsLaterPollCallbacksInSameCycle) {
+    inline_proxy::EventLoop loop;
+
+    int fds[2];
+    ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM, 0, fds), 0);
+    inline_proxy::ScopedFd a(fds[0]);
+    inline_proxy::ScopedFd b(fds[1]);
+
+    std::vector<int> order;
+    auto handle = loop.Register(a.get(), true, true,
+                                [&] {
+                                    char buffer[1];
+                                    (void)::read(a.get(), buffer, sizeof(buffer));
+                                    order.push_back(1);
+                                    loop.Stop();
+                                },
+                                [&] { order.push_back(2); },
+                                {});
+
+    const char byte = 'x';
+    ASSERT_EQ(::write(b.get(), &byte, 1), 1);
+
+    loop.Run();
+
+    EXPECT_EQ(order, std::vector<int>({1}));
+    (void)handle;
 }

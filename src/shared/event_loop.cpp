@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <fcntl.h>
 #include <poll.h>
+#include <limits>
 #include <stdexcept>
 #include <system_error>
 #include <unistd.h>
@@ -197,6 +198,9 @@ int EventLoop::State::ComputeTimeoutMillis() const {
         return 0;
     }
     const auto delta = std::chrono::duration_cast<std::chrono::milliseconds>(earliest.due - now);
+    if (delta.count() > static_cast<std::chrono::milliseconds::rep>(std::numeric_limits<int>::max())) {
+        return std::numeric_limits<int>::max();
+    }
     return static_cast<int>(std::max<std::chrono::milliseconds::rep>(0, delta.count()));
 }
 
@@ -311,12 +315,22 @@ void EventLoop::Run() {
         for (auto callback : state_->TakeDeferred()) {
             if (callback) {
                 callback();
+                if (state_->stop_requested.load(std::memory_order_acquire)) {
+                    break;
+                }
             }
+        }
+
+        if (state_->stop_requested.load(std::memory_order_acquire)) {
+            break;
         }
 
         for (auto callback : state_->TakeDueTimers()) {
             if (callback) {
                 callback();
+                if (state_->stop_requested.load(std::memory_order_acquire)) {
+                    break;
+                }
             }
         }
 
@@ -379,20 +393,29 @@ void EventLoop::Run() {
 
             if (want_read && registration->on_read) {
                 registration->on_read();
+                if (state_->stop_requested.load(std::memory_order_acquire)) {
+                    break;
+                }
             }
-            if (!registration->active) {
+            if (!registration->active || state_->stop_requested.load(std::memory_order_acquire)) {
                 continue;
             }
             if (want_write && registration->on_write) {
                 registration->on_write();
+                if (state_->stop_requested.load(std::memory_order_acquire)) {
+                    break;
+                }
             }
-            if (!registration->active) {
+            if (!registration->active || state_->stop_requested.load(std::memory_order_acquire)) {
                 continue;
             }
             if (terminal && registration->on_error) {
                 registration->on_error(revents);
+                if (state_->stop_requested.load(std::memory_order_acquire)) {
+                    break;
+                }
             }
-            if (!registration->active) {
+            if (!registration->active || state_->stop_requested.load(std::memory_order_acquire)) {
                 continue;
             }
             if ((revents & POLLNVAL) != 0) {
