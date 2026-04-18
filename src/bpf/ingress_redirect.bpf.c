@@ -92,7 +92,7 @@ int redirect_ingress(struct __sk_buff* skb) {
     if ((void*)(tcph + 1) > data_end) {
         return TC_ACT_OK;
     }
-    if (tcph->dest != (__be16)config->listener_port) {
+    if (__builtin_bswap16(tcph->dest) != (__u16)config->listener_port) {
         return TC_ACT_OK;
     }
 

@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include <cstdint>
+#include <linux/bpf.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -45,4 +46,21 @@ TEST(BpfLoaderTest, CapturesListenerPortFromConfiguredSocket) {
     EXPECT_EQ(loader.listener_port(), expected_port);
 
     ::close(listener_fd);
+}
+
+TEST(BpfLoaderTest, GeneratedProgramUsesConfiguredListenerPort) {
+    inline_proxy::BpfLoader loader;
+    const auto insns = loader.BuildIngressProgramForTesting();
+
+    bool saw_listener_port_load = false;
+    for (std::size_t i = 0; i + 5 < insns.size(); ++i) {
+        if (insns[i + 5].code == (BPF_JMP | BPF_CALL) && insns[i + 5].imm == 26 &&
+            insns[i + 1].code == (BPF_ALU64 | BPF_MOV | BPF_K) &&
+            insns[i + 1].dst_reg == BPF_REG_2 && insns[i + 1].imm == 36) {
+            saw_listener_port_load = true;
+            break;
+        }
+    }
+
+    EXPECT_TRUE(saw_listener_port_load);
 }

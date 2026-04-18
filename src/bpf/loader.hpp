@@ -5,6 +5,9 @@
 #include <set>
 #include <string>
 #include <string_view>
+#include <vector>
+
+#include <linux/bpf.h>
 
 #include "shared/scoped_fd.hpp"
 
@@ -28,6 +31,8 @@ public:
     std::uint32_t listener_port() const noexcept;
 
     bool IsIngressAttached(std::string_view interface_name) const;
+
+    std::vector<bpf_insn> BuildIngressProgramForTesting() const;
 
 private:
     std::set<std::string> attached_interfaces_;

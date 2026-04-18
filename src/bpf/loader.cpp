@@ -33,7 +33,9 @@ constexpr __u8 kCodeStMem = BPF_ST | BPF_MEM;
 constexpr __u8 kCodeMovImm = BPF_ALU64 | BPF_MOV | BPF_K;
 constexpr __u8 kCodeMovReg = BPF_ALU64 | BPF_MOV | BPF_X;
 constexpr __u8 kCodeAddImm = BPF_ALU64 | BPF_ADD | BPF_K;
+constexpr __u8 kCodeEndianFromBe = BPF_ALU | BPF_END | BPF_FROM_BE;
 constexpr __u8 kCodeJmpEq = BPF_JMP | BPF_JEQ | BPF_K;
+constexpr __u8 kCodeJmpNeReg = BPF_JMP | BPF_JNE | BPF_X;
 constexpr __u8 kCodeJmpNe = BPF_JMP | BPF_JNE | BPF_K;
 constexpr __u8 kCodeCall = BPF_JMP | BPF_CALL;
 constexpr __u8 kCodeExit = BPF_JMP | BPF_EXIT;
@@ -83,6 +85,10 @@ struct ProgramBuilder {
 
     std::size_t EmitJump(__u8 code, __u8 dst_reg, __s32 imm) {
         return Emit(MakeInsn(code, dst_reg, 0, 0, imm));
+    }
+
+    std::size_t EmitJumpReg(__u8 code, __u8 dst_reg, __u8 src_reg) {
+        return Emit(MakeInsn(code, dst_reg, src_reg, 0, 0));
     }
 
     std::size_t EmitCall(__s32 helper_id) {
@@ -140,9 +146,20 @@ std::vector<bpf_insn> BuildIngressProgram(int map_fd) {
     builder.Emit(MakeInsn(kCodeLdxMem | BPF_B, BPF_REG_7, BPF_REG_10, -12, 0));
     const std::size_t non_tcp_jump = builder.EmitJump(kCodeJmpNe, BPF_REG_7, static_cast<__s32>(kTcpProtocol));
 
-    builder.Emit(MakeInsn(kCodeLdxMem | BPF_W, BPF_REG_7, BPF_REG_6, 0, 0));
-    const std::size_t disabled_jump = builder.EmitJump(kCodeJmpEq, BPF_REG_7, 0);
+    builder.Emit(MakeInsn(kCodeMovReg, BPF_REG_1, BPF_REG_8, 0, 0));
+    builder.Emit(MakeInsn(kCodeMovImm, BPF_REG_2, 0, 0, 36));
+    builder.Emit(MakeInsn(kCodeMovReg, BPF_REG_3, BPF_REG_10, 0, 0));
+    builder.Emit(MakeInsn(kCodeAddImm, BPF_REG_3, 0, 0, -16));
+    builder.Emit(MakeInsn(kCodeMovImm, BPF_REG_4, 0, 0, 2));
+    builder.EmitCall(kHelperSkbLoadBytes);
+    const std::size_t tcp_port_load_failed_jump = builder.EmitJump(kCodeJmpNe, BPF_REG_0, 0);
 
+    builder.Emit(MakeInsn(kCodeLdxMem | BPF_H, BPF_REG_7, BPF_REG_10, -16, 0));
+    builder.Emit(MakeInsn(kCodeEndianFromBe, BPF_REG_7, 0, 0, 16));
+    builder.Emit(MakeInsn(kCodeLdxMem | BPF_H, BPF_REG_1, BPF_REG_6, 4, 0));
+    const std::size_t port_mismatch_jump = builder.EmitJumpReg(kCodeJmpNeReg, BPF_REG_7, BPF_REG_1);
+
+    builder.Emit(MakeInsn(kCodeMovReg, BPF_REG_1, BPF_REG_8, 0, 0));
     builder.Emit(MakeInsn(kCodeLdxMem | BPF_W, BPF_REG_1, BPF_REG_6, 8, 0));
     builder.Emit(MakeInsn(kCodeMovImm, BPF_REG_2, 0, 0, static_cast<__s32>(kIngressFlag)));
     builder.EmitCall(kHelperRedirect);
@@ -151,9 +168,10 @@ std::vector<bpf_insn> BuildIngressProgram(int map_fd) {
     builder.PatchJump(missing_config_jump, exit_index);
     builder.PatchJump(ethertype_load_failed_jump, exit_index);
     builder.PatchJump(ipproto_load_failed_jump, exit_index);
+    builder.PatchJump(tcp_port_load_failed_jump, exit_index);
     builder.PatchJump(non_ipv4_jump, exit_index);
     builder.PatchJump(non_tcp_jump, exit_index);
-    builder.PatchJump(disabled_jump, exit_index);
+    builder.PatchJump(port_mismatch_jump, exit_index);
 
     return builder.insns;
 }
@@ -443,7 +461,7 @@ bool BpfLoader::ConfigureListenerSocket(int listener_fd) {
     listener_socket_fd_ = listener_fd;
     listener_port_ = listener_port;
     runtime_config_.enabled = 1;
-    runtime_config_.listener_port = htons(static_cast<std::uint16_t>(listener_port));
+    runtime_config_.listener_port = listener_port;
     runtime_config_.redirect_ifindex = LinkIndex("lo").value_or(0);
 
     if (config_map_.valid() && !UpdateConfigMap(config_map_, runtime_config_)) {
@@ -459,6 +477,10 @@ std::optional<int> BpfLoader::listener_socket_fd() const noexcept {
 
 std::uint32_t BpfLoader::listener_port() const noexcept {
     return listener_port_;
+}
+
+std::vector<bpf_insn> BpfLoader::BuildIngressProgramForTesting() const {
+    return BuildIngressProgram(0);
 }
 
 bool BpfLoader::IsIngressAttached(std::string_view interface_name) const {
