@@ -98,7 +98,9 @@ void ApplyOverride(ProxyConfig& cfg, std::string_view name, std::string_view val
     }
     if (name == kTransparentPortEnv) {
         cfg.transparent_port = ParsePortOrThrow(value, kTransparentPortEnv);
+        return;
     }
+    throw std::invalid_argument(std::string("unknown env key: ") + std::string(name));
 }
 
 void ApplyEnvOverrides(ProxyConfig& cfg, std::initializer_list<ProxyConfig::EnvOverride> env) {
@@ -329,13 +331,9 @@ private:
     bool closed_ = false;
 };
 
-void PruneClosedSessions(std::list<std::shared_ptr<RelaySession>>& sessions,
-                         ProxyState& state,
-                         InterfaceRegistry& registry) {
+void PruneClosedSessions(std::list<std::shared_ptr<RelaySession>>& sessions) {
     for (auto it = sessions.begin(); it != sessions.end();) {
-        if (*it && (*it)->closed()) {
-            state.decrement_sessions();
-            registry.DecrementSessions();
+        if (!*it || (*it)->closed()) {
             it = sessions.erase(it);
             continue;
         }
@@ -423,7 +421,7 @@ int RunProxyDaemon(const ProxyConfig& cfg) {
 
     std::function<void()> sweep;
     sweep = [&] {
-        PruneClosedSessions(sessions, state, registry);
+        PruneClosedSessions(sessions);
         PruneClosedConnections(admin_connections);
         loop.Schedule(std::chrono::seconds(1), sweep);
     };
@@ -486,7 +484,15 @@ int RunProxyDaemon(const ProxyConfig& cfg) {
                     .client = GetPeer(accepted.get()),
                     .original_dst = GetSockName(accepted.get()),
                 };
-                auto session = CreateRelaySession(loop, std::move(accepted), endpoints);
+                auto session = CreateRelaySession(
+                    loop,
+                    std::move(accepted),
+                    endpoints,
+                    [&loop, &sessions, &state, &registry] {
+                        state.decrement_sessions();
+                        registry.DecrementSessions();
+                        loop.Defer([&sessions] { PruneClosedSessions(sessions); });
+                    });
                 if (!session) {
                     continue;
                 }

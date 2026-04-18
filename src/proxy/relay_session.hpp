@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <memory>
+#include <functional>
 #include <string>
 #include <sys/socket.h>
 
@@ -13,6 +14,7 @@ namespace inline_proxy {
 
 using SendHook = ssize_t (*)(int fd, const void* buffer, size_t length, int flags);
 using ShutdownHook = int (*)(int fd, int how);
+using CloseCallback = std::function<void()>;
 
 struct SessionEndpoints {
     sockaddr_storage client{};
@@ -31,7 +33,8 @@ public:
 
     static std::shared_ptr<RelaySession> Create(EventLoop& loop,
                                                 ScopedFd client_fd,
-                                                const SessionEndpoints& endpoints);
+                                                const SessionEndpoints& endpoints,
+                                                CloseCallback on_close = {});
 
 private:
     RelaySession(EventLoop& loop, ScopedFd client_fd, ScopedFd upstream_fd);
@@ -65,10 +68,12 @@ private:
     bool client_write_shutdown_ = false;
     bool upstream_write_shutdown_ = false;
     bool closed_ = false;
+    CloseCallback on_close_;
 };
 
 std::shared_ptr<RelaySession> CreateRelaySession(EventLoop& loop,
                                                  ScopedFd client_fd,
-                                                 const SessionEndpoints& endpoints);
+                                                 const SessionEndpoints& endpoints,
+                                                 CloseCallback on_close = {});
 
 }  // namespace inline_proxy

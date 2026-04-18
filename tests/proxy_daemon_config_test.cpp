@@ -115,3 +115,11 @@ TEST(ProxyConfigTest, RejectsUnknownCliFlags) {
 
     EXPECT_THROW((void)inline_proxy::ProxyConfig::FromArgs(2, argv), std::invalid_argument);
 }
+
+TEST(ProxyConfigTest, RejectsUnknownInjectedEnvKeys) {
+    EXPECT_THROW((void)inline_proxy::ProxyConfig::FromEnv({
+                     {"INLINE_PROXY_ADMIN_PORT", "18080"},
+                     {"INLINE_PROXY_EXTRA", "1"},
+                 }),
+                 std::invalid_argument);
+}

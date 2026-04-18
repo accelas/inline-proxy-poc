@@ -116,6 +116,19 @@ TEST(TransparentSocketTest, ListenerFailsWhenRequiredTransparentOptionCannotBeEn
     }
 }
 
+TEST(TransparentSocketTest, TransparentListenerIsNonBlocking) {
+    HookScope hooks;
+    g_fake_transparent_options = true;
+    inline_proxy::SetSetSockOptHookForTesting(TestSetSockOpt);
+
+    auto listener = inline_proxy::CreateTransparentListener("127.0.0.1", 0);
+    ASSERT_TRUE(listener.ok());
+
+    const int flags = ::fcntl(listener.fd(), F_GETFL, 0);
+    ASSERT_GE(flags, 0);
+    EXPECT_NE(flags & O_NONBLOCK, 0) << "transparent listener must be nonblocking";
+}
+
 TEST(TransparentSocketTest, AcceptedSocketHelpersReportPeerAndLocalAddresses) {
     HookScope hooks;
     g_fake_transparent_options = true;

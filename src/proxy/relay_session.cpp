@@ -83,7 +83,8 @@ bool RelaySession::closed() const noexcept {
 
 std::shared_ptr<RelaySession> RelaySession::Create(EventLoop& loop,
                                                    ScopedFd client_fd,
-                                                   const SessionEndpoints& endpoints) {
+                                                   const SessionEndpoints& endpoints,
+                                                   CloseCallback on_close) {
     if (!client_fd) {
         return {};
     }
@@ -100,6 +101,7 @@ std::shared_ptr<RelaySession> RelaySession::Create(EventLoop& loop,
     auto session = std::shared_ptr<RelaySession>(
         new RelaySession(loop, std::move(client_fd), std::move(upstream.fd)));
     session->upstream_connecting_ = upstream.connecting;
+    session->on_close_ = std::move(on_close);
     session->Arm();
     session->UpdateInterest();
     return session;
@@ -355,6 +357,10 @@ void RelaySession::Close() {
         return;
     }
     closed_ = true;
+    if (on_close_) {
+        on_close_();
+        on_close_ = {};
+    }
     if (client_handle_) {
         client_handle_.reset();
     }
@@ -367,8 +373,9 @@ void RelaySession::Close() {
 
 std::shared_ptr<RelaySession> CreateRelaySession(EventLoop& loop,
                                                  ScopedFd client_fd,
-                                                 const SessionEndpoints& endpoints) {
-    return RelaySession::Create(loop, std::move(client_fd), endpoints);
+                                                 const SessionEndpoints& endpoints,
+                                                 CloseCallback on_close) {
+    return RelaySession::Create(loop, std::move(client_fd), endpoints, std::move(on_close));
 }
 
 }  // namespace inline_proxy

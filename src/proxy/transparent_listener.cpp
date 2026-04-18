@@ -65,6 +65,10 @@ TransparentListener CreateTransparentListener(const std::string& address, std::u
         return TransparentListener{};
     }
 
+    if (!SetNonBlocking(fd.get())) {
+        return TransparentListener{};
+    }
+
     if (::listen(fd.get(), 128) != 0) {
         return TransparentListener{};
     }
