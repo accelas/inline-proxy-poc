@@ -30,3 +30,13 @@ cc_test(
         "//src/shared:shared",
     ],
 )
+
+
+cc_test(
+    name = "admin_http_test",
+    srcs = ["admin_http_test.cpp"],
+    deps = [
+        "@googletest//:gtest_main",
+        "//src/proxy:proxy",
+    ],
+)

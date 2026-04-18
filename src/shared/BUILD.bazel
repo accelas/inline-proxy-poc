@@ -5,6 +5,7 @@ exports_files(["BUILD.bazel"])
 cc_library(
     name = "shared",
     srcs = [
+        "event_loop.cpp",
         "netlink.cpp",
         "netns.cpp",
         "scoped_fd.cpp",
@@ -13,6 +14,7 @@ cc_library(
     ],
     hdrs = [
         "core.hpp",
+        "event_loop.hpp",
         "netlink.hpp",
         "netns.hpp",
         "scoped_fd.hpp",

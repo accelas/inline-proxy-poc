@@ -1,7 +1,28 @@
+package(default_visibility = ["//visibility:public"])
+
 exports_files(["BUILD.bazel"])
+
+cc_library(
+    name = "proxy",
+    srcs = [
+        "admin_http.cpp",
+        "proxy_state.cpp",
+    ],
+    hdrs = [
+        "admin_http.hpp",
+        "proxy_state.hpp",
+    ],
+    deps = [
+        "//src/shared:shared",
+    ],
+    include_prefix = "proxy",
+)
 
 cc_binary(
     name = "proxy_daemon",
     srcs = ["main.cpp"],
-    deps = ["//src/shared:core"],
+    deps = [
+        ":proxy",
+        "//src/shared:core",
+    ],
 )
