@@ -172,6 +172,7 @@ std::vector<bpf_insn> BuildIngressProgram(int map_fd) {
     const std::size_t tcp_port_load_failed_jump = builder.EmitJump(kCodeJmpNe, BPF_REG_0, 0);
 
     builder.Emit(MakeInsn(kCodeLdxMem | BPF_H, BPF_REG_7, BPF_REG_10, -16, 0));
+    builder.Emit(MakeInsn(kCodeEndianFromBe, BPF_REG_7, 0, 0, 16));
     builder.Emit(MakeInsn(kCodeLdxMem | BPF_H, BPF_REG_1, BPF_REG_6, 4, 0));
     const std::size_t port_mismatch_jump = builder.EmitJumpReg(kCodeJmpNeReg, BPF_REG_7, BPF_REG_1);
 

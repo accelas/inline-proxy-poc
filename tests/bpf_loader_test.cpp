@@ -85,8 +85,13 @@ TEST(BpfLoaderTest, GeneratedProgramUsesConfiguredListenerPort) {
     bool saw_ihl_shift = false;
     bool saw_dynamic_tcp_offset = false;
     bool saw_listener_port_load = false;
+    bool saw_listener_port_bswap = false;
     bool saw_hardcoded_tcp_offset = false;
     bool saw_listener_port_direct_compare = false;
+    std::size_t packet_port_load_index = 0;
+    std::size_t listener_port_load_index = 0;
+    std::size_t listener_port_bswap_index = 0;
+    std::size_t listener_port_compare_index = 0;
 
     for (std::size_t i = 0; i < insns.size(); ++i) {
         const auto& insn = insns[i];
@@ -127,13 +132,27 @@ TEST(BpfLoaderTest, GeneratedProgramUsesConfiguredListenerPort) {
             saw_dynamic_tcp_offset = true;
         }
 
+        if (insn.code == (BPF_LDX | BPF_MEM | BPF_H) && insn.dst_reg == BPF_REG_7 &&
+            insn.src_reg == BPF_REG_10 && insn.off == -16) {
+            packet_port_load_index = i;
+        }
+
         if (insn.code == (BPF_LDX | BPF_MEM | BPF_H) && insn.dst_reg == BPF_REG_1 &&
             insn.src_reg == BPF_REG_6 && insn.off == 4) {
             saw_listener_port_load = true;
-            if (i + 1 < insns.size() && insns[i + 1].code == (BPF_JMP | BPF_JNE | BPF_X) &&
-                insns[i + 1].dst_reg == BPF_REG_7 && insns[i + 1].src_reg == BPF_REG_1) {
-                saw_listener_port_direct_compare = true;
-            }
+            listener_port_load_index = i;
+        }
+
+        if (insn.code == (BPF_ALU | BPF_END | BPF_FROM_BE) && insn.dst_reg == BPF_REG_7 &&
+            insn.imm == 16) {
+            saw_listener_port_bswap = true;
+            listener_port_bswap_index = i;
+        }
+
+        if (insn.code == (BPF_JMP | BPF_JNE | BPF_X) && insn.dst_reg == BPF_REG_7 &&
+            insn.src_reg == BPF_REG_1) {
+            saw_listener_port_direct_compare = true;
+            listener_port_compare_index = i;
         }
     }
 
@@ -142,6 +161,10 @@ TEST(BpfLoaderTest, GeneratedProgramUsesConfiguredListenerPort) {
     EXPECT_TRUE(saw_ihl_shift);
     EXPECT_TRUE(saw_dynamic_tcp_offset);
     EXPECT_TRUE(saw_listener_port_load);
+    EXPECT_TRUE(saw_listener_port_bswap);
     EXPECT_TRUE(saw_listener_port_direct_compare);
+    EXPECT_LT(packet_port_load_index, listener_port_bswap_index);
+    EXPECT_LT(listener_port_bswap_index, listener_port_load_index);
+    EXPECT_LT(listener_port_load_index, listener_port_compare_index);
     EXPECT_FALSE(saw_hardcoded_tcp_offset);
 }

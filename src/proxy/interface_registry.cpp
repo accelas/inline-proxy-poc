@@ -5,7 +5,17 @@
 
 namespace inline_proxy {
 bool InterfaceRegistry::ConfigureIngressListener(int listener_fd) {
-    return bpf_loader_.ConfigureListenerSocket(listener_fd);
+    if (!bpf_loader_.ConfigureListenerSocket(listener_fd)) {
+        return false;
+    }
+
+    bool all_replayed = true;
+    for (const auto& name : wan_interfaces_) {
+        if (!bpf_loader_.AttachIngress(name)) {
+            all_replayed = false;
+        }
+    }
+    return all_replayed;
 }
 
 bool InterfaceRegistry::HasPrefix(std::string_view name, std::string_view prefix) {

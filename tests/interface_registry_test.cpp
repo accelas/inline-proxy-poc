@@ -44,6 +44,30 @@ TEST(InterfaceRegistryTest, ConfiguresIngressListenerOnLoader) {
     ::close(listener_fd);
 }
 
+TEST(InterfaceRegistryTest, ReplaysRecordedWanInterfacesWhenListenerIsConfigured) {
+    inline_proxy::InterfaceRegistry registry;
+
+    EXPECT_TRUE(registry.RecordInterface("wan_missing0"));
+    EXPECT_NE(std::find(registry.wan_interfaces().begin(), registry.wan_interfaces().end(), "wan_missing0"),
+              registry.wan_interfaces().end());
+
+    const int listener_fd = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    ASSERT_GE(listener_fd, 0);
+
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = 0;
+    ASSERT_EQ(::bind(listener_fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)), 0);
+
+    EXPECT_FALSE(registry.ConfigureIngressListener(listener_fd));
+    EXPECT_EQ(registry.bpf_loader().listener_socket_fd(), listener_fd);
+    EXPECT_NE(registry.bpf_loader().listener_port(), 0U);
+    EXPECT_FALSE(registry.bpf_loader().IsIngressAttached("wan_missing0"));
+
+    ::close(listener_fd);
+}
+
 TEST(InterfaceRegistryTest, RejectsInvalidIngressListenerConfiguration) {
     inline_proxy::InterfaceRegistry registry;
 
