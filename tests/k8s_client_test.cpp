@@ -1,5 +1,6 @@
 #include <atomic>
 #include <chrono>
+#include <cerrno>
 #include <filesystem>
 #include <fstream>
 #include <future>
@@ -7,10 +8,12 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include <gtest/gtest.h>
 
 #include <arpa/inet.h>
+#include <poll.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -235,6 +238,138 @@ private:
     uint16_t port_ = 0;
 };
 
+class BackloggedDualStackServer {
+public:
+    BackloggedDualStackServer() {
+        server_v6_fd_ = ::socket(AF_INET6, SOCK_STREAM, 0);
+        if (server_v6_fd_ < 0) {
+            throw std::runtime_error("failed to create IPv6 listener");
+        }
+        int one = 1;
+        if (::setsockopt(server_v6_fd_, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one)) != 0) {
+            throw std::runtime_error("failed to set IPv6 SO_REUSEADDR");
+        }
+        if (::setsockopt(server_v6_fd_, IPPROTO_IPV6, IPV6_V6ONLY, &one, sizeof(one)) != 0) {
+            throw std::runtime_error("failed to set IPV6_V6ONLY");
+        }
+
+        sockaddr_in6 addr6{};
+        addr6.sin6_family = AF_INET6;
+        addr6.sin6_port = 0;
+        if (::inet_pton(AF_INET6, "::1", &addr6.sin6_addr) != 1) {
+            throw std::runtime_error("inet_pton(::1) failed");
+        }
+        if (::bind(server_v6_fd_, reinterpret_cast<sockaddr*>(&addr6), sizeof(addr6)) != 0) {
+            throw std::runtime_error("failed to bind IPv6 listener");
+        }
+        if (::listen(server_v6_fd_, 1) != 0) {
+            throw std::runtime_error("failed to listen on IPv6 listener");
+        }
+        socklen_t len6 = sizeof(addr6);
+        if (::getsockname(server_v6_fd_, reinterpret_cast<sockaddr*>(&addr6), &len6) != 0) {
+            throw std::runtime_error("failed to read IPv6 listener port");
+        }
+        port_ = ntohs(addr6.sin6_port);
+
+        server_v4_fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
+        if (server_v4_fd_ < 0) {
+            throw std::runtime_error("failed to create IPv4 listener");
+        }
+        if (::setsockopt(server_v4_fd_, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one)) != 0) {
+            throw std::runtime_error("failed to set IPv4 SO_REUSEADDR");
+        }
+
+        sockaddr_in addr4{};
+        addr4.sin_family = AF_INET;
+        addr4.sin_port = htons(port_);
+        if (::inet_pton(AF_INET, "127.0.0.1", &addr4.sin_addr) != 1) {
+            throw std::runtime_error("inet_pton(127.0.0.1) failed");
+        }
+        if (::bind(server_v4_fd_, reinterpret_cast<sockaddr*>(&addr4), sizeof(addr4)) != 0) {
+            throw std::runtime_error("failed to bind IPv4 listener");
+        }
+        if (::listen(server_v4_fd_, 1) != 0) {
+            throw std::runtime_error("failed to listen on IPv4 listener");
+        }
+
+        FillBacklog(AF_INET6, reinterpret_cast<const sockaddr*>(&addr6), sizeof(addr6));
+        FillBacklog(AF_INET, reinterpret_cast<const sockaddr*>(&addr4), sizeof(addr4));
+        if (ProbeBacklog(AF_INET6, reinterpret_cast<const sockaddr*>(&addr6), sizeof(addr6)) ||
+            ProbeBacklog(AF_INET, reinterpret_cast<const sockaddr*>(&addr4), sizeof(addr4))) {
+            throw std::runtime_error("failed to saturate both listener backlogs");
+        }
+        if (held_connections_.size() < 16) {
+            throw std::runtime_error("failed to saturate both listener backlogs");
+        }
+    }
+
+    ~BackloggedDualStackServer() {
+        for (int fd : held_connections_) {
+            ::close(fd);
+        }
+        if (server_v4_fd_ >= 0) {
+            ::close(server_v4_fd_);
+        }
+        if (server_v6_fd_ >= 0) {
+            ::close(server_v6_fd_);
+        }
+    }
+
+    uint16_t port() const { return port_; }
+
+private:
+    void FillBacklog(int family, const sockaddr* address, socklen_t address_len) {
+        std::vector<int> pending_connections;
+        for (int attempt = 0; attempt < 96; ++attempt) {
+            int fd = ::socket(family, SOCK_STREAM | SOCK_NONBLOCK, 0);
+            if (fd < 0) {
+                throw std::runtime_error("failed to create backlog filler socket");
+            }
+            const int rc = ::connect(fd, address, address_len);
+            if (rc != 0 && errno != EINPROGRESS) {
+                ::close(fd);
+                continue;
+            }
+            pending_connections.push_back(fd);
+        }
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+        for (int fd : pending_connections) {
+            held_connections_.push_back(fd);
+        }
+    }
+
+    bool ProbeBacklog(int family, const sockaddr* address, socklen_t address_len) {
+        int fd = ::socket(family, SOCK_STREAM | SOCK_NONBLOCK, 0);
+        if (fd < 0) {
+            throw std::runtime_error("failed to create backlog probe socket");
+        }
+
+        const int rc = ::connect(fd, address, address_len);
+        if (rc == 0) {
+            ::close(fd);
+            return true;
+        }
+        if (rc != 0 && errno != EINPROGRESS) {
+            ::close(fd);
+            return true;
+        }
+
+        pollfd pfd{};
+        pfd.fd = fd;
+        pfd.events = POLLOUT;
+        const int poll_rc = ::poll(&pfd, 1, 25);
+        ::close(fd);
+        return poll_rc > 0;
+    }
+
+    int server_v6_fd_ = -1;
+    int server_v4_fd_ = -1;
+    uint16_t port_ = 0;
+    std::vector<int> held_connections_;
+};
+
 }  // namespace
 
 TEST(K8sClientTest, ParsesPodLookupResponse) {
@@ -264,6 +399,11 @@ TEST(K8sClientTest, ParsesPodLookupResponse) {
 TEST(K8sClientTest, BuildsDefaultInClusterApiEndpoint) {
     const auto endpoint = inline_proxy::BuildK8sApiEndpoint("10.0.0.1", "443");
     EXPECT_EQ(endpoint, "https://10.0.0.1:443");
+}
+
+TEST(K8sClientTest, BuildsIpv6ApiEndpointWithBrackets) {
+    const auto endpoint = inline_proxy::BuildK8sApiEndpoint("2001:db8::1", "443");
+    EXPECT_EQ(endpoint, "https://[2001:db8::1]:443");
 }
 
 TEST(K8sClientTest, FetchPodInfoUsesInjectedFetcher) {
@@ -331,4 +471,24 @@ TEST(K8sClientTest, CleansUpSocketsAndTlsResourcesWhenRequestTimesOut) {
     }
 
     EXPECT_EQ(CountOpenFileDescriptors(), baseline_fd_count);
+}
+
+TEST(K8sClientTest, EnforcesSingleTimeoutBudgetAcrossResolvedAddresses) {
+    auto bundle = CreateTempCertBundle();
+    WritePemFiles(bundle);
+    BackloggedDualStackServer server;
+
+    inline_proxy::K8sClientOptions options;
+    options.api_server_host = "localhost";
+    options.api_server_port = std::to_string(server.port());
+    options.token_path = bundle.token_path;
+    options.ca_path = bundle.cert_path;
+    options.timeout = std::chrono::milliseconds(100);
+
+    const inline_proxy::K8sQuery query{.namespace_name = "inline-proxy-system", .pod_name = "proxy-1"};
+
+    const auto start = std::chrono::steady_clock::now();
+    EXPECT_THROW((inline_proxy::FetchPodInfo(query, options)), std::runtime_error);
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start);
+    EXPECT_LT(elapsed.count(), 160) << "elapsed=" << elapsed.count() << "ms";
 }

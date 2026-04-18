@@ -84,11 +84,25 @@ std::string BuildPodPath(const K8sQuery& query) {
     return "/api/v1/namespaces/" + query.namespace_name + "/pods/" + query.pod_name;
 }
 
-std::string BuildHostHeader(const K8sClientOptions& options) {
-    if (options.api_server_port.empty() || options.api_server_port == "443") {
-        return options.api_server_host;
+std::string FormatHostLiteral(std::string_view host) {
+    if (host.empty()) {
+        return std::string(host);
     }
-    return options.api_server_host + ":" + options.api_server_port;
+    if (host.front() == '[' && host.back() == ']') {
+        return std::string(host);
+    }
+    if (host.find(':') != std::string_view::npos) {
+        return "[" + std::string(host) + "]";
+    }
+    return std::string(host);
+}
+
+std::string BuildHostHeader(const K8sClientOptions& options) {
+    const std::string host = FormatHostLiteral(options.api_server_host);
+    if (options.api_server_port.empty() || options.api_server_port == "443") {
+        return host;
+    }
+    return host + ":" + options.api_server_port;
 }
 
 std::string BuildHttpRequest(const K8sClientOptions& options, const K8sQuery& query, const std::string& token) {
@@ -228,8 +242,12 @@ int ConnectTcp(const std::string& host, const std::string& port, std::chrono::mi
         throw std::runtime_error(std::string("getaddrinfo failed: ") + ::gai_strerror(rc));
     }
 
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
     int fd = -1;
     for (addrinfo* it = results; it != nullptr; it = it->ai_next) {
+        if (std::chrono::steady_clock::now() >= deadline) {
+            break;
+        }
         fd = ::socket(it->ai_family, it->ai_socktype | SOCK_NONBLOCK, it->ai_protocol);
         if (fd < 0) {
             continue;
@@ -242,15 +260,10 @@ int ConnectTcp(const std::string& host, const std::string& port, std::chrono::mi
             fd = -1;
             continue;
         }
-
-        pollfd pfd{};
-        pfd.fd = fd;
-        pfd.events = POLLOUT;
-        const int poll_rc = ::poll(&pfd, 1, static_cast<int>(timeout.count()));
-        if (poll_rc <= 0) {
+        if (!WaitForFd(fd, POLLOUT, deadline)) {
             ::close(fd);
             fd = -1;
-            continue;
+            break;
         }
         int socket_error = 0;
         socklen_t len = sizeof(socket_error);
@@ -418,7 +431,7 @@ void SetK8sResponseFetcherForTesting(K8sResponseFetcher fetcher) {
 }
 
 std::string BuildK8sApiEndpoint(std::string_view host, std::string_view port) {
-    return "https://" + std::string(host) + ":" + std::string(port);
+    return "https://" + FormatHostLiteral(host) + ":" + std::string(port);
 }
 
 std::string BuildK8sApiEndpoint(std::string_view host, std::uint16_t port) {
