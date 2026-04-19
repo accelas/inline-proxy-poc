@@ -166,3 +166,37 @@ cc_test(
         "//src/shared:shared",
     ],
 )
+
+cc_library(
+    name = "netns_fixture",
+    srcs = ["netns_fixture.cpp"],
+    hdrs = ["netns_fixture.hpp"],
+    deps = [
+        "//src/cni:cni_parser",
+        "//src/cni:cni_splice",
+        "//src/proxy:proxy",
+        "//src/shared:shared",
+    ],
+)
+
+cc_test(
+    name = "transparent_relay_netns_test",
+    srcs = ["transparent_relay_netns_test.cpp"],
+    size = "large",
+    local = True,
+    deps = [
+        ":netns_fixture",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_test(
+    name = "splice_executor_netns_test",
+    srcs = ["splice_executor_netns_test.cpp"],
+    size = "large",
+    local = True,
+    deps = [
+        ":netns_fixture",
+        "@googletest//:gtest_main",
+    ],
+)

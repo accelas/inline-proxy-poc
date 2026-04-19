@@ -18,6 +18,8 @@ struct CniInvocation {
 
 struct CniExecutionOptions {
     std::filesystem::path state_root = "/var/run/inline-proxy-cni";
+    std::optional<std::filesystem::path> workload_netns_path;
+    std::optional<std::filesystem::path> proxy_netns_path;
 };
 
 struct CniExecutionResult {
@@ -38,6 +40,8 @@ public:
                                  const std::optional<PodInfo>& proxy_pod) const;
 
     CniExecutionResult HandleDel(const CniInvocation& invocation) const;
+
+    bool ExecuteSplice(const SplicePlan& plan) const;
 
 private:
     CniExecutionOptions options_;
