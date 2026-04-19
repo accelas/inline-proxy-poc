@@ -18,6 +18,7 @@ public:
     void set_ready(bool ready) noexcept;
 
     std::size_t active_sessions() const noexcept;
+    std::size_t total_connections() const noexcept;
     void increment_sessions() noexcept;
     void decrement_sessions();
 
@@ -28,6 +29,7 @@ private:
     EventLoop loop_;
     bool ready_ = true;
     std::size_t active_sessions_ = 0;
+    std::size_t total_connections_ = 0;
 };
 
 }  // namespace inline_proxy

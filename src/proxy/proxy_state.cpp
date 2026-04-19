@@ -25,8 +25,13 @@ std::size_t ProxyState::active_sessions() const noexcept {
     return active_sessions_;
 }
 
+std::size_t ProxyState::total_connections() const noexcept {
+    return total_connections_;
+}
+
 void ProxyState::increment_sessions() noexcept {
     ++active_sessions_;
+    ++total_connections_;
 }
 
 void ProxyState::decrement_sessions() {
@@ -47,6 +52,11 @@ std::string ProxyState::MetricsText() const {
     output += "# TYPE inline_proxy_active_sessions gauge\n";
     output += "inline_proxy_active_sessions ";
     output += std::to_string(active_sessions_);
+    output += '\n';
+    output += "# HELP inline_proxy_total_connections Total proxied connections accepted\n";
+    output += "# TYPE inline_proxy_total_connections counter\n";
+    output += "inline_proxy_total_connections ";
+    output += std::to_string(total_connections_);
     output += '\n';
     return output;
 }

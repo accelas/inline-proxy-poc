@@ -21,6 +21,7 @@ TEST(AdminHttpTest, HealthAndReadinessEndpointsReturn200) {
 
 TEST(AdminHttpTest, MetricsAndSessionsEndpointsReturnText) {
     inline_proxy::ProxyState state;
+    state.increment_sessions();
     inline_proxy::InterfaceRegistry registry;
     auto app = inline_proxy::BuildAdminHttp(state, registry);
 
@@ -31,6 +32,8 @@ TEST(AdminHttpTest, MetricsAndSessionsEndpointsReturnText) {
     EXPECT_EQ(metrics.content_type, "text/plain; version=0.0.4; charset=utf-8");
     EXPECT_NE(metrics.body.find("inline_proxy_ready"), std::string::npos);
     EXPECT_NE(metrics.body.find("inline_proxy_active_sessions"), std::string::npos);
+    EXPECT_NE(metrics.body.find("inline_proxy_total_connections"), std::string::npos);
+    EXPECT_NE(metrics.body.find("inline_proxy_total_connections 1"), std::string::npos);
 
     EXPECT_EQ(sessions.status, 200);
     EXPECT_EQ(sessions.content_type, "text/plain; charset=utf-8");
