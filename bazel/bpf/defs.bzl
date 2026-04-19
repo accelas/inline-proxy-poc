@@ -90,7 +90,7 @@ def bpf_skeleton(name, src, hdrs = [], copts = []):
         name = name + "_skel",
         srcs = [linked],
         outs = [skel],
-        cmd = "$(location @host_bpftool//:bpftool) gen skeleton $(location " + linked + ") > $@",
+        cmd = "$(location @host_bpftool//:bpftool) gen skeleton $(location " + linked + ") name " + name + " > $@",
         tools = ["@host_bpftool//:bpftool"],
         message = "Generating BPF skeleton " + skel,
     )
