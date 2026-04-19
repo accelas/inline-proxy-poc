@@ -299,7 +299,10 @@ Implementation must be driven by tests.
    - keep netns resolution tests for workload/proxy discovery
 
 6. **End-to-end routed namespace harness**
-   - add/update a netns harness that proves:
+   - refer to the existing netns-backed end-to-end coverage first, rather than inventing a brand-new harness
+   - extend `tests/splice_executor_netns_test.cpp` and its `NetnsFixture::RunSpliceExecutorScenario()` path so it validates the new routed root->proxy->workload topology
+   - keep `tests/ebpf_intercept_fd_netns_test.cpp` / `FdNetnsHarness` as the existing transparent interception proof and adapt it only where the routed `wan_*` model changes its assumptions
+   - the combined e2e goal is to prove:
      - root namespace routes pod traffic to proxy
      - proxy accepts/intercepts the traffic
      - workload receives traffic with expected transparency behavior
@@ -332,8 +335,11 @@ Likely implementation surface:
 - `tests/cni_add_del_test.cpp`
 - `tests/netns_fixture.cpp`
 - `tests/netns_fixture.hpp`
+- `tests/splice_executor_netns_test.cpp`
 - `tests/ebpf_intercept_fd_netns_test.cpp`
-- additional routed-topology tests as needed
+- `tests/fd_netns_harness.cpp`
+- `tests/fd_netns_harness.hpp`
+- additional routed-topology assertions layered onto those existing e2e tests as needed
 
 ## What changes from the current branch
 
