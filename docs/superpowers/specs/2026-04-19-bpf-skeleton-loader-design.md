@@ -40,16 +40,13 @@ Out of scope:
 
 ## Decisions
 
-### 1. Vendor libbpf and bpftool from source
+### 1. Vendor libbpf from source; use host-installed bpftool
 
-Both land under `third_party/` with hand-written `BUILD.bazel` files, mirroring the existing yajl vendoring pattern. The root `MODULE.bazel` declares them with `version = "0.0.0"` and `local_path_override`.
+**libbpf v1.5.0** is vendored into `third_party/libbpf/` with a hand-written `BUILD.bazel`, mirroring the existing yajl vendoring pattern. The root `MODULE.bazel` declares it with `version = "0.0.0"` and `local_path_override`. It matches `libbpf1 1:1.5.0-3` installed on the development host and has all CO-RE APIs the skeleton uses. libbpf is compiled as a **static archive** and linked statically into `proxy_daemon` so the deployed container image does not need a runtime `libbpf.so`.
 
-Upstream versions pinned:
+**bpftool is host-installed**, not vendored. Rationale: bpftool's upstream build bootstraps itself (it uses an intermediate bpftool to generate skeletons for two of its own subcommands' `.bpf.c` files), and reproducing that two-pass bootstrap in Bazel has a cost out of proportion to the value — bpftool is a compiler-like build-time tool, same tier as clang. The deployed container image never needs bpftool. We therefore treat bpftool like clang: a host prerequisite, located at build time via a small Bazel repository rule (`//bazel/bpf:host_bpftool.bzl`), failing the build loudly if not on `$PATH`. The host package on Debian is `bpftool` or `linux-tools-common`.
 
-- **libbpf v1.5.0** — matches `libbpf1 1:1.5.0-3` installed on the development host, has all CO-RE APIs the skeleton uses.
-- **bpftool v7.5.0** — paired with libbpf 1.5. bpftool's own source tree bundles libbpf as a submodule; we let bpftool use its bundled submodule for its own build rather than wiring it to our separately-vendored copy. Rationale: bpftool is a build-time tool that never ships to runtime, and this simplifies integrating its Makefile-driven build into Bazel.
-
-libbpf is compiled as a **static archive** and linked statically into `proxy_daemon` so the deployed container image does not need a runtime `libbpf.so`.
+Pinning policy: bpftool is not version-pinned in the repo. The skeleton-generation interface (`bpftool gen skeleton`, `bpftool gen object`) has been stable across bpftool 7.x. If a specific minimum version is ever needed, the repository rule is the single place to add a `--version` gate.
 
 ### 2. One custom Bazel rule: `bpf_skeleton`
 
@@ -68,10 +65,10 @@ Expands to:
 1. **Compile step** (`genrule` invoking host `clang-19`):
    `clang -target bpf -O2 -g -D__TARGET_ARCH_x86 -I<hdrs dir> -c $(SRC) -o $(name).bpf.o`
 
-2. **Link step** (`genrule` invoking the vendored bpftool):
+2. **Link step** (`genrule` invoking host bpftool via `@host_bpftool//:bpftool`):
    `bpftool gen object $(name).linked.o $(name).bpf.o`
 
-3. **Skeleton step** (`genrule` invoking bpftool):
+3. **Skeleton step** (`genrule` invoking host bpftool via `@host_bpftool//:bpftool`):
    `bpftool gen skeleton $(name).linked.o > $(name).skel.h`
 
 4. **Wrap step**:
@@ -225,7 +222,7 @@ The netlink code already works and this rewrite is narrowly about the load path.
 
 - `bazel/bpf/BUILD.bazel` (empty package marker)
 - `bazel/bpf/defs.bzl` (the `bpf_skeleton` macro)
-- `third_party/bpftool/` (vendored source + hand-written `BUILD.bazel` + `MODULE.bazel`)
+- `bazel/bpf/host_bpftool.bzl` (repository rule that locates host `bpftool` and exposes it as `@host_bpftool//:bpftool`)
 - `src/bpf/vmlinux.h` (checked-in BTF header)
 - `scripts/regenerate_vmlinux_h.sh`
 
@@ -236,7 +233,7 @@ The netlink code already works and this rewrite is narrowly about the load path.
 - `src/bpf/loader.cpp` — internals replaced; netlink path retained
 - `src/bpf/loader.hpp` — drops `BuildIngressProgramForTesting` and `MarkIngressAttachedForTesting`; adds opaque skeleton pointer member
 - `src/bpf/BUILD.bazel` — loads `bpf_skeleton`, declares `ingress_redirect_skel` target, makes `:loader` depend on it; drops the now-unused `filegroup(name = "ingress_redirect_bpf")`
-- Root `MODULE.bazel` — adds `bpftool` `bazel_dep` + `local_path_override`
+- Root `MODULE.bazel` — adds a `use_extension` / `use_repo` pair that registers `@host_bpftool//:bpftool`
 
 **Removed:**
 
@@ -253,7 +250,7 @@ The netlink code already works and this rewrite is narrowly about the load path.
 Each step is an independent commit. Steps 1–3 do not touch the runtime loader and can be reverted without affecting the proxy.
 
 1. **Vendor libbpf sources.** Replace the stub `third_party/libbpf/BUILD.bazel` with a real static-archive build of libbpf 1.5.0. Verify `@libbpf//:libbpf` builds.
-2. **Vendor bpftool sources.** Add `third_party/bpftool/` with a `cc_binary` target. Add the `bazel_dep` to root `MODULE.bazel`. Verify `bazel run //third_party/bpftool` works.
+2. **Wire up host bpftool.** Add `bazel/bpf/host_bpftool.bzl` and register the extension in root `MODULE.bazel`. Verify `bazel run @host_bpftool//:bpftool -- version` works against the host-installed `bpftool`.
 3. **Land the macro, `vmlinux.h`, and the rewritten `.bpf.c`.** Add `bazel/bpf/defs.bzl`; add `scripts/regenerate_vmlinux_h.sh`; generate `src/bpf/vmlinux.h`; rewrite `src/bpf/ingress_redirect.bpf.c`; declare the `bpf_skeleton` target in `src/bpf/BUILD.bazel` **without** wiring it into `:loader`. Verify the skeleton header builds.
 4. **Rewrite `loader.cpp` and `loader.hpp`.** Delete the handwritten codegen; wire in the skeleton; drop the two test-only helpers; update `src/bpf/BUILD.bazel` to depend on the skeleton.
 5. **Update tests.** Delete the two opcode- and test-hook-dependent test cases from `tests/bpf_loader_test.cpp`; add `LoadsSkeleton`.
