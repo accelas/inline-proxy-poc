@@ -10,6 +10,7 @@
 #include <future>
 #include <memory>
 #include <netdb.h>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -259,6 +260,32 @@ int CountOpenFileDescriptors() {
     }
     return count;
 }
+
+class ScopedEnvVar {
+public:
+    ScopedEnvVar(const char* name, const std::optional<std::string>& value) : name_(name) {
+        if (const char* current = std::getenv(name_)) {
+            old_value_ = std::string(current);
+        }
+        if (value.has_value()) {
+            ::setenv(name_, value->c_str(), 1);
+        } else {
+            ::unsetenv(name_);
+        }
+    }
+
+    ~ScopedEnvVar() {
+        if (old_value_.has_value()) {
+            ::setenv(name_, old_value_->c_str(), 1);
+        } else {
+            ::unsetenv(name_);
+        }
+    }
+
+private:
+    const char* name_;
+    std::optional<std::string> old_value_;
+};
 
 class StallingTlsServer {
 public:
@@ -541,6 +568,61 @@ TEST(K8sClientTest, FetchPodInfoUsesInjectedFetcher) {
 
     inline_proxy::SetK8sResponseFetcherForTesting(
         [](const inline_proxy::K8sClientOptions&, const inline_proxy::K8sQuery&) {
+            return std::optional<std::string>(R"({
+                "metadata":{"name":"proxy-1","namespace":"inline-proxy-system"},
+                "spec":{"nodeName":"worker-1"},
+                "status":{"phase":"Running"}
+            })");
+        });
+
+    const auto pod = inline_proxy::FetchPodInfo(query);
+    EXPECT_EQ(pod.name, "proxy-1");
+    EXPECT_EQ(pod.node_name, "worker-1");
+    EXPECT_TRUE(pod.running);
+
+    inline_proxy::SetK8sResponseFetcherForTesting({});
+}
+
+TEST(K8sClientTest, FetchPodInfoLoadsDefaultOptionsFromKubeconfig) {
+    const auto base = std::filesystem::temp_directory_path() /
+                      ("inline-proxy-kubeconfig-" + std::to_string(::getpid()) + "-default");
+    std::filesystem::create_directories(base);
+    const auto kubeconfig_path = base / "kubeconfig";
+    const auto ca_path = base / "ca.crt";
+    const auto client_cert_path = base / "client.crt";
+    const auto client_key_path = base / "client.key";
+
+    {
+        std::ofstream kubeconfig(kubeconfig_path);
+        ASSERT_TRUE(static_cast<bool>(kubeconfig));
+        kubeconfig << "apiVersion: v1\n"
+                   << "clusters:\n"
+                   << "- cluster:\n"
+                   << "    server: https://127.0.0.1:6443\n"
+                   << "    certificate-authority: " << ca_path.string() << "\n"
+                   << "  name: local\n"
+                   << "users:\n"
+                   << "- name: user\n"
+                   << "  user:\n"
+                   << "    client-certificate: " << client_cert_path.string() << "\n"
+                   << "    client-key: " << client_key_path.string() << "\n";
+    }
+
+    ScopedEnvVar service_host("KUBERNETES_SERVICE_HOST", std::nullopt);
+    ScopedEnvVar service_port("KUBERNETES_SERVICE_PORT", std::nullopt);
+    ScopedEnvVar token_path("INLINE_PROXY_K8S_TOKEN_PATH", std::nullopt);
+    ScopedEnvVar ca_override("INLINE_PROXY_K8S_CA_PATH", std::nullopt);
+    ScopedEnvVar kubeconfig_override("INLINE_PROXY_KUBECONFIG_PATH", kubeconfig_path.string());
+
+    const inline_proxy::K8sQuery query{.namespace_name = "inline-proxy-system", .pod_name = "proxy-1"};
+
+    inline_proxy::SetK8sResponseFetcherForTesting(
+        [&](const inline_proxy::K8sClientOptions& options, const inline_proxy::K8sQuery&) {
+            EXPECT_EQ(options.api_server_host, "127.0.0.1");
+            EXPECT_EQ(options.api_server_port, "6443");
+            EXPECT_EQ(options.ca_path, ca_path);
+            EXPECT_EQ(options.client_cert_path, client_cert_path);
+            EXPECT_EQ(options.client_key_path, client_key_path);
             return std::optional<std::string>(R"({
                 "metadata":{"name":"proxy-1","namespace":"inline-proxy-system"},
                 "spec":{"nodeName":"worker-1"},

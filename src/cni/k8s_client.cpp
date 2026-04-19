@@ -14,6 +14,7 @@
 #include <fstream>
 #include <mutex>
 #include <memory>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -73,10 +74,118 @@ std::string ReadFile(const std::filesystem::path& path) {
     return buffer.str();
 }
 
+std::optional<std::filesystem::path> FirstExistingPath(
+    std::initializer_list<std::filesystem::path> candidates) {
+    for (const auto& candidate : candidates) {
+        if (!candidate.empty() && std::filesystem::exists(candidate)) {
+            return candidate;
+        }
+    }
+    return std::nullopt;
+}
+
+std::string TrimCopy(std::string_view value) {
+    return Trim(std::string(value));
+}
+
+void ParseServerUrl(std::string_view server_url, K8sClientOptions& options) {
+    std::string url = TrimCopy(server_url);
+    static constexpr std::string_view kHttpsPrefix = "https://";
+    if (url.rfind(kHttpsPrefix.data(), 0) != 0) {
+        throw std::runtime_error("unsupported Kubernetes API server URL: " + url);
+    }
+
+    std::string authority = url.substr(kHttpsPrefix.size());
+    const auto slash = authority.find('/');
+    if (slash != std::string::npos) {
+        authority = authority.substr(0, slash);
+    }
+
+    if (authority.empty()) {
+        throw std::runtime_error("missing host in Kubernetes API server URL");
+    }
+
+    if (authority.front() == '[') {
+        const auto closing = authority.find(']');
+        if (closing == std::string::npos) {
+            throw std::runtime_error("malformed IPv6 Kubernetes API server URL");
+        }
+        options.api_server_host = authority.substr(1, closing - 1);
+        if (closing + 1 < authority.size()) {
+            if (authority[closing + 1] != ':') {
+                throw std::runtime_error("malformed Kubernetes API server URL");
+            }
+            options.api_server_port = authority.substr(closing + 2);
+        }
+        return;
+    }
+
+    const auto colon = authority.rfind(':');
+    if (colon != std::string::npos) {
+        options.api_server_host = authority.substr(0, colon);
+        options.api_server_port = authority.substr(colon + 1);
+        return;
+    }
+
+    options.api_server_host = authority;
+}
+
+void ApplyKubeconfigLine(std::string_view line, K8sClientOptions& options) {
+    const std::string trimmed = TrimCopy(line);
+    if (trimmed.empty() || trimmed.front() == '#') {
+        return;
+    }
+
+    const auto colon = trimmed.find(':');
+    if (colon == std::string::npos) {
+        return;
+    }
+
+    const std::string key = TrimCopy(trimmed.substr(0, colon));
+    const std::string value = TrimCopy(trimmed.substr(colon + 1));
+    if (value.empty()) {
+        return;
+    }
+
+    if (key == "server") {
+        ParseServerUrl(value, options);
+    } else if (key == "certificate-authority") {
+        options.ca_path = value;
+    } else if (key == "client-certificate") {
+        options.client_cert_path = value;
+    } else if (key == "client-key") {
+        options.client_key_path = value;
+    }
+}
+
+void ApplyKubeconfig(const std::filesystem::path& path, K8sClientOptions& options) {
+    std::ifstream stream(path);
+    if (!stream) {
+        throw std::runtime_error("failed to open kubeconfig: " + path.string());
+    }
+
+    std::string line;
+    while (std::getline(stream, line)) {
+        ApplyKubeconfigLine(line, options);
+    }
+}
+
 K8sClientOptions LoadDefaultOptions() {
     K8sClientOptions options;
+    if (const char* host = std::getenv("INLINE_PROXY_K8S_API_SERVER_HOST")) {
+        options.api_server_host = host;
+    }
     if (const char* host = std::getenv("KUBERNETES_SERVICE_HOST")) {
         options.api_server_host = host;
+        if (options.token_path.empty()) {
+            options.token_path = "/var/run/secrets/kubernetes.io/serviceaccount/token";
+        }
+        if (options.ca_path.empty()) {
+            options.ca_path = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt";
+        }
+    }
+    if (const char* port = std::getenv("INLINE_PROXY_K8S_API_SERVER_PORT")) {
+        options.api_server_port = port;
     }
     if (const char* port = std::getenv("KUBERNETES_SERVICE_PORT")) {
         options.api_server_port = port;
@@ -86,6 +195,23 @@ K8sClientOptions LoadDefaultOptions() {
     }
     if (const char* ca_path = std::getenv("INLINE_PROXY_K8S_CA_PATH")) {
         options.ca_path = ca_path;
+    }
+    if (const char* client_cert_path = std::getenv("INLINE_PROXY_K8S_CLIENT_CERT_PATH")) {
+        options.client_cert_path = client_cert_path;
+    }
+    if (const char* client_key_path = std::getenv("INLINE_PROXY_K8S_CLIENT_KEY_PATH")) {
+        options.client_key_path = client_key_path;
+    }
+    if (options.api_server_host.empty()) {
+        const char* kubeconfig_env = std::getenv("INLINE_PROXY_KUBECONFIG_PATH");
+        const auto kubeconfig_path = kubeconfig_env
+                                         ? std::optional<std::filesystem::path>(kubeconfig_env)
+                                         : FirstExistingPath({
+                                               "/var/lib/rancher/k3s/agent/kubelet.kubeconfig",
+                                           });
+        if (kubeconfig_path.has_value()) {
+            ApplyKubeconfig(*kubeconfig_path, options);
+        }
     }
     return options;
 }
@@ -144,11 +270,13 @@ std::string BuildHostHeader(const K8sClientOptions& options) {
     return host + ":" + options.api_server_port;
 }
 
-std::string BuildHttpRequest(const K8sClientOptions& options, std::string_view path, const std::string& token) {
+std::string BuildHttpRequest(const K8sClientOptions& options, std::string_view path, std::string_view token) {
     std::ostringstream request;
     request << "GET " << path << " HTTP/1.1\r\n";
     request << "Host: " << BuildHostHeader(options) << "\r\n";
-    request << "Authorization: Bearer " << token << "\r\n";
+    if (!token.empty()) {
+        request << "Authorization: Bearer " << token << "\r\n";
+    }
     request << "Accept: application/json\r\n";
     request << "Connection: close\r\n\r\n";
     return request.str();
@@ -424,8 +552,22 @@ std::string PerformHttpsGet(const K8sClientOptions& options, std::string_view pa
         throw std::runtime_error("failed to create SSL context");
     }
     SSL_CTX_set_verify(ctx.get(), SSL_VERIFY_PEER, nullptr);
+    if (options.ca_path.empty()) {
+        throw std::runtime_error("missing Kubernetes CA bundle path");
+    }
     if (SSL_CTX_load_verify_locations(ctx.get(), options.ca_path.string().c_str(), nullptr) != 1) {
         throw std::runtime_error("failed to load Kubernetes CA bundle");
+    }
+    if (!options.client_cert_path.empty() || !options.client_key_path.empty()) {
+        if (options.client_cert_path.empty() || options.client_key_path.empty()) {
+            throw std::runtime_error("client certificate and key must both be configured");
+        }
+        if (SSL_CTX_use_certificate_file(ctx.get(), options.client_cert_path.string().c_str(), SSL_FILETYPE_PEM) != 1) {
+            throw std::runtime_error("failed to load Kubernetes client certificate");
+        }
+        if (SSL_CTX_use_PrivateKey_file(ctx.get(), options.client_key_path.string().c_str(), SSL_FILETYPE_PEM) != 1) {
+            throw std::runtime_error("failed to load Kubernetes client key");
+        }
     }
 
     std::unique_ptr<SSL, decltype(&SSL_free)> ssl(SSL_new(ctx.get()), &SSL_free);
@@ -493,7 +635,10 @@ std::optional<std::string> FetchPodJson(const K8sClientOptions& options, const K
     if (options.timeout.count() <= 0) {
         throw std::runtime_error("Kubernetes client timeout must be positive");
     }
-    const std::string token = Trim(ReadFile(options.token_path));
+    std::string token;
+    if (!options.token_path.empty()) {
+        token = Trim(ReadFile(options.token_path));
+    }
     const std::string response = PerformHttpsGet(options, BuildPodPath(query), token);
     return ExtractBody(response);
 }
@@ -514,7 +659,10 @@ std::optional<std::string> FetchPodListJson(const K8sClientOptions& options, con
     if (options.timeout.count() <= 0) {
         throw std::runtime_error("Kubernetes client timeout must be positive");
     }
-    const std::string token = Trim(ReadFile(options.token_path));
+    std::string token;
+    if (!options.token_path.empty()) {
+        token = Trim(ReadFile(options.token_path));
+    }
     const std::string response = PerformHttpsGet(options, BuildPodListPath(query), token);
     return ExtractBody(response);
 }

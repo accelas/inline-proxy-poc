@@ -25,8 +25,10 @@ struct K8sPodListQuery {
 struct K8sClientOptions {
     std::string api_server_host;
     std::string api_server_port = "443";
-    std::filesystem::path token_path = "/var/run/secrets/kubernetes.io/serviceaccount/token";
-    std::filesystem::path ca_path = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt";
+    std::filesystem::path token_path;
+    std::filesystem::path ca_path;
+    std::filesystem::path client_cert_path;
+    std::filesystem::path client_key_path;
     std::chrono::milliseconds timeout{5000};
 };
 
