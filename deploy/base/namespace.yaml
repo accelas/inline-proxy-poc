@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: inline-proxy-system
+  labels:
+    app.kubernetes.io/name: inline-proxy
+    app.kubernetes.io/part-of: inline-proxy

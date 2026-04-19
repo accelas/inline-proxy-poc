@@ -200,3 +200,23 @@ cc_test(
         "@googletest//:gtest_main",
     ],
 )
+
+cc_test(
+    name = "deploy_manifest_test",
+    srcs = ["deploy_manifest_test.cpp"],
+    data = [
+        "//deploy:README.md",
+        "//deploy:base/caddy-demo.yaml",
+        "//deploy:base/client-demo.yaml",
+        "//deploy:base/kustomization.yaml",
+        "//deploy:base/namespace.yaml",
+        "//deploy:base/proxy-daemonset.yaml",
+        "//deploy:base/proxy-installer-daemonset.yaml",
+        "//deploy:base/rbac.yaml",
+        "//deploy:scripts/install-cni.sh",
+        "//deploy:scripts/reconcile-cni.sh",
+    ],
+    deps = [
+        "@googletest//:gtest_main",
+    ],
+)

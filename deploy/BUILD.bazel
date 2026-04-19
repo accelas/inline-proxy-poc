@@ -1,1 +1,7 @@
-exports_files(["README.md"])
+exports_files(
+    glob([
+        "README.md",
+        "base/*.yaml",
+        "scripts/*.sh",
+    ]),
+)

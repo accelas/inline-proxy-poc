@@ -1,0 +1,82 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: inline-proxy-installer
+  namespace: inline-proxy-system
+  labels:
+    app: inline-proxy-installer
+    app.kubernetes.io/name: inline-proxy-installer
+spec:
+  selector:
+    matchLabels:
+      app: inline-proxy-installer
+  template:
+    metadata:
+      labels:
+        app: inline-proxy-installer
+        app.kubernetes.io/name: inline-proxy-installer
+    spec:
+      serviceAccountName: inline-proxy-installer
+      hostPID: true
+      tolerations:
+        - operator: Exists
+      containers:
+        - name: installer
+          image: ghcr.io/example/inline-proxy/installer:latest
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            privileged: true
+          command:
+            - /bin/sh
+            - /opt/inline-proxy/scripts/install-cni.sh
+          env:
+            - name: INLINE_PROXY_CNI_BINARY_SOURCE
+              value: /opt/inline-proxy/bin/inline_proxy_cni
+            - name: INLINE_PROXY_CNI_PLUGIN_NAME
+              value: inline-proxy-cni
+            - name: INLINE_PROXY_PROXY_NAMESPACE
+              value: inline-proxy-system
+            - name: INLINE_PROXY_PROXY_LABEL
+              value: app=inline-proxy
+            - name: INLINE_PROXY_ANNOTATION_KEY
+              value: inline-proxy.example.com/enabled
+          volumeMounts:
+            - name: host-cni-bin
+              mountPath: /host/opt/cni/bin
+            - name: host-k3s-bin
+              mountPath: /host/var/lib/rancher/k3s/data/current/bin
+            - name: host-cni-conf
+              mountPath: /host/etc/cni/net.d
+            - name: host-k3s-conf
+              mountPath: /host/var/lib/rancher/k3s/agent/etc/cni/net.d
+            - name: inline-proxy-bin
+              mountPath: /opt/inline-proxy/bin
+              readOnly: true
+            - name: inline-proxy-scripts
+              mountPath: /opt/inline-proxy/scripts
+              readOnly: true
+      volumes:
+        - name: host-cni-bin
+          hostPath:
+            path: /opt/cni/bin
+            type: DirectoryOrCreate
+        - name: host-k3s-bin
+          hostPath:
+            path: /var/lib/rancher/k3s/data/current/bin
+            type: DirectoryOrCreate
+        - name: host-cni-conf
+          hostPath:
+            path: /etc/cni/net.d
+            type: DirectoryOrCreate
+        - name: host-k3s-conf
+          hostPath:
+            path: /var/lib/rancher/k3s/agent/etc/cni/net.d
+            type: DirectoryOrCreate
+        - name: inline-proxy-bin
+          configMap:
+            name: inline-proxy-installer-bin
+            optional: true
+        - name: inline-proxy-scripts
+          configMap:
+            name: inline-proxy-installer-scripts
+            defaultMode: 0755
