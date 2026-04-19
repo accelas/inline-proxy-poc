@@ -185,8 +185,8 @@ TEST(EventLoopTest, StopBeforeDispatchSkipsOtherReadyFdsAfterWakeupDrain) {
     std::thread stopper([&] {
         const char payload[] = {'o', 'k'};
         ASSERT_EQ(::write(write_fd.get(), payload, sizeof(payload)), static_cast<ssize_t>(sizeof(payload)));
-        stop_requested.set_value();
         loop.Stop();
+        stop_requested.set_value();
         for (int i = 0; i < 2000; ++i) {
             handle->Update(true, false);
         }
