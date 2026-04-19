@@ -1,96 +1,135 @@
-#ifndef __BPF_INGRESS_REDIRECT_BPF_C__
-#define __BPF_INGRESS_REDIRECT_BPF_C__
+// CO-RE-style TC ingress redirector.
+//
+// Replaces the handwritten bpf_insn codegen in src/bpf/loader.cpp. The
+// program's observable behavior must match the handwritten program
+// exactly; see the parity table in
+// docs/superpowers/specs/2026-04-19-bpf-skeleton-loader-design.md
+// (Decisions section 5).
 
-/*
- * First-pass ingress steering for WAN interfaces.
- *
- * The program:
- * - looks up a single runtime config record
- * - checks for Ethernet/IPv4/TCP traffic
- * - matches the TCP destination port against the configured listener port
- * - redirects matching traffic to the configured ingress handoff target
- */
+#include "vmlinux.h"
 
-#include <linux/bpf.h>
-#include <linux/if_ether.h>
-#include <linux/ip.h>
-#include <linux/pkt_cls.h>
-#include <linux/tcp.h>
-#include <stddef.h>
+#include <bpf/bpf_endian.h>
+#include <bpf/bpf_helpers.h>
 
 #include "ingress_redirect_common.h"
 
-#define SEC(NAME) __attribute__((section(NAME), used))
+#define ETH_P_IP    0x0800
+#define IPPROTO_TCP 6
+#define TC_ACT_OK   0
 
-struct bpf_map_def {
-    __u32 type;
-    __u32 key_size;
-    __u32 value_size;
-    __u32 max_entries;
-};
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __type(key, __u32);
+    __type(value, struct ingress_redirect_config);
+    __uint(max_entries, 1);
+} config_map SEC(".maps");
 
-static void* (*bpf_map_lookup_elem)(void* map, const void* key) = (void*)1;
-static int (*bpf_redirect)(int ifindex, __u64 flags) = (void*)23;
+struct {
+    __uint(type, BPF_MAP_TYPE_SOCKMAP);
+    __type(key, __u32);
+    __type(value, __u32);
+    __uint(max_entries, 1);
+} listener_map SEC(".maps");
 
-SEC("maps")
-struct bpf_map_def redirect_config_map = {
-    .type = BPF_MAP_TYPE_ARRAY,
-    .key_size = sizeof(__u32),
-    .value_size = sizeof(struct ingress_redirect_config),
-    .max_entries = 1,
-};
-
-static inline struct ingress_redirect_config* lookup_runtime_config(void) {
-    __u32 key = INGRESS_REDIRECT_MAP_KEY_ZERO;
-    return bpf_map_lookup_elem(&redirect_config_map, &key);
-}
+#ifdef DEBUG_TRACE
+#define ipx_trace(fmt, ...) bpf_printk("ipx " fmt, ##__VA_ARGS__)
+#else
+#define ipx_trace(fmt, ...) ((void)0)
+#endif
 
 SEC("tc")
-int redirect_ingress(struct __sk_buff* skb) {
-    void* data = (void*)(long)skb->data;
-    void* data_end = (void*)(long)skb->data_end;
-    struct ingress_redirect_config* config = lookup_runtime_config();
-    struct ethhdr* eth;
-    struct iphdr* iph;
-    struct tcphdr* tcph;
-    __u8 ihl_bytes;
-
-    if (!config || !config->enabled || !config->listener_port || !config->redirect_ifindex) {
+int ingress_redirect(struct __sk_buff *skb) {
+    __u32 cfg_key = 0;
+    struct ingress_redirect_config *cfg =
+        bpf_map_lookup_elem(&config_map, &cfg_key);
+    if (!cfg || !cfg->enabled) {
         return TC_ACT_OK;
     }
 
-    eth = data;
-    if ((void*)(eth + 1) > data_end) {
+    // Ethertype at L2 offset 12.
+    __u16 eth_proto = 0;
+    if (bpf_skb_load_bytes(skb, 12, &eth_proto, sizeof(eth_proto)) != 0) {
         return TC_ACT_OK;
     }
-    if (eth->h_proto != __builtin_bswap16(ETH_P_IP)) {
-        return TC_ACT_OK;
-    }
-
-    iph = (void*)(eth + 1);
-    if ((void*)(iph + 1) > data_end) {
-        return TC_ACT_OK;
-    }
-    if (iph->protocol != INGRESS_REDIRECT_TCP_PROTOCOL) {
+    if (eth_proto != bpf_htons(ETH_P_IP)) {
         return TC_ACT_OK;
     }
 
-    ihl_bytes = (__u8)(iph->ihl * 4);
-    if (ihl_bytes < sizeof(*iph)) {
+    // IP protocol at offset 23 (L2 14 + IP 9).
+    __u8 ip_proto = 0;
+    if (bpf_skb_load_bytes(skb, 23, &ip_proto, sizeof(ip_proto)) != 0) {
+        return TC_ACT_OK;
+    }
+    if (ip_proto != IPPROTO_TCP) {
         return TC_ACT_OK;
     }
 
-    tcph = (void*)((char*)iph + ihl_bytes);
-    if ((void*)(tcph + 1) > data_end) {
+    // IHL byte at offset 14. Compute TCP header offset from it.
+    __u8 ihl_byte = 0;
+    if (bpf_skb_load_bytes(skb, 14, &ihl_byte, sizeof(ihl_byte)) != 0) {
         return TC_ACT_OK;
     }
-    if (__builtin_bswap16(tcph->dest) != (__u16)config->listener_port) {
+    __u32 ihl_bytes = (ihl_byte & 0x0f) << 2;
+    if (ihl_bytes < 20) {
         return TC_ACT_OK;
+    }
+    __u32 tcp_off = 14 + ihl_bytes;
+
+    // TCP destination port (big-endian, 2 bytes at tcp_off + 2).
+    __u16 dst_port_be = 0;
+    if (bpf_skb_load_bytes(skb, tcp_off + 2, &dst_port_be, sizeof(dst_port_be)) != 0) {
+        return TC_ACT_OK;
+    }
+    __u16 dst_port = bpf_ntohs(dst_port_be);
+    if (dst_port != (__u16)cfg->listener_port) {
+        return TC_ACT_OK;
+    }
+    ipx_trace("port80\n");
+
+    // TCP flags at tcp_off + 13.
+    __u8 tcp_flags = 0;
+    if (bpf_skb_load_bytes(skb, tcp_off + 13, &tcp_flags, sizeof(tcp_flags)) != 0) {
+        return TC_ACT_OK;
+    }
+    ipx_trace("flags=%d\n", tcp_flags);
+
+    // IPv4 + TCP 4-tuple: 8 bytes of IPs at offset 26, then 4 bytes of
+    // ports at tcp_off (src port then dst port).
+    struct bpf_sock_tuple tuple = {};
+    if (bpf_skb_load_bytes(skb, 26, &tuple.ipv4.saddr, 8) != 0) {
+        return TC_ACT_OK;
+    }
+    if (bpf_skb_load_bytes(skb, tcp_off, &tuple.ipv4.sport, 4) != 0) {
+        return TC_ACT_OK;
+    }
+    ipx_trace("s=%x d=%x\n", tuple.ipv4.saddr, tuple.ipv4.daddr);
+    ipx_trace("sp=%d dp=%d\n",
+              bpf_ntohs(tuple.ipv4.sport), bpf_ntohs(tuple.ipv4.dport));
+
+    // Primary: look up an established socket on the 4-tuple.
+    struct bpf_sock *sk = bpf_skc_lookup_tcp(skb, &tuple, sizeof(tuple.ipv4),
+                                             BPF_F_CURRENT_NETNS, 0);
+    if (sk) {
+        ipx_trace("lookup hit\n");
+        ipx_trace("state=%d\n", sk->state);
+    } else {
+        // Fallback: the listener socket from the sockmap. This mirrors the
+        // handwritten program's trace+lookup sequence verbatim, including
+        // the "listener map" trace line before the lookup call.
+        ipx_trace("listener map\n");
+        __u32 lmap_key = 0;
+        sk = (struct bpf_sock *)bpf_map_lookup_elem(&listener_map, &lmap_key);
+        if (!sk) {
+            return TC_ACT_OK;
+        }
+        ipx_trace("listener use\n");
     }
 
-    return bpf_redirect((int)config->redirect_ifindex, INGRESS_REDIRECT_INGRESS_FLAG);
+    skb->mark = cfg->skb_mark;
+    int assign_rc = bpf_sk_assign(skb, sk, 0);
+    ipx_trace("assign=%d\n", assign_rc);
+    bpf_sk_release(sk);
+    return assign_rc == 0 ? TC_ACT_OK : assign_rc;
 }
 
-char _license[] SEC("license") = "GPL";
-
-#endif  // __BPF_INGRESS_REDIRECT_BPF_C__
+char LICENSE[] SEC("license") = "GPL";
