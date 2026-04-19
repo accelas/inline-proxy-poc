@@ -32,3 +32,4 @@
 # Git worktrees
 .worktrees/
 .worktree/
+.omx/
