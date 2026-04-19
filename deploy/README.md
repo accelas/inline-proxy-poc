@@ -82,6 +82,10 @@ The expected signal is:
 - proxy admin endpoints remain healthy
 - daemon logs / counters show sessions on the node hosting the backend pod
 
+One practical way to force cross-node placement during the demo is to add distinct
+`nodeSelector` or `nodeAffinity` rules to the client pod and one Caddy replica, then
+confirm placement with `kubectl get pods -o wide`.
+
 ## Unannotated control case
 
 Remove the annotation from the Caddy pod template and re-apply:

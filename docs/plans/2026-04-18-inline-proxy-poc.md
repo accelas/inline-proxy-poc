@@ -612,3 +612,9 @@ Expected: PASS.
 git add README.md deploy/README.md docs/plans/2026-04-18-inline-proxy-poc.md
 git commit -m "docs: finalize demo verification guidance"
 ```
+
+## Verification status
+
+- [x] `bazel test //... --test_output=errors` passes
+- [x] `bazel build //src/proxy:proxy_daemon //src/cni:inline_proxy_cni //src/bpf:loader` passes
+- [x] deployment docs describe same-node and cross-node validation

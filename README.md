@@ -45,3 +45,12 @@ The demo workload uses:
 - `inline-proxy-client-demo` traffic generator
 
 See `deploy/README.md` for install and validation commands.
+
+## Verification snapshot
+
+Current verification commands for this branch:
+
+```bash
+bazel test //... --test_output=errors
+bazel build //src/proxy:proxy_daemon //src/cni:inline_proxy_cni //src/bpf:loader
+```
