@@ -128,6 +128,7 @@ CniExecutionResult SpliceExecutor::HandleAdd(const CniInvocation& invocation,
 
     StateStore store(plan.state_path);
     if (!store.Write(BuildStateFields(plan, invocation, workload_pod, *proxy_pod))) {
+        RollbackSplice(plan);
         result.stderr_text = "failed to persist inline proxy splice state";
         return result;
     }
@@ -267,6 +268,22 @@ bool SpliceExecutor::ExecuteSplice(const SplicePlan& plan) const {
     }
 
     return true;
+}
+
+void SpliceExecutor::RollbackSplice(const SplicePlan& plan) const {
+    if (!options_.workload_netns_path.has_value() || !options_.proxy_netns_path.has_value()) {
+        return;
+    }
+    auto workload_netns_fd = OpenNetnsFd(*options_.workload_netns_path);
+    if (!workload_netns_fd) {
+        return;
+    }
+    BestEffortRollback(plan,
+                       PeerNameForPlan(plan),
+                       *options_.workload_netns_path,
+                       *options_.proxy_netns_path,
+                       workload_netns_fd.get(),
+                       SpliceStage::kInstalledReplacement);
 }
 
 }  // namespace inline_proxy

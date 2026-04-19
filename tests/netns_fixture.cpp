@@ -12,6 +12,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <future>
+#include <functional>
 #include <optional>
 #include <string>
 #include <thread>
@@ -42,12 +43,11 @@ std::string Quote(const std::string& value) {
     return "'" + value + "'";
 }
 
-std::string ShortIfName(const std::string& prefix, std::string_view suffix) {
-    std::string ifname = prefix + std::string(suffix);
-    if (ifname.size() > 15) {
-        ifname.resize(15);
-    }
-    return ifname;
+std::string UniqueRootIfName(std::string_view prefix_seed) {
+    const auto hash = static_cast<unsigned int>(std::hash<std::string_view>{}(prefix_seed));
+    char buffer[16] = {};
+    std::snprintf(buffer, sizeof(buffer), "h%08x", hash);
+    return std::string(buffer);
 }
 
 bool HasCapNetAdmin() {
@@ -483,7 +483,7 @@ bool NetnsFixture::RunTransparentRelayScenario() {
 }
 
 bool NetnsFixture::RunSpliceExecutorScenario() {
-    const auto host_ifname = ShortIfName("host", prefix_);
+    const auto host_ifname = UniqueRootIfName(prefix_);
     root_links_.push_back(host_ifname);
     if (!RunCommand("/usr/bin/ip link add " + host_ifname + " type veth peer name eth0") ||
         !RunCommand("/usr/bin/ip link set eth0 netns " + Quote(workload_ns_)) ||

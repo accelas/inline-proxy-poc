@@ -43,6 +43,7 @@ public:
 
 private:
     bool ExecuteSplice(const SplicePlan& plan) const;
+    void RollbackSplice(const SplicePlan& plan) const;
 
     CniExecutionOptions options_;
 };
