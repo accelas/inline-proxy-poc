@@ -68,18 +68,21 @@ bool MatchesNodeLocalProxy(const PodInfo& pod,
     return pod.node_name == node_name;
 }
 
-std::string RenderPrevResultJson(const std::optional<PrevResult>& prev_result) {
-    if (!prev_result.has_value()) {
+std::string RenderPrevResultJson(const CniRequest& request) {
+    if (request.prev_result_json.has_value()) {
+        return *request.prev_result_json;
+    }
+    if (!request.prev_result.has_value()) {
         return "{}";
     }
 
     std::ostringstream out;
     out << "{\"interfaces\":[";
-    for (std::size_t index = 0; index < prev_result->interfaces.size(); ++index) {
+    for (std::size_t index = 0; index < request.prev_result->interfaces.size(); ++index) {
         if (index > 0) {
             out << ',';
         }
-        const auto& iface = prev_result->interfaces[index];
+        const auto& iface = request.prev_result->interfaces[index];
         out << "{\"name\":\"";
         AppendEscaped(out, iface.name);
         out << "\"";

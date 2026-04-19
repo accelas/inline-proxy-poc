@@ -19,6 +19,7 @@
 #include <string>
 #include <utility>
 #include <thread>
+#include <vector>
 
 #include <nlohmann/json.hpp>
 
@@ -37,6 +38,16 @@ std::mutex& FetcherMutex() {
 
 K8sResponseFetcher& Fetcher() {
     static K8sResponseFetcher fetcher;
+    return fetcher;
+}
+
+std::mutex& ListFetcherMutex() {
+    static std::mutex mutex;
+    return mutex;
+}
+
+K8sPodListResponseFetcher& ListFetcher() {
+    static K8sPodListResponseFetcher fetcher;
     return fetcher;
 }
 
@@ -86,6 +97,32 @@ std::string BuildPodPath(const K8sQuery& query) {
     return "/api/v1/namespaces/" + query.namespace_name + "/pods/" + query.pod_name;
 }
 
+std::string UrlEncodeQueryValue(std::string_view value) {
+    std::ostringstream encoded;
+    for (unsigned char ch : value) {
+        if ((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
+            (ch >= '0' && ch <= '9') || ch == '-' || ch == '_' || ch == '.' || ch == '~') {
+            encoded << static_cast<char>(ch);
+        } else {
+            encoded << '%';
+            static constexpr char kHex[] = "0123456789ABCDEF";
+            encoded << kHex[(ch >> 4) & 0x0f] << kHex[ch & 0x0f];
+        }
+    }
+    return encoded.str();
+}
+
+std::string BuildPodListPath(const K8sPodListQuery& query) {
+    if (query.namespace_name.empty()) {
+        throw std::invalid_argument("namespace must be non-empty");
+    }
+    std::string path = "/api/v1/namespaces/" + query.namespace_name + "/pods";
+    if (!query.label_selector.empty()) {
+        path += "?labelSelector=" + UrlEncodeQueryValue(query.label_selector);
+    }
+    return path;
+}
+
 std::string FormatHostLiteral(std::string_view host) {
     if (host.empty()) {
         return std::string(host);
@@ -107,9 +144,9 @@ std::string BuildHostHeader(const K8sClientOptions& options) {
     return host + ":" + options.api_server_port;
 }
 
-std::string BuildHttpRequest(const K8sClientOptions& options, const K8sQuery& query, const std::string& token) {
+std::string BuildHttpRequest(const K8sClientOptions& options, std::string_view path, const std::string& token) {
     std::ostringstream request;
-    request << "GET " << BuildPodPath(query) << " HTTP/1.1\r\n";
+    request << "GET " << path << " HTTP/1.1\r\n";
     request << "Host: " << BuildHostHeader(options) << "\r\n";
     request << "Authorization: Bearer " << token << "\r\n";
     request << "Accept: application/json\r\n";
@@ -346,7 +383,7 @@ int ConnectTcp(const std::string& host, const std::string& port, std::chrono::st
     return fd;
 }
 
-std::string PerformHttpsGet(const K8sClientOptions& options, const K8sQuery& query, const std::string& token) {
+std::string PerformHttpsGet(const K8sClientOptions& options, std::string_view path, const std::string& token) {
     class UniqueFd {
     public:
         explicit UniqueFd(int fd) : fd_(fd) {}
@@ -407,7 +444,7 @@ std::string PerformHttpsGet(const K8sClientOptions& options, const K8sQuery& que
 
     SslConnectWithTimeout(ssl.get(), fd.get(), deadline);
 
-    const std::string request = BuildHttpRequest(options, query, token);
+    const std::string request = BuildHttpRequest(options, path, token);
     SslWriteAllWithTimeout(ssl.get(), fd.get(), deadline, request);
     const std::string response = SslReadAllWithTimeout(ssl.get(), fd.get(), deadline);
 
@@ -457,7 +494,28 @@ std::optional<std::string> FetchPodJson(const K8sClientOptions& options, const K
         throw std::runtime_error("Kubernetes client timeout must be positive");
     }
     const std::string token = Trim(ReadFile(options.token_path));
-    const std::string response = PerformHttpsGet(options, query, token);
+    const std::string response = PerformHttpsGet(options, BuildPodPath(query), token);
+    return ExtractBody(response);
+}
+
+std::optional<std::string> FetchPodListJson(const K8sClientOptions& options, const K8sPodListQuery& query) {
+    K8sPodListResponseFetcher fetcher_copy;
+    {
+        std::lock_guard lock(ListFetcherMutex());
+        fetcher_copy = ListFetcher();
+    }
+    if (fetcher_copy) {
+        return fetcher_copy(options, query);
+    }
+
+    if (options.api_server_host.empty()) {
+        throw std::runtime_error("KUBERNETES_SERVICE_HOST is not set");
+    }
+    if (options.timeout.count() <= 0) {
+        throw std::runtime_error("Kubernetes client timeout must be positive");
+    }
+    const std::string token = Trim(ReadFile(options.token_path));
+    const std::string response = PerformHttpsGet(options, BuildPodListPath(query), token);
     return ExtractBody(response);
 }
 
@@ -492,6 +550,11 @@ void ReadStringMap(const Json& object, const char* key, std::map<std::string, st
 void SetK8sResponseFetcherForTesting(K8sResponseFetcher fetcher) {
     std::lock_guard lock(FetcherMutex());
     Fetcher() = std::move(fetcher);
+}
+
+void SetK8sPodListResponseFetcherForTesting(K8sPodListResponseFetcher fetcher) {
+    std::lock_guard lock(ListFetcherMutex());
+    ListFetcher() = std::move(fetcher);
 }
 
 std::string BuildK8sApiEndpoint(std::string_view host, std::string_view port) {
@@ -542,6 +605,30 @@ std::optional<PodInfo> ParsePodInfo(std::string_view json) {
     return info;
 }
 
+std::vector<PodInfo> ParsePodList(std::string_view json) {
+    const auto parsed = Json::parse(std::string(json), nullptr, false);
+    if (parsed.is_discarded() || !parsed.is_object()) {
+        return {};
+    }
+
+    const auto items_it = parsed.find("items");
+    if (items_it == parsed.end() || !items_it->is_array()) {
+        return {};
+    }
+
+    std::vector<PodInfo> pods;
+    for (const auto& item : *items_it) {
+        if (!item.is_object()) {
+            continue;
+        }
+        const auto pod = ParsePodInfo(item.dump());
+        if (pod.has_value()) {
+            pods.push_back(*pod);
+        }
+    }
+    return pods;
+}
+
 PodInfo FetchPodInfo(const K8sQuery& query) {
     return FetchPodInfo(query, LoadDefaultOptions());
 }
@@ -556,6 +643,37 @@ PodInfo FetchPodInfo(const K8sQuery& query, const K8sClientOptions& options) {
         throw std::runtime_error("failed to parse Kubernetes pod response");
     }
     return *parsed;
+}
+
+std::vector<PodInfo> FetchPodList(const K8sPodListQuery& query) {
+    return FetchPodList(query, LoadDefaultOptions());
+}
+
+std::vector<PodInfo> FetchPodList(const K8sPodListQuery& query, const K8sClientOptions& options) {
+    const auto json = FetchPodListJson(options, query);
+    if (!json) {
+        throw std::runtime_error("Kubernetes API response fetcher returned no data");
+    }
+    return ParsePodList(*json);
+}
+
+std::optional<PodInfo> FindNodeLocalProxyPod(std::string_view node_name) {
+    return FindNodeLocalProxyPod(node_name, LoadDefaultOptions());
+}
+
+std::optional<PodInfo> FindNodeLocalProxyPod(std::string_view node_name, const K8sClientOptions& options) {
+    const K8sPodListQuery query{.namespace_name = "inline-proxy-system", .label_selector = "app=inline-proxy"};
+    for (const auto& pod : FetchPodList(query, options)) {
+        const auto label_it = pod.labels.find("app");
+        if (pod.running &&
+            pod.namespace_name == "inline-proxy-system" &&
+            label_it != pod.labels.end() &&
+            label_it->second == "inline-proxy" &&
+            pod.node_name == node_name) {
+            return pod;
+        }
+    }
+    return std::nullopt;
 }
 
 }  // namespace inline_proxy

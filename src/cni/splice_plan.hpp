@@ -30,6 +30,6 @@ bool MatchesNodeLocalProxy(const PodInfo& pod,
                            std::string_view label_key = "app",
                            std::string_view label_value = "inline-proxy");
 
-std::string RenderPrevResultJson(const std::optional<PrevResult>& prev_result);
+std::string RenderPrevResultJson(const CniRequest& request);
 
 }  // namespace inline_proxy

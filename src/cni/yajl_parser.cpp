@@ -1,6 +1,7 @@
 #include "cni/yajl_parser.hpp"
 
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <type_traits>
@@ -91,6 +92,125 @@ std::optional<PrevResult> ParsePrevResultNode(yajl_val node) {
     return result;
 }
 
+bool IsJsonWhitespace(char ch) {
+    return ch == ' ' || ch == '\n' || ch == '\r' || ch == '\t';
+}
+
+std::optional<std::size_t> FindKeyValueStart(std::string_view input, std::string_view key) {
+    const std::string needle = "\"" + std::string(key) + "\"";
+    std::size_t pos = 0;
+    while (true) {
+        pos = input.find(needle, pos);
+        if (pos == std::string_view::npos) {
+            return std::nullopt;
+        }
+
+        std::size_t cursor = pos + needle.size();
+        while (cursor < input.size() && IsJsonWhitespace(input[cursor])) {
+            ++cursor;
+        }
+        if (cursor >= input.size() || input[cursor] != ':') {
+            pos += 1;
+            continue;
+        }
+        ++cursor;
+        while (cursor < input.size() && IsJsonWhitespace(input[cursor])) {
+            ++cursor;
+        }
+        if (cursor >= input.size()) {
+            return std::nullopt;
+        }
+        return cursor;
+    }
+}
+
+std::optional<std::size_t> ConsumeJsonString(std::string_view input, std::size_t pos) {
+    if (pos >= input.size() || input[pos] != '"') {
+        return std::nullopt;
+    }
+    ++pos;
+    while (pos < input.size()) {
+        const char ch = input[pos++];
+        if (ch == '"') {
+            return pos;
+        }
+        if (ch == '\\' && pos < input.size()) {
+            ++pos;
+        }
+    }
+    return std::nullopt;
+}
+
+std::optional<std::size_t> ConsumeJsonValue(std::string_view input, std::size_t pos) {
+    if (pos >= input.size()) {
+        return std::nullopt;
+    }
+
+    if (input[pos] == '"') {
+        return ConsumeJsonString(input, pos);
+    }
+
+    if (input[pos] == '{' || input[pos] == '[') {
+        const char open = input[pos];
+        const char close = (open == '{') ? '}' : ']';
+        int depth = 0;
+        bool in_string = false;
+        bool escaped = false;
+        for (; pos < input.size(); ++pos) {
+            const char ch = input[pos];
+            if (in_string) {
+                if (escaped) {
+                    escaped = false;
+                    continue;
+                }
+                if (ch == '\\') {
+                    escaped = true;
+                    continue;
+                }
+                if (ch == '"') {
+                    in_string = false;
+                }
+                continue;
+            }
+            if (ch == '"') {
+                in_string = true;
+                continue;
+            }
+            if (ch == open) {
+                ++depth;
+            } else if (ch == close) {
+                --depth;
+                if (depth == 0) {
+                    return pos + 1;
+                }
+            }
+        }
+        return std::nullopt;
+    }
+
+    std::size_t cursor = pos;
+    while (cursor < input.size()) {
+        const char ch = input[cursor];
+        if (ch == ',' || ch == '}' || ch == ']' || IsJsonWhitespace(ch)) {
+            break;
+        }
+        ++cursor;
+    }
+    return cursor;
+}
+
+std::optional<std::string> ExtractRawJsonValue(std::string_view input, std::string_view key) {
+    const auto start = FindKeyValueStart(input, key);
+    if (!start) {
+        return std::nullopt;
+    }
+    const auto end = ConsumeJsonValue(input, *start);
+    if (!end || *end <= *start) {
+        return std::nullopt;
+    }
+    return std::string(input.substr(*start, *end - *start));
+}
+
 }  // namespace
 
 std::optional<PrevResult> ParsePrevResult(std::string_view json) {
@@ -126,6 +246,7 @@ std::optional<CniRequest> ParseCniRequest(std::string_view json) {
     const auto prev_result = yajl_object_get(root.get(), "prevResult");
     if (prev_result) {
         request.prev_result = ParsePrevResultNode(prev_result);
+        request.prev_result_json = ExtractRawJsonValue(input, "prevResult");
         yajl_tree_free(prev_result);
         if (!request.prev_result) {
             return std::nullopt;

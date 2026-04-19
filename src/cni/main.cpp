@@ -25,21 +25,6 @@ std::string ReadStdin() {
     return buffer.str();
 }
 
-std::optional<inline_proxy::PodInfo> ResolveProxyPod(const inline_proxy::PodInfo& workload_pod) {
-    const auto proxy_name = GetEnv("INLINE_PROXY_PROXY_POD_NAME");
-    if (!proxy_name.has_value() || proxy_name->empty()) {
-        return std::nullopt;
-    }
-
-    const auto proxy_namespace = GetEnv("INLINE_PROXY_PROXY_POD_NAMESPACE").value_or("inline-proxy-system");
-    const inline_proxy::K8sQuery query{.namespace_name = proxy_namespace, .pod_name = *proxy_name};
-    const auto proxy_pod = inline_proxy::FetchPodInfo(query);
-    if (!inline_proxy::MatchesNodeLocalProxy(proxy_pod, workload_pod.node_name)) {
-        return std::nullopt;
-    }
-    return proxy_pod;
-}
-
 }  // namespace
 
 int main() {
@@ -98,7 +83,7 @@ int main() {
 
         invocation.request = *request;
 
-        const auto proxy_pod = ResolveProxyPod(workload_pod);
+        const auto proxy_pod = inline_proxy::FindNodeLocalProxyPod(workload_pod.node_name);
         const auto result = executor.HandleAdd(invocation, workload_pod, proxy_pod);
         if (!result.success) {
             std::cerr << result.stderr_text << "\n";

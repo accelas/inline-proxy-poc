@@ -17,7 +17,7 @@ StateFields BuildStateFields(const SplicePlan& plan,
         {"lan_name", plan.lan_name},
         {"pod_name", workload_pod.name},
         {"pod_namespace", workload_pod.namespace_name},
-        {"prev_result", RenderPrevResultJson(invocation.request.prev_result)},
+        {"prev_result", RenderPrevResultJson(invocation.request)},
         {"proxy_name", proxy_pod.name},
         {"proxy_namespace", proxy_pod.namespace_name},
         {"proxy_node_name", proxy_pod.node_name},
@@ -37,7 +37,7 @@ CniExecutionResult SpliceExecutor::HandleAdd(const CniInvocation& invocation,
                                              const PodInfo& workload_pod,
                                              const std::optional<PodInfo>& proxy_pod) const {
     CniExecutionResult result;
-    result.stdout_json = RenderPrevResultJson(invocation.request.prev_result);
+    result.stdout_json = RenderPrevResultJson(invocation.request);
 
     if (IsProxyPod(workload_pod)) {
         result.success = true;

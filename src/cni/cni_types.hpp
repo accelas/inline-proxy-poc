@@ -19,6 +19,7 @@ struct CniRequest {
     std::string cni_version;
     std::string name;
     std::optional<PrevResult> prev_result;
+    std::optional<std::string> prev_result_json;
 };
 
 }  // namespace inline_proxy
