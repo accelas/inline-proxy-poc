@@ -39,3 +39,9 @@ TEST(DeployManifestTest, TargetsK3sCniBinaryDirectory) {
     EXPECT_NE(installer.find("/var/lib/rancher/k3s/data/cni"), std::string::npos);
     EXPECT_NE(script.find("/host/var/lib/rancher/k3s/data/cni"), std::string::npos);
 }
+
+TEST(DeployManifestTest, InstallerAcceptsSymlinkedK3sCniPlugins) {
+    const auto script = ReadText("deploy/scripts/install-cni.sh");
+
+    EXPECT_NE(script.find("-type l"), std::string::npos);
+}

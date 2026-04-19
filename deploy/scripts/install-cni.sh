@@ -10,7 +10,7 @@ SCRIPT_DIR=$(CDPATH= cd -- "$(dirname "$0")" && pwd)
 
 choose_bin_dir() {
   for candidate in "$@"; do
-    if [ -d "$candidate" ] && find "$candidate" -maxdepth 1 -type f | grep -q .; then
+    if [ -d "$candidate" ] && find "$candidate" -maxdepth 1 \( -type f -o -type l \) | grep -q .; then
       printf '%s\n' "$candidate"
       return 0
     fi
