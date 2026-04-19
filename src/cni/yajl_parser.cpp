@@ -2,11 +2,9 @@
 
 #include <memory>
 #include <optional>
-#include <sstream>
 #include <string>
 #include <string_view>
 #include <type_traits>
-#include <vector>
 
 #include "yajl/yajl_tree.h"
 
@@ -92,43 +90,6 @@ std::optional<PrevResult> ParsePrevResultNode(yajl_val node) {
     }
 
     return result;
-}
-
-void AppendEscaped(std::ostringstream& out, std::string_view value) {
-    for (char ch : value) {
-        switch (ch) {
-            case '\\': out << "\\\\"; break;
-            case '"': out << "\\\""; break;
-            case '\b': out << "\\b"; break;
-            case '\f': out << "\\f"; break;
-            case '\n': out << "\\n"; break;
-            case '\r': out << "\\r"; break;
-            case '\t': out << "\\t"; break;
-            default: out << ch; break;
-        }
-    }
-}
-
-std::string RenderPrevResultJson(const PrevResult& prev_result) {
-    std::ostringstream out;
-    out << "{\"interfaces\":[";
-    for (std::size_t index = 0; index < prev_result.interfaces.size(); ++index) {
-        if (index > 0) {
-            out << ',';
-        }
-        const auto& iface = prev_result.interfaces[index];
-        out << "{\"name\":\"";
-        AppendEscaped(out, iface.name);
-        out << "\"";
-        if (iface.sandbox.has_value()) {
-            out << ",\"sandbox\":\"";
-            AppendEscaped(out, *iface.sandbox);
-            out << "\"";
-        }
-        out << "}";
-    }
-    out << "]}";
-    return out.str();
 }
 
 bool IsJsonWhitespace(char ch) {
@@ -414,7 +375,7 @@ std::optional<CniRequest> ParseCniRequest(std::string_view json) {
             return std::nullopt;
         }
         if (!request.prev_result_json.has_value()) {
-            request.prev_result_json = RenderPrevResultJson(*request.prev_result);
+            return std::nullopt;
         }
     }
 

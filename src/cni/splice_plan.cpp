@@ -1,6 +1,6 @@
 #include "cni/splice_plan.hpp"
 
-#include <sstream>
+#include <stdexcept>
 #include <utility>
 
 namespace inline_proxy {
@@ -27,21 +27,6 @@ std::string SanitizeContainerIdForPath(std::string_view container_id) {
         sanitized = "unknown";
     }
     return "container-" + sanitized;
-}
-
-void AppendEscaped(std::ostringstream& out, std::string_view value) {
-    for (char ch : value) {
-        switch (ch) {
-            case '\\': out << "\\\\"; break;
-            case '"': out << "\\\""; break;
-            case '\b': out << "\\b"; break;
-            case '\f': out << "\\f"; break;
-            case '\n': out << "\\n"; break;
-            case '\r': out << "\\r"; break;
-            case '\t': out << "\\t"; break;
-            default: out << ch; break;
-        }
-    }
 }
 
 }  // namespace
@@ -100,26 +85,7 @@ std::string RenderPrevResultJson(const CniRequest& request) {
     if (!request.prev_result.has_value()) {
         return "{}";
     }
-
-    std::ostringstream out;
-    out << "{\"interfaces\":[";
-    for (std::size_t index = 0; index < request.prev_result->interfaces.size(); ++index) {
-        if (index > 0) {
-            out << ',';
-        }
-        const auto& iface = request.prev_result->interfaces[index];
-        out << "{\"name\":\"";
-        AppendEscaped(out, iface.name);
-        out << "\"";
-        if (iface.sandbox.has_value()) {
-            out << ",\"sandbox\":\"";
-            AppendEscaped(out, *iface.sandbox);
-            out << "\"";
-        }
-        out << "}";
-    }
-    out << "]}";
-    return out.str();
+    throw std::logic_error("prevResult JSON missing from parsed CNI request");
 }
 
 }  // namespace inline_proxy
