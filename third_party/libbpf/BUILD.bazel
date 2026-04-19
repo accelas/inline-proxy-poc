@@ -1,0 +1,100 @@
+package(default_visibility = ["//visibility:public"])
+
+# libbpf 1.5.0 static library.
+#
+# Source files are compiled from the upstream `src/` directory, with the
+# upstream header-search paths set up so that `<bpf/libbpf.h>` resolves.
+# The library is consumed by:
+#   - //src/bpf:loader (C++ loader)
+#   - //bazel/bpf:defs.bzl (the bpf_skeleton macro, as the runtime dep for
+#     generated skeleton headers)
+
+_LIBBPF_SRCS = [
+    "src/bpf.c",
+    "src/bpf_prog_linfo.c",
+    "src/btf.c",
+    "src/btf_dump.c",
+    "src/btf_iter.c",
+    "src/btf_relocate.c",
+    "src/elf.c",
+    "src/features.c",
+    "src/gen_loader.c",
+    "src/hashmap.c",
+    "src/libbpf.c",
+    "src/libbpf_errno.c",
+    "src/libbpf_probes.c",
+    "src/linker.c",
+    "src/netlink.c",
+    "src/nlattr.c",
+    "src/relo_core.c",
+    "src/ringbuf.c",
+    "src/str_error.c",
+    "src/strset.c",
+    "src/usdt.c",
+    "src/zip.c",
+]
+
+# Public headers consumers can `#include <bpf/...>`.
+# Listed explicitly so the genrule knows which files to place under bpf/.
+_LIBBPF_PUBLIC_HDRS = [
+    "src/bpf.h",
+    "src/bpf_core_read.h",
+    "src/bpf_endian.h",
+    "src/bpf_gen_internal.h",
+    "src/bpf_helper_defs.h",
+    "src/bpf_helpers.h",
+    "src/bpf_tracing.h",
+    "src/btf.h",
+    "src/libbpf.h",
+    "src/libbpf_common.h",
+    "src/libbpf_legacy.h",
+    "src/libbpf_version.h",
+    "src/skel_internal.h",
+    "src/usdt.bpf.h",
+]
+
+# All headers needed at compile time (private internals + public originals in
+# their natural src/ location).  The public headers are included here so that
+# internal .c files that do `#include "btf.h"` can find them via the
+# `includes = ["src"]` search path without relying solely on the genrule copy.
+_LIBBPF_ALL_HDRS = glob(
+    [
+        "src/*.h",
+        "include/asm/*.h",
+        "include/linux/*.h",
+        "include/uapi/linux/*.h",
+    ],
+)
+
+# The genrule places each public header under bpf/ so that consumers can write
+# `#include <bpf/libbpf.h>`, matching the upstream installed layout.
+genrule(
+    name = "make_bpf_include_dir",
+    srcs = _LIBBPF_PUBLIC_HDRS,
+    outs = ["bpf/" + h.removeprefix("src/") for h in _LIBBPF_PUBLIC_HDRS],
+    cmd = "for f in $(SRCS); do cp \"$$f\" \"$(RULEDIR)/bpf/$$(basename $$f)\"; done",
+)
+
+cc_library(
+    name = "libbpf",
+    srcs = _LIBBPF_SRCS + _LIBBPF_ALL_HDRS,
+    hdrs = [":make_bpf_include_dir"],
+    includes = [
+        ".",
+        "src",
+        "include",
+        "include/uapi",
+    ],
+    copts = [
+        "-std=gnu11",
+        "-D_LARGEFILE64_SOURCE",
+        "-D_FILE_OFFSET_BITS=64",
+        "-Wno-unused-parameter",
+        "-Wno-sign-compare",
+        "-Wno-missing-field-initializers",
+        "-Wno-unused-result",
+        "-Wno-address-of-packed-member",
+    ],
+    linkopts = ["-lelf", "-lz"],
+    linkstatic = True,
+)
