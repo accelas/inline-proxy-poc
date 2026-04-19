@@ -18,6 +18,13 @@ local_path_override(module_name = "yajl", path = "third_party/yajl")
 local_path_override(module_name = "libbpf", path = "third_party/libbpf")
 
 # ============================================================================
+# Host-installed bpftool (build-time only)
+# ============================================================================
+
+host_bpftool_ext = use_extension("//bazel/bpf:host_bpftool.bzl", "host_bpftool")
+use_repo(host_bpftool_ext, "host_bpftool")
+
+# ============================================================================
 # Testing
 # ============================================================================
 
