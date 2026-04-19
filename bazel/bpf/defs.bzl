@@ -48,14 +48,29 @@ def bpf_skeleton(name, src, hdrs = [], copts = []):
     ]
     _clang_copts = " ".join(_default_copts + copts)
 
+    # libbpf BPF-side headers needed by CO-RE programs (#include <bpf/...>).
+    # Adding them as srcs makes Bazel place them in the sandbox and lets us
+    # derive the -I path from one sentinel file.
+    _libbpf_bpf_hdrs = [
+        "@libbpf//:bpf/bpf_core_read.h",
+        "@libbpf//:bpf/bpf_endian.h",
+        "@libbpf//:bpf/bpf_helper_defs.h",
+        "@libbpf//:bpf/bpf_helpers.h",
+        "@libbpf//:bpf/bpf_tracing.h",
+    ]
+    # Sentinel used to derive the -I path: strip the trailing "/bpf/bpf_helpers.h".
+    _sentinel = "@libbpf//:bpf/bpf_helpers.h"
+
     native.genrule(
         name = name + "_compile",
-        srcs = [src] + hdrs,
+        srcs = [src] + hdrs + _libbpf_bpf_hdrs,
         outs = [obj],
         cmd = " ".join([
             _CLANG,
             _clang_copts,
             "-I $$(dirname $(location " + src + "))",
+            # Parent of the bpf/ directory, so #include <bpf/bpf_helpers.h> works.
+            "-I $$(dirname $$(dirname $(location " + _sentinel + ")))",
             "-c $(location " + src + ")",
             "-o $@",
         ]),

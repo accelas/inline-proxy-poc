@@ -1,3 +1,5 @@
+load("//bazel/bpf:defs.bzl", "bpf_skeleton")
+
 package(default_visibility = ["//visibility:public"])
 
 exports_files([
@@ -5,6 +7,15 @@ exports_files([
     "ingress_redirect.bpf.c",
     "ingress_redirect_common.h",
 ])
+
+bpf_skeleton(
+    name = "ingress_redirect_skel",
+    src = "ingress_redirect.bpf.c",
+    hdrs = [
+        "ingress_redirect_common.h",
+        "vmlinux.h",
+    ],
+)
 
 cc_library(
     name = "loader",
@@ -15,9 +26,4 @@ cc_library(
     ],
     deps = ["//src/shared:shared"],
     include_prefix = "bpf",
-)
-
-filegroup(
-    name = "ingress_redirect_bpf",
-    srcs = ["ingress_redirect.bpf.c"],
 )
