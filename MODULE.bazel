@@ -1,7 +1,7 @@
-"""Bazel module configuration for mango-PROJECT_NAME."""
+"""Bazel module configuration for the inline proxy PoC."""
 
 module(
-    name = "mango-PROJECT_NAME",
+    name = "inline_proxy_poc",
     version = "0.1.0",
 )
 
@@ -11,36 +11,17 @@ module(
 
 bazel_dep(name = "rules_cc", version = "0.0.17")
 bazel_dep(name = "rules_pkg", version = "1.0.1")
+bazel_dep(name = "yajl", version = "0.0.0")
+bazel_dep(name = "libbpf", version = "0.0.0")
+
+local_path_override(module_name = "yajl", path = "third_party/yajl")
+local_path_override(module_name = "libbpf", path = "third_party/libbpf")
 
 # ============================================================================
 # Testing
 # ============================================================================
 
 bazel_dep(name = "googletest", version = "1.15.2")
-
-# ============================================================================
-# Common Dependencies (uncomment as needed)
-# ============================================================================
-
-# Logging
-# bazel_dep(name = "spdlog", version = "1.15.3")
-
-# Configuration parsing
-# bazel_dep(name = "yaml-cpp", version = "0.8.0")
-
-# Serialization
-# bazel_dep(name = "protobuf", version = "29.3")
-# bazel_dep(name = "flatbuffers", version = "25.2.10")
-
-# Messaging
-# bazel_dep(name = "libzmq", version = "4.3.5")
-# bazel_dep(name = "cppzmq", version = "4.10.0")
-
-# ============================================================================
-# C++ Toolchain
-# ============================================================================
-
-register_toolchains("//toolchain:cc_toolchain_for_k8")
 
 # ============================================================================
 # Development Tools

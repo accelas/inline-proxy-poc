@@ -1,0 +1,25 @@
+#ifndef INLINE_PROXY_BPF_INGRESS_REDIRECT_COMMON_H_
+#define INLINE_PROXY_BPF_INGRESS_REDIRECT_COMMON_H_
+
+#include <linux/bpf.h>
+
+struct ingress_redirect_config {
+    __u32 enabled;
+    __u32 listener_port;
+    __u32 redirect_ifindex;
+};
+
+typedef struct ingress_redirect_config IngressRedirectConfig;
+
+enum {
+    INGRESS_REDIRECT_MAP_KEY_ZERO = 0u,
+    INGRESS_REDIRECT_HELPER_MAP_LOOKUP_ELEM = 1,
+    INGRESS_REDIRECT_HELPER_REDIRECT = 23,
+    INGRESS_REDIRECT_HELPER_SKB_LOAD_BYTES = 26,
+};
+
+static const __u32 INGRESS_REDIRECT_IPV4_WIRE_VALUE = 0x0008u;
+static const __u32 INGRESS_REDIRECT_TCP_PROTOCOL = 6u;
+static const __u32 INGRESS_REDIRECT_INGRESS_FLAG = BPF_F_INGRESS;
+
+#endif  // INLINE_PROXY_BPF_INGRESS_REDIRECT_COMMON_H_

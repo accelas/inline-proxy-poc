@@ -1,0 +1,69 @@
+package(default_visibility = ["//visibility:public"])
+
+exports_files(["BUILD.bazel"])
+
+cc_library(
+    name = "cni_types",
+    srcs = ["cni_types.cpp"],
+    hdrs = ["cni_types.hpp"],
+    include_prefix = "cni",
+)
+
+cc_library(
+    name = "cni_args",
+    srcs = ["cni_args.cpp"],
+    hdrs = ["cni_args.hpp"],
+    include_prefix = "cni",
+)
+
+cc_library(
+    name = "cni_parser",
+    srcs = ["yajl_parser.cpp"],
+    hdrs = ["yajl_parser.hpp"],
+    deps = [
+        ":cni_types",
+        "@yajl//:yajl",
+    ],
+    include_prefix = "cni",
+)
+
+cc_library(
+    name = "k8s_client",
+    srcs = ["k8s_client.cpp"],
+    hdrs = ["k8s_client.hpp"],
+    deps = [
+        ":cni_types",
+    ],
+    linkopts = ["-lssl", "-lcrypto"],
+    include_prefix = "cni",
+)
+
+cc_library(
+    name = "cni_splice",
+    srcs = [
+        "splice_executor.cpp",
+        "splice_plan.cpp",
+    ],
+    hdrs = [
+        "splice_executor.hpp",
+        "splice_plan.hpp",
+    ],
+    deps = [
+        ":cni_parser",
+        ":cni_types",
+        ":k8s_client",
+        "//src/shared:shared",
+    ],
+    include_prefix = "cni",
+)
+
+cc_binary(
+    name = "inline_proxy_cni",
+    srcs = ["main.cpp"],
+    deps = [
+        ":cni_splice",
+        ":cni_args",
+        ":cni_parser",
+        ":k8s_client",
+    ],
+)

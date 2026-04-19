@@ -1,0 +1,8 @@
+package(default_visibility = ["//visibility:public"])
+
+cc_library(
+    name = "yajl",
+    srcs = ["yajl_tree.cpp"],
+    hdrs = ["yajl_tree.h"],
+    include_prefix = "yajl",
+)

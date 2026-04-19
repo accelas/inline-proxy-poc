@@ -1,8 +1,222 @@
 cc_test(
-    name = "lib_test",
-    srcs = ["lib_test.cpp"],
+    name = "project_layout_test",
+    srcs = ["project_layout_test.cpp"],
     deps = [
-        "//src:lib",
+        "@googletest//:gtest_main",
+    ],
+    data = [
+        "//src/shared:BUILD.bazel",
+        "//src/proxy:BUILD.bazel",
+        "//src/cni:BUILD.bazel",
+        "//src/bpf:BUILD.bazel",
+        "//deploy:README.md",
+    ],
+)
+
+cc_test(
+    name = "shared_linux_test",
+    srcs = ["shared_linux_test.cpp"],
+    deps = [
+        "@googletest//:gtest_main",
+        "//src/shared:shared",
+    ],
+)
+
+cc_test(
+    name = "scoped_fd_close_test",
+    srcs = ["scoped_fd_close_test.cpp"],
+    deps = [
+        "@googletest//:gtest_main",
+        "//src/shared:shared",
+    ],
+)
+
+
+cc_test(
+    name = "admin_http_test",
+    srcs = ["admin_http_test.cpp"],
+    deps = [
+        "@googletest//:gtest_main",
+        "//src/proxy:proxy",
+    ],
+)
+
+
+cc_test(
+    name = "event_loop_test",
+    srcs = ["event_loop_test.cpp"],
+    deps = [
+        "@googletest//:gtest_main",
+        "//src/shared:shared",
+    ],
+)
+
+
+cc_test(
+    name = "transparent_socket_test",
+    srcs = ["transparent_socket_test.cpp"],
+    deps = [
+        "@googletest//:gtest_main",
+        "//src/proxy:proxy",
+        "//src/shared:shared",
+    ],
+)
+
+cc_test(
+    name = "relay_session_test",
+    srcs = ["relay_session_test.cpp"],
+    deps = [
+        "@googletest//:gtest_main",
+        "//src/proxy:proxy",
+        "//src/shared:shared",
+    ],
+)
+
+cc_test(
+    name = "proxy_daemon_config_test",
+    srcs = ["proxy_daemon_config_test.cpp"],
+    deps = [
+        "@googletest//:gtest_main",
+        "//src/proxy:proxy",
+    ],
+)
+
+cc_test(
+    name = "interface_registry_test",
+    srcs = ["interface_registry_test.cpp"],
+    deps = [
+        "@googletest//:gtest_main",
+        "//src/proxy:proxy",
+    ],
+)
+
+cc_test(
+    name = "admin_connection_send_test",
+    srcs = ["admin_connection_send_test.cpp"],
+    deps = [
+        "@googletest//:gtest_main",
+        "//src/proxy:proxy",
+        "//src/shared:shared",
+    ],
+)
+
+cc_test(
+    name = "relay_session_close_callback_test",
+    srcs = ["relay_session_close_callback_test.cpp"],
+    deps = [
+        "@googletest//:gtest_main",
+        "//src/proxy:proxy",
+        "//src/shared:shared",
+    ],
+)
+
+cc_test(
+    name = "bpf_loader_test",
+    srcs = ["bpf_loader_test.cpp"],
+    deps = [
+        "@googletest//:gtest_main",
+        "//src/bpf:loader",
+    ],
+)
+
+
+cc_test(
+    name = "cni_yajl_parser_test",
+    srcs = ["cni_yajl_parser_test.cpp"],
+    deps = [
+        "@googletest//:gtest_main",
+        "//src/cni:cni_parser",
+    ],
+)
+
+cc_test(
+    name = "cni_args_test",
+    srcs = ["cni_args_test.cpp"],
+    deps = [
+        "@googletest//:gtest_main",
+        "//src/cni:cni_args",
+    ],
+)
+
+cc_test(
+    name = "k8s_client_test",
+    srcs = ["k8s_client_test.cpp"],
+    deps = [
+        "@googletest//:gtest_main",
+        "//src/cni:k8s_client",
+    ],
+)
+
+cc_test(
+    name = "splice_plan_test",
+    srcs = ["splice_plan_test.cpp"],
+    deps = [
+        "@googletest//:gtest_main",
+        "//src/cni:cni_splice",
+    ],
+)
+
+cc_test(
+    name = "cni_add_del_test",
+    srcs = ["cni_add_del_test.cpp"],
+    deps = [
+        "@googletest//:gtest_main",
+        "//src/cni:cni_splice",
+        "//src/cni:cni_parser",
+        "//src/shared:shared",
+    ],
+)
+
+cc_library(
+    name = "netns_fixture",
+    srcs = ["netns_fixture.cpp"],
+    hdrs = ["netns_fixture.hpp"],
+    deps = [
+        "//src/cni:cni_parser",
+        "//src/cni:cni_splice",
+        "//src/proxy:proxy",
+        "//src/shared:shared",
+    ],
+)
+
+cc_test(
+    name = "transparent_relay_netns_test",
+    srcs = ["transparent_relay_netns_test.cpp"],
+    size = "large",
+    local = True,
+    deps = [
+        ":netns_fixture",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_test(
+    name = "splice_executor_netns_test",
+    srcs = ["splice_executor_netns_test.cpp"],
+    size = "large",
+    local = True,
+    deps = [
+        ":netns_fixture",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_test(
+    name = "deploy_manifest_test",
+    srcs = ["deploy_manifest_test.cpp"],
+    data = [
+        "//deploy:README.md",
+        "//deploy:base/caddy-demo.yaml",
+        "//deploy:base/client-demo.yaml",
+        "//deploy:base/kustomization.yaml",
+        "//deploy:base/namespace.yaml",
+        "//deploy:base/proxy-daemonset.yaml",
+        "//deploy:base/proxy-installer-daemonset.yaml",
+        "//deploy:base/rbac.yaml",
+        "//deploy:scripts/install-cni.sh",
+        "//deploy:scripts/reconcile-cni.sh",
+    ],
+    deps = [
         "@googletest//:gtest_main",
     ],
 )

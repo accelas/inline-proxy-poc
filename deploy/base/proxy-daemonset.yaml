@@ -1,0 +1,70 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: inline-proxy-daemon
+  namespace: inline-proxy-system
+  labels:
+    app: inline-proxy
+    app.kubernetes.io/name: inline-proxy
+spec:
+  selector:
+    matchLabels:
+      app: inline-proxy
+  template:
+    metadata:
+      labels:
+        app: inline-proxy
+        app.kubernetes.io/name: inline-proxy
+    spec:
+      serviceAccountName: inline-proxy-daemon
+      priorityClassName: system-node-critical
+      tolerations:
+        - operator: Exists
+      containers:
+        - name: proxy-daemon
+          image: ghcr.io/example/inline-proxy/proxy-daemon:latest
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            privileged: true
+            capabilities:
+              add:
+                - NET_ADMIN
+                - NET_RAW
+                - SYS_ADMIN
+                - BPF
+          env:
+            - name: INLINE_PROXY_ADMIN_ADDRESS
+              value: "0.0.0.0"
+            - name: INLINE_PROXY_ADMIN_PORT
+              value: "8080"
+            - name: INLINE_PROXY_TRANSPARENT_ADDRESS
+              value: "127.0.0.1"
+            - name: INLINE_PROXY_TRANSPARENT_PORT
+              value: "15001"
+          ports:
+            - name: admin-http
+              containerPort: 8080
+              protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: admin-http
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: admin-http
+          volumeMounts:
+            - name: bpffs
+              mountPath: /sys/fs/bpf
+              mountPropagation: Bidirectional
+            - name: cni-state
+              mountPath: /var/run/inline-proxy-cni
+      volumes:
+        - name: bpffs
+          hostPath:
+            path: /sys/fs/bpf
+            type: DirectoryOrCreate
+        - name: cni-state
+          hostPath:
+            path: /var/run/inline-proxy-cni
+            type: DirectoryOrCreate

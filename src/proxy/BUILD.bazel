@@ -1,0 +1,39 @@
+package(default_visibility = ["//visibility:public"])
+
+exports_files(["BUILD.bazel"])
+
+cc_library(
+    name = "proxy",
+    srcs = [
+        "admin_http.cpp",
+        "config.cpp",
+        "interface_registry.cpp",
+        "proxy_state.cpp",
+        "relay_session.cpp",
+        "transparent_listener.cpp",
+        "transparent_socket.cpp",
+    ],
+    hdrs = [
+        "admin_http.hpp",
+        "config.hpp",
+        "interface_registry.hpp",
+        "proxy_state.hpp",
+        "relay_session.hpp",
+        "transparent_listener.hpp",
+        "transparent_socket.hpp",
+    ],
+    deps = [
+        "//src/bpf:loader",
+        "//src/shared:shared",
+    ],
+    include_prefix = "proxy",
+)
+
+cc_binary(
+    name = "proxy_daemon",
+    srcs = ["main.cpp"],
+    deps = [
+        ":proxy",
+        "//src/shared:core",
+    ],
+)
