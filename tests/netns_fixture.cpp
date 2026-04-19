@@ -329,7 +329,7 @@ NetnsFixture& NetnsFixture::operator=(NetnsFixture&& other) noexcept {
 }
 
 bool NetnsFixture::HasRequiredPrivileges() {
-    return ::geteuid() == 0 && HasCapNetAdmin() && ::access("/usr/bin/ip", X_OK) == 0;
+    return HasCapNetAdmin() && ::access("/usr/bin/ip", X_OK) == 0;
 }
 
 std::optional<NetnsFixture> NetnsFixture::Create() {
