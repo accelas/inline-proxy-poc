@@ -8,6 +8,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <fstream>
 #include <cstdio>
 #include <cstdlib>
 #include <future>
@@ -31,6 +32,7 @@ namespace inline_proxy {
 namespace {
 
 constexpr std::chrono::seconds kIoTimeout(5);
+constexpr unsigned int kCapNetAdminBit = 12;
 
 std::string NamespacePath(const std::string& name) {
     return "/var/run/netns/" + name;
@@ -38,6 +40,25 @@ std::string NamespacePath(const std::string& name) {
 
 std::string Quote(const std::string& value) {
     return "'" + value + "'";
+}
+
+bool HasCapNetAdmin() {
+    std::ifstream status("/proc/self/status");
+    std::string line;
+    while (std::getline(status, line)) {
+        if (line.rfind("CapEff:\t", 0) != 0) {
+            continue;
+        }
+        const auto hex_caps = line.substr(sizeof("CapEff:\t") - 1);
+        unsigned long long capabilities = 0;
+        try {
+            capabilities = std::stoull(hex_caps, nullptr, 16);
+        } catch (...) {
+            return false;
+        }
+        return (capabilities & (1ULL << kCapNetAdminBit)) != 0;
+    }
+    return false;
 }
 
 bool WaitForReadable(int fd, std::chrono::milliseconds timeout) {
@@ -308,7 +329,7 @@ NetnsFixture& NetnsFixture::operator=(NetnsFixture&& other) noexcept {
 }
 
 bool NetnsFixture::HasRequiredPrivileges() {
-    return ::geteuid() == 0 && ::access("/usr/bin/ip", X_OK) == 0;
+    return ::geteuid() == 0 && HasCapNetAdmin() && ::access("/usr/bin/ip", X_OK) == 0;
 }
 
 std::optional<NetnsFixture> NetnsFixture::Create() {
