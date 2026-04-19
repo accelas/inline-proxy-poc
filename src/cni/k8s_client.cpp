@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cerrno>
+#include <cctype>
 #include <condition_variable>
 #include <fstream>
 #include <mutex>
@@ -467,6 +468,71 @@ std::string SslReadAllWithTimeout(SSL* ssl, int fd, std::chrono::steady_clock::t
     return response;
 }
 
+std::string ToLower(std::string value) {
+    for (char& ch : value) {
+        ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+    }
+    return value;
+}
+
+bool HasChunkedTransferEncoding(std::string_view headers) {
+    std::istringstream stream{std::string(headers)};
+    std::string line;
+    bool first_line = true;
+    while (std::getline(stream, line)) {
+        if (!line.empty() && line.back() == '\r') {
+            line.pop_back();
+        }
+        if (first_line) {
+            first_line = false;
+            continue;
+        }
+        const auto colon = line.find(':');
+        if (colon == std::string::npos) {
+            continue;
+        }
+        const auto name = ToLower(TrimCopy(line.substr(0, colon)));
+        if (name != "transfer-encoding") {
+            continue;
+        }
+        const auto value = ToLower(TrimCopy(line.substr(colon + 1)));
+        if (value.find("chunked") != std::string::npos) {
+            return true;
+        }
+    }
+    return false;
+}
+
+std::string DecodeChunkedBody(std::string_view body) {
+    std::string decoded;
+    std::size_t cursor = 0;
+    while (true) {
+        const auto line_end = body.find("\r\n", cursor);
+        if (line_end == std::string_view::npos) {
+            throw std::runtime_error("malformed chunked HTTP response from Kubernetes API server");
+        }
+        std::string chunk_size_text = TrimCopy(body.substr(cursor, line_end - cursor));
+        const auto semicolon = chunk_size_text.find(';');
+        if (semicolon != std::string::npos) {
+            chunk_size_text = chunk_size_text.substr(0, semicolon);
+        }
+        const std::size_t chunk_size = std::stoul(chunk_size_text, nullptr, 16);
+        cursor = line_end + 2;
+        if (chunk_size == 0) {
+            return decoded;
+        }
+        if (cursor + chunk_size + 2 > body.size()) {
+            throw std::runtime_error("truncated chunked HTTP response from Kubernetes API server");
+        }
+        decoded.append(body.substr(cursor, chunk_size));
+        cursor += chunk_size;
+        if (body.substr(cursor, 2) != "\r\n") {
+            throw std::runtime_error("malformed chunked HTTP response terminator from Kubernetes API server");
+        }
+        cursor += 2;
+    }
+}
+
 int ConnectTcp(const std::string& host, const std::string& port, std::chrono::steady_clock::time_point deadline) {
     if (std::chrono::steady_clock::now() >= deadline) {
         throw std::runtime_error("failed to connect to Kubernetes API server within timeout");
@@ -616,7 +682,12 @@ std::string ExtractBody(const std::string& response) {
         throw std::runtime_error("Kubernetes API request failed with status " + std::to_string(status));
     }
 
-    return response.substr(pos + delimiter.size());
+    const std::string headers = response.substr(0, pos);
+    const std::string body = response.substr(pos + delimiter.size());
+    if (HasChunkedTransferEncoding(headers)) {
+        return DecodeChunkedBody(body);
+    }
+    return body;
 }
 
 std::optional<std::string> FetchPodJson(const K8sClientOptions& options, const K8sQuery& query) {

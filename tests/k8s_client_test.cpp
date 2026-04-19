@@ -395,6 +395,139 @@ private:
     uint16_t port_ = 0;
 };
 
+class ChunkedTlsServer {
+public:
+    ChunkedTlsServer(const TempCertBundle& bundle, std::string body) : body_(std::move(body)) {
+        std::promise<uint16_t> port_promise;
+        auto port_future = port_promise.get_future();
+        thread_ = std::thread([this, bundle, promise = std::move(port_promise)]() mutable {
+            Run(bundle, std::move(promise));
+        });
+        port_ = port_future.get();
+    }
+
+    ~ChunkedTlsServer() {
+        if (client_fd_ >= 0) {
+            ::shutdown(client_fd_, SHUT_RDWR);
+            ::close(client_fd_);
+        }
+        if (server_fd_ >= 0) {
+            ::shutdown(server_fd_, SHUT_RDWR);
+            ::close(server_fd_);
+        }
+        if (thread_.joinable()) {
+            thread_.join();
+        }
+    }
+
+    uint16_t port() const { return port_; }
+
+private:
+    static void WriteAll(SSL* ssl, std::string_view data) {
+        std::size_t offset = 0;
+        while (offset < data.size()) {
+            const int rc = SSL_write(ssl, data.data() + offset, static_cast<int>(data.size() - offset));
+            if (rc <= 0) {
+                throw std::runtime_error("SSL_write failed");
+            }
+            offset += static_cast<std::size_t>(rc);
+        }
+    }
+
+    void WriteChunk(SSL* ssl, std::string_view chunk) {
+        std::ostringstream header;
+        header << std::hex << chunk.size() << "\r\n";
+        WriteAll(ssl, header.str());
+        WriteAll(ssl, chunk);
+        WriteAll(ssl, "\r\n");
+    }
+
+    void Run(const TempCertBundle& bundle, std::promise<uint16_t> promise) {
+        try {
+            server_fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
+            if (server_fd_ < 0) {
+                throw std::runtime_error("socket failed");
+            }
+            int one = 1;
+            if (::setsockopt(server_fd_, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one)) != 0) {
+                throw std::runtime_error("setsockopt failed");
+            }
+
+            sockaddr_in addr{};
+            addr.sin_family = AF_INET;
+            addr.sin_port = 0;
+            if (::inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr) != 1) {
+                throw std::runtime_error("inet_pton failed");
+            }
+            if (::bind(server_fd_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
+                throw std::runtime_error("bind failed");
+            }
+            if (::listen(server_fd_, 1) != 0) {
+                throw std::runtime_error("listen failed");
+            }
+
+            socklen_t len = sizeof(addr);
+            if (::getsockname(server_fd_, reinterpret_cast<sockaddr*>(&addr), &len) != 0) {
+                throw std::runtime_error("getsockname failed");
+            }
+            promise.set_value(ntohs(addr.sin_port));
+
+            client_fd_ = ::accept(server_fd_, nullptr, nullptr);
+            if (client_fd_ < 0) {
+                throw std::runtime_error("accept failed");
+            }
+
+            std::unique_ptr<SSL_CTX, decltype(&SSL_CTX_free)> ctx(SSL_CTX_new(TLS_server_method()), &SSL_CTX_free);
+            if (!ctx) {
+                throw std::runtime_error("SSL_CTX_new failed");
+            }
+            if (SSL_CTX_use_certificate_file(ctx.get(), bundle.cert_path.c_str(), SSL_FILETYPE_PEM) != 1) {
+                throw std::runtime_error("SSL_CTX_use_certificate_file failed");
+            }
+            if (SSL_CTX_use_PrivateKey_file(ctx.get(), bundle.key_path.c_str(), SSL_FILETYPE_PEM) != 1) {
+                throw std::runtime_error("SSL_CTX_use_PrivateKey_file failed");
+            }
+
+            SSL* ssl_raw = SSL_new(ctx.get());
+            if (!ssl_raw) {
+                throw std::runtime_error("SSL_new failed");
+            }
+            std::unique_ptr<SSL, decltype(&SSL_free)> ssl(ssl_raw, &SSL_free);
+            if (SSL_set_fd(ssl.get(), client_fd_) != 1) {
+                throw std::runtime_error("SSL_set_fd failed");
+            }
+            if (SSL_accept(ssl.get()) != 1) {
+                throw std::runtime_error("SSL_accept failed");
+            }
+
+            char buffer[4096];
+            (void)SSL_read(ssl.get(), buffer, sizeof(buffer));
+
+            WriteAll(ssl.get(),
+                     "HTTP/1.1 200 OK\r\n"
+                     "Content-Type: application/json\r\n"
+                     "Transfer-Encoding: chunked\r\n"
+                     "\r\n");
+            const auto midpoint = body_.size() / 2;
+            WriteChunk(ssl.get(), std::string_view(body_).substr(0, midpoint));
+            WriteChunk(ssl.get(), std::string_view(body_).substr(midpoint));
+            WriteAll(ssl.get(), "0\r\n\r\n");
+            (void)SSL_shutdown(ssl.get());
+        } catch (...) {
+            try {
+                promise.set_exception(std::current_exception());
+            } catch (...) {
+            }
+        }
+    }
+
+    std::string body_;
+    std::thread thread_;
+    int server_fd_ = -1;
+    int client_fd_ = -1;
+    uint16_t port_ = 0;
+};
+
 class BackloggedDualStackServer {
 public:
     BackloggedDualStackServer() {
@@ -636,6 +769,31 @@ TEST(K8sClientTest, FetchPodInfoLoadsDefaultOptionsFromKubeconfig) {
     EXPECT_TRUE(pod.running);
 
     inline_proxy::SetK8sResponseFetcherForTesting({});
+}
+
+TEST(K8sClientTest, FetchPodInfoParsesChunkedHttpResponse) {
+    auto bundle = CreateTempCertBundle();
+    WritePemFiles(bundle);
+
+    ChunkedTlsServer server(bundle, R"({
+        "metadata":{"name":"proxy-1","namespace":"inline-proxy-system"},
+        "spec":{"nodeName":"worker-1"},
+        "status":{"phase":"Running"}
+    })");
+
+    inline_proxy::K8sClientOptions options;
+    options.api_server_host = "localhost";
+    options.api_server_port = std::to_string(server.port());
+    options.token_path = bundle.token_path;
+    options.ca_path = bundle.cert_path;
+    options.timeout = std::chrono::milliseconds(1000);
+
+    const inline_proxy::K8sQuery query{.namespace_name = "inline-proxy-system", .pod_name = "proxy-1"};
+    const auto pod = inline_proxy::FetchPodInfo(query, options);
+    EXPECT_EQ(pod.name, "proxy-1");
+    EXPECT_EQ(pod.namespace_name, "inline-proxy-system");
+    EXPECT_EQ(pod.node_name, "worker-1");
+    EXPECT_TRUE(pod.running);
 }
 
 TEST(K8sClientTest, TimesOutWhenApiserverStopsRespondingAfterTlsHandshake) {
