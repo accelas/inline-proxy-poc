@@ -1,5 +1,6 @@
 #include "proxy/config.hpp"
 
+#include <arpa/inet.h>
 #include <algorithm>
 #include <cstddef>
 #include <charconv>
@@ -33,8 +34,12 @@ namespace inline_proxy {
 namespace {
 
 constexpr std::string_view kAdminPortEnv = "INLINE_PROXY_ADMIN_PORT";
+constexpr std::string_view kAdminAddressEnv = "INLINE_PROXY_ADMIN_ADDRESS";
 constexpr std::string_view kTransparentPortEnv = "INLINE_PROXY_TRANSPARENT_PORT";
+constexpr std::string_view kTransparentAddressEnv = "INLINE_PROXY_TRANSPARENT_ADDRESS";
+constexpr std::string_view kAdminAddressPrefix = "--admin-address=";
 constexpr std::string_view kAdminPrefix = "--admin-port=";
+constexpr std::string_view kTransparentAddressPrefix = "--transparent-address=";
 constexpr std::string_view kTransparentPrefix = "--transparent-port=";
 constexpr std::string_view kInlineProxyPrefix = "INLINE_PROXY_";
 
@@ -70,8 +75,21 @@ std::uint16_t ParsePortOrThrow(std::string_view value, std::string_view source) 
     return static_cast<std::uint16_t>(parsed);
 }
 
+std::string ParseAddressOrThrow(std::string_view value, std::string_view source) {
+    if (value.empty()) {
+        throw std::invalid_argument(std::string(source) + " must not be empty");
+    }
+    in_addr ipv4{};
+    if (::inet_pton(AF_INET, std::string(value).c_str(), &ipv4) != 1) {
+        throw std::invalid_argument(std::string(source) + " must be a valid IPv4 address");
+    }
+    return std::string(value);
+}
+
 struct CliParseResult {
+    bool admin_address_seen = false;
     bool admin_seen = false;
+    bool transparent_address_seen = false;
     bool transparent_seen = false;
 };
 
@@ -79,9 +97,21 @@ CliParseResult ParseCliOverrides(ProxyConfig& cfg, int argc, char** argv) {
     CliParseResult seen;
     for (int i = 1; i < argc; ++i) {
         const std::string_view arg(argv[i] ? argv[i] : "");
+        if (arg.rfind(kAdminAddressPrefix, 0) == 0) {
+            cfg.admin_address =
+                ParseAddressOrThrow(arg.substr(kAdminAddressPrefix.size()), kAdminAddressPrefix);
+            seen.admin_address_seen = true;
+            continue;
+        }
         if (arg.rfind(kAdminPrefix, 0) == 0) {
             cfg.admin_port = ParsePortOrThrow(arg.substr(kAdminPrefix.size()), kAdminPrefix);
             seen.admin_seen = true;
+            continue;
+        }
+        if (arg.rfind(kTransparentAddressPrefix, 0) == 0) {
+            cfg.transparent_address = ParseAddressOrThrow(
+                arg.substr(kTransparentAddressPrefix.size()), kTransparentAddressPrefix);
+            seen.transparent_address_seen = true;
             continue;
         }
         if (arg.rfind(kTransparentPrefix, 0) == 0) {
@@ -95,8 +125,16 @@ CliParseResult ParseCliOverrides(ProxyConfig& cfg, int argc, char** argv) {
 }
 
 void ApplyOverride(ProxyConfig& cfg, std::string_view name, std::string_view value) {
+    if (name == kAdminAddressEnv) {
+        cfg.admin_address = ParseAddressOrThrow(value, kAdminAddressEnv);
+        return;
+    }
     if (name == kAdminPortEnv) {
         cfg.admin_port = ParsePortOrThrow(value, kAdminPortEnv);
+        return;
+    }
+    if (name == kTransparentAddressEnv) {
+        cfg.transparent_address = ParseAddressOrThrow(value, kTransparentAddressEnv);
         return;
     }
     if (name == kTransparentPortEnv) {
@@ -121,20 +159,33 @@ void ApplyProcessEnvOverrides(ProxyConfig& cfg, const CliParseResult& cli) {
         }
 
         const std::string_view name = entry.substr(0, eq);
+        const std::string_view value = entry.substr(eq + 1);
         if (name.rfind(kInlineProxyPrefix, 0) != 0) {
             continue;
         }
 
+        if (name == kAdminAddressEnv) {
+            if (!cli.admin_address_seen) {
+                cfg.admin_address = ParseAddressOrThrow(value, kAdminAddressEnv);
+            }
+            continue;
+        }
         if (name == kAdminPortEnv) {
             if (!cli.admin_seen) {
-                cfg.admin_port = ParsePortOrThrow(entry.substr(eq + 1), kAdminPortEnv);
+                cfg.admin_port = ParsePortOrThrow(value, kAdminPortEnv);
             }
             continue;
         }
 
+        if (name == kTransparentAddressEnv) {
+            if (!cli.transparent_address_seen) {
+                cfg.transparent_address = ParseAddressOrThrow(value, kTransparentAddressEnv);
+            }
+            continue;
+        }
         if (name == kTransparentPortEnv) {
             if (!cli.transparent_seen) {
-                cfg.transparent_port = ParsePortOrThrow(entry.substr(eq + 1), kTransparentPortEnv);
+                cfg.transparent_port = ParsePortOrThrow(value, kTransparentPortEnv);
             }
             continue;
         }
@@ -417,13 +468,13 @@ int RunProxyDaemon(const ProxyConfig& cfg) {
     state.set_ready(false);
 
     InterfaceRegistry registry;
-    auto admin_listener = CreatePlainListener("127.0.0.1", cfg.admin_port);
+    auto admin_listener = CreatePlainListener(cfg.admin_address, cfg.admin_port);
     if (!admin_listener) {
         std::cerr << "failed to create admin listener on port " << cfg.admin_port << '\n';
         return 1;
     }
 
-    auto transparent_listener = CreateTransparentListener("0.0.0.0", cfg.transparent_port);
+    auto transparent_listener = CreateTransparentListener(cfg.transparent_address, cfg.transparent_port);
     if (!transparent_listener) {
         std::cerr << "failed to create transparent listener on port " << cfg.transparent_port << '\n';
         return 1;

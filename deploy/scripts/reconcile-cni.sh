@@ -93,5 +93,7 @@ if any(plugin.get("type") == plugin_name for plugin in plugins):
     sys.exit(0)
 
 plugins.append(plugin_entry)
-conf_path.write_text(json.dumps(config, indent=2) + "\n")
+tmp_path = conf_path.with_name(conf_path.name + ".inline-proxy.tmp")
+tmp_path.write_text(json.dumps(config, indent=2) + "\n")
+tmp_path.replace(conf_path)
 PY
