@@ -5,6 +5,7 @@
 #include <string>
 #include <string_view>
 
+#include "cni/cni_args.hpp"
 #include "cni/k8s_client.hpp"
 #include "cni/splice_executor.hpp"
 #include "cni/yajl_parser.hpp"
@@ -16,6 +17,23 @@ std::optional<std::string> GetEnv(std::string_view name) {
     if (const char* value = std::getenv(key.c_str())) {
         return std::string(value);
     }
+    return std::nullopt;
+}
+
+std::optional<inline_proxy::CniPodIdentity> ResolvePodIdentity() {
+    if (const auto cni_args = GetEnv("CNI_ARGS"); cni_args.has_value() && !cni_args->empty()) {
+        if (const auto identity = inline_proxy::ParseCniArgs(*cni_args); identity.has_value()) {
+            return identity;
+        }
+    }
+
+    const auto pod_namespace = GetEnv("K8S_POD_NAMESPACE");
+    const auto pod_name = GetEnv("K8S_POD_NAME");
+    if (pod_namespace.has_value() && !pod_namespace->empty() && pod_name.has_value() &&
+        !pod_name->empty()) {
+        return inline_proxy::CniPodIdentity{.namespace_name = *pod_namespace, .pod_name = *pod_name};
+    }
+
     return std::nullopt;
 }
 
@@ -64,11 +82,9 @@ int main() {
             return 1;
         }
 
-        const auto pod_namespace = GetEnv("K8S_POD_NAMESPACE");
-        const auto pod_name = GetEnv("K8S_POD_NAME");
-        if (!pod_namespace.has_value() || pod_namespace->empty() ||
-            !pod_name.has_value() || pod_name->empty()) {
-            std::cerr << "missing K8S_POD_NAMESPACE or K8S_POD_NAME\n";
+        const auto pod_identity = ResolvePodIdentity();
+        if (!pod_identity.has_value()) {
+            std::cerr << "missing pod identity in CNI_ARGS or legacy env vars\n";
             return 1;
         }
 
@@ -78,7 +94,10 @@ int main() {
             return 1;
         }
 
-        const inline_proxy::K8sQuery workload_query{.namespace_name = *pod_namespace, .pod_name = *pod_name};
+        const inline_proxy::K8sQuery workload_query{
+            .namespace_name = pod_identity->namespace_name,
+            .pod_name = pod_identity->pod_name,
+        };
         const auto workload_pod = inline_proxy::FetchPodInfo(workload_query);
 
         invocation.request = *request;

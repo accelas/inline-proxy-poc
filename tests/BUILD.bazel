@@ -130,6 +130,15 @@ cc_test(
 )
 
 cc_test(
+    name = "cni_args_test",
+    srcs = ["cni_args_test.cpp"],
+    deps = [
+        "@googletest//:gtest_main",
+        "//src/cni:cni_args",
+    ],
+)
+
+cc_test(
     name = "k8s_client_test",
     srcs = ["k8s_client_test.cpp"],
     deps = [

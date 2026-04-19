@@ -11,6 +11,24 @@ std::string TruncateContainerId(std::string_view container_id) {
     return std::string(container_id.substr(0, count));
 }
 
+std::string SanitizeContainerIdForPath(std::string_view container_id) {
+    std::string sanitized;
+    sanitized.reserve(container_id.size());
+    for (const unsigned char ch : container_id) {
+        const bool is_alnum = (ch >= '0' && ch <= '9') || (ch >= 'A' && ch <= 'Z') ||
+                              (ch >= 'a' && ch <= 'z');
+        if (is_alnum || ch == '-' || ch == '_' || ch == '.') {
+            sanitized.push_back(static_cast<char>(ch));
+        } else {
+            sanitized.push_back('_');
+        }
+    }
+    if (sanitized.empty()) {
+        sanitized = "unknown";
+    }
+    return "container-" + sanitized;
+}
+
 void AppendEscaped(std::ostringstream& out, std::string_view value) {
     for (char ch : value) {
         switch (ch) {
@@ -37,7 +55,7 @@ SplicePlan BuildSplicePlan(std::string_view container_id,
     plan.ifname = std::string(ifname);
     plan.wan_name = "wan_" + suffix;
     plan.lan_name = "lan_" + suffix;
-    plan.state_path = std::move(state_root) / (plan.container_id + ".json");
+    plan.state_path = std::move(state_root) / (SanitizeContainerIdForPath(container_id) + ".json");
     return plan;
 }
 
