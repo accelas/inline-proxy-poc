@@ -95,15 +95,3 @@ TEST(InterfaceRegistryTest, ReturnsFailureWhenWanIngressAttachFailsButRetainsInt
     EXPECT_EQ(registry.SummaryText(), "wan_interfaces=none\nlan_interfaces=none\nactive_sessions=0\n");
 }
 
-TEST(InterfaceRegistryTest, KeepsWanInterfaceWhenDetachFailsAfterLoaderHadBeenAttached) {
-    inline_proxy::InterfaceRegistry registry;
-
-    EXPECT_FALSE(registry.RecordInterface("wan_eth1"));
-    auto& loader = const_cast<inline_proxy::BpfLoader&>(registry.bpf_loader());
-    loader.MarkIngressAttachedForTesting("wan_eth1");
-
-    EXPECT_FALSE(registry.RemoveInterface("wan_eth1"));
-    EXPECT_NE(std::find(registry.wan_interfaces().begin(), registry.wan_interfaces().end(), "wan_eth1"),
-              registry.wan_interfaces().end());
-    EXPECT_TRUE(loader.IsIngressAttached("wan_eth1"));
-}

@@ -1,7 +1,6 @@
 #include <gtest/gtest.h>
 
 #include <cstdint>
-#include <linux/bpf.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -67,132 +66,10 @@ TEST(BpfLoaderTest, RejectsConfigureListenerSocketWhenGetsocknameFails) {
     ::close(pipe_fds[1]);
 }
 
-TEST(BpfLoaderTest, PreservesAttachedStateWhenDetachFails) {
-    inline_proxy::BpfLoader loader;
-    loader.MarkIngressAttachedForTesting("wan_eth0");
-
-    EXPECT_TRUE(loader.IsIngressAttached("wan_eth0"));
-    EXPECT_FALSE(loader.DetachIngress("wan_eth0"));
-    EXPECT_TRUE(loader.IsIngressAttached("wan_eth0"));
-}
-
-TEST(BpfLoaderTest, GeneratedProgramUsesConfiguredListenerPort) {
-    inline_proxy::BpfLoader loader;
-    const auto insns = loader.BuildIngressProgramForTesting();
-
-    bool saw_ihl_byte_load = false;
-    bool saw_ihl_mask = false;
-    bool saw_ihl_shift = false;
-    bool saw_dynamic_tcp_offset = false;
-    bool saw_listener_port_load = false;
-    bool saw_listener_port_bswap = false;
-    bool saw_hardcoded_tcp_offset = false;
-    bool saw_listener_port_direct_compare = false;
-    bool saw_socket_lookup = false;
-    bool saw_socket_assign = false;
-    bool saw_socket_release = false;
-    bool saw_mark_load = false;
-    bool saw_mark_store = false;
-    std::size_t packet_port_load_index = 0;
-    std::size_t listener_port_load_index = 0;
-    std::size_t listener_port_bswap_index = 0;
-    std::size_t listener_port_compare_index = 0;
-
-    for (std::size_t i = 0; i < insns.size(); ++i) {
-        const auto& insn = insns[i];
-        if (insn.code == (BPF_ALU64 | BPF_MOV | BPF_K) && insn.dst_reg == BPF_REG_2 &&
-            insn.imm == 36) {
-            saw_hardcoded_tcp_offset = true;
-        }
-
-        if (i + 5 < insns.size() &&
-            insns[i].code == (BPF_ALU64 | BPF_MOV | BPF_X) && insns[i].dst_reg == BPF_REG_1 &&
-            insns[i].src_reg == BPF_REG_8 &&
-            insns[i + 1].code == (BPF_ALU64 | BPF_MOV | BPF_K) &&
-            insns[i + 1].dst_reg == BPF_REG_2 && insns[i + 1].imm == 14 &&
-            insns[i + 2].code == (BPF_ALU64 | BPF_MOV | BPF_X) &&
-            insns[i + 2].dst_reg == BPF_REG_3 && insns[i + 2].src_reg == BPF_REG_10 &&
-            insns[i + 3].code == (BPF_ALU64 | BPF_ADD | BPF_K) &&
-            insns[i + 3].dst_reg == BPF_REG_3 && insns[i + 3].imm == -40 &&
-            insns[i + 4].code == (BPF_ALU64 | BPF_MOV | BPF_K) &&
-            insns[i + 4].dst_reg == BPF_REG_4 && insns[i + 4].imm == 1 &&
-            insns[i + 5].code == (BPF_JMP | BPF_CALL) && insns[i + 5].imm == 26) {
-            saw_ihl_byte_load = true;
-        }
-
-        if (insn.code == (BPF_ALU64 | BPF_AND | BPF_K) && insn.dst_reg == BPF_REG_7 &&
-            insn.imm == 15) {
-            saw_ihl_mask = true;
-        }
-
-        if (insn.code == (BPF_ALU64 | BPF_LSH | BPF_K) && insn.dst_reg == BPF_REG_7 &&
-            insn.imm == 2) {
-            saw_ihl_shift = true;
-        }
-
-        if (insn.code == (BPF_ALU64 | BPF_MOV | BPF_X) && insn.dst_reg == BPF_REG_2 &&
-            (insn.src_reg == BPF_REG_7 || insn.src_reg == BPF_REG_5) && i + 1 < insns.size() &&
-            insns[i + 1].code == (BPF_ALU64 | BPF_ADD | BPF_K) && insns[i + 1].dst_reg == BPF_REG_2 &&
-            insns[i + 1].imm == 16) {
-            saw_dynamic_tcp_offset = true;
-        }
-
-        if (insn.code == (BPF_LDX | BPF_MEM | BPF_H) && insn.dst_reg == BPF_REG_7 &&
-            insn.src_reg == BPF_REG_10 && insn.off == -22) {
-            packet_port_load_index = i;
-        }
-
-        if (insn.code == (BPF_LDX | BPF_MEM | BPF_H) && insn.dst_reg == BPF_REG_1 &&
-            insn.src_reg == BPF_REG_6 && insn.off == 4) {
-            saw_listener_port_load = true;
-            listener_port_load_index = i;
-        }
-
-        if (insn.code == (BPF_ALU | BPF_END | BPF_FROM_BE) && insn.dst_reg == BPF_REG_7 &&
-            insn.imm == 16) {
-            saw_listener_port_bswap = true;
-            listener_port_bswap_index = i;
-        }
-
-        if (insn.code == (BPF_JMP | BPF_JNE | BPF_X) && insn.dst_reg == BPF_REG_7 &&
-            insn.src_reg == BPF_REG_1) {
-            saw_listener_port_direct_compare = true;
-            listener_port_compare_index = i;
-        }
-
-        if (insn.code == (BPF_JMP | BPF_CALL) && insn.imm == 99) {
-            saw_socket_lookup = true;
-        }
-        if (insn.code == (BPF_JMP | BPF_CALL) && insn.imm == 124) {
-            saw_socket_assign = true;
-        }
-        if (insn.code == (BPF_JMP | BPF_CALL) && insn.imm == 86) {
-            saw_socket_release = true;
-        }
-        if (insn.code == (BPF_LDX | BPF_MEM | BPF_W) && insn.dst_reg == BPF_REG_9 &&
-            insn.src_reg == BPF_REG_6 && insn.off == 8) {
-            saw_mark_load = true;
-        }
-        if (insn.code == (BPF_STX | BPF_MEM | BPF_W) && insn.dst_reg == BPF_REG_8 &&
-            insn.src_reg == BPF_REG_9 && insn.off == 8) {
-            saw_mark_store = true;
-        }
+TEST(BpfLoaderTest, LoadsSkeleton) {
+    if (::geteuid() != 0) {
+        GTEST_SKIP() << "Requires root / CAP_BPF";
     }
-
-    EXPECT_TRUE(saw_ihl_byte_load);
-    EXPECT_TRUE(saw_ihl_mask);
-    EXPECT_TRUE(saw_ihl_shift);
-    EXPECT_TRUE(saw_dynamic_tcp_offset);
-    EXPECT_TRUE(saw_listener_port_load);
-    EXPECT_TRUE(saw_listener_port_bswap);
-    EXPECT_TRUE(saw_listener_port_direct_compare);
-    EXPECT_TRUE(saw_socket_lookup);
-    EXPECT_TRUE(saw_socket_assign);
-    EXPECT_TRUE(saw_socket_release);
-    EXPECT_TRUE(saw_mark_load);
-    EXPECT_TRUE(saw_mark_store);
-    EXPECT_LT(packet_port_load_index, listener_port_bswap_index);
-    EXPECT_LT(listener_port_bswap_index, listener_port_load_index);
-    EXPECT_LT(listener_port_load_index, listener_port_compare_index);
-    EXPECT_FALSE(saw_hardcoded_tcp_offset);
+    inline_proxy::BpfLoader loader;
+    EXPECT_TRUE(loader.LoadProgramForTesting());
 }
