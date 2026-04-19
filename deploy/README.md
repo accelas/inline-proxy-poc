@@ -22,7 +22,8 @@ This directory contains k3s-oriented deployment artifacts for the inline proxy P
 
 It installs the `inline_proxy_cni` binary into the active k3s or generic CNI bin
 directory, then calls `scripts/reconcile-cni.sh` to append the chained plugin into
-the active CNI conflist.
+the active CNI conflist. The installer DaemonSet keeps running and re-runs the
+same install/reconcile flow on a fixed interval to catch drift.
 
 If the node has multiple plausible CNI configs, set `INLINE_PROXY_CNI_CONF_FILE`
 in the installer DaemonSet to force the exact file to patch.

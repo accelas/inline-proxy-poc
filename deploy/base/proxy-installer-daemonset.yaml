@@ -28,7 +28,13 @@ spec:
             privileged: true
           command:
             - /bin/sh
-            - /opt/inline-proxy/scripts/install-cni.sh
+            - -ceu
+            - |
+              /bin/sh /opt/inline-proxy/scripts/install-cni.sh
+              while true; do
+                sleep "${INLINE_PROXY_RECONCILE_INTERVAL_SECONDS:-300}"
+                /bin/sh /opt/inline-proxy/scripts/install-cni.sh
+              done
           env:
             - name: INLINE_PROXY_CNI_BINARY_SOURCE
               value: /opt/inline-proxy/bin/inline_proxy_cni
@@ -42,6 +48,8 @@ spec:
               value: inline-proxy.example.com/enabled
             - name: INLINE_PROXY_CNI_CONF_FILE
               value: ""
+            - name: INLINE_PROXY_RECONCILE_INTERVAL_SECONDS
+              value: "300"
           volumeMounts:
             - name: host-cni-bin
               mountPath: /host/opt/cni/bin
