@@ -40,6 +40,13 @@ inline_proxy::PodInfo MakeProxyPod() {
     return pod;
 }
 
+inline_proxy::PodInfo MakePendingProxyPod() {
+    auto pod = MakeProxyPod();
+    pod.phase = "Pending";
+    pod.running = false;
+    return pod;
+}
+
 inline_proxy::CniRequest MakeRequest() {
     const std::string json = R"({"cniVersion":"1.0.0","name":"k8s-pod-network","prevResult":{"dns":{"nameservers":["1.1.1.1"],"search":["svc.cluster.local"]},"interfaces":[{"name":"eth0","sandbox":"/var/run/netns/test"}],"routes":[{"dst":"10.0.0.0/8","gw":"10.42.0.1"}]}})";
     auto request = inline_proxy::ParseCniRequest(json);
@@ -132,6 +139,27 @@ TEST(CniAddDelTest, ProxyPodAddDoesNotWriteState) {
     ASSERT_TRUE(result.success);
     EXPECT_EQ(result.stdout_json,
               R"({"dns":{"nameservers":["1.1.1.1"],"search":["svc.cluster.local"]},"interfaces":[{"name":"eth0","sandbox":"/var/run/netns/test"}],"routes":[{"dst":"10.0.0.0/8","gw":"10.42.0.1"}]})");
+    EXPECT_FALSE(std::filesystem::exists(executor.StatePathForContainerId(invocation.container_id)));
+
+    std::filesystem::remove_all(state_root, ec);
+}
+
+TEST(CniAddDelTest, ProxyPodAddDoesNotRequireRunningPhase) {
+    const auto state_root = std::filesystem::temp_directory_path() / "inline_proxy_cni_proxy_pending_test";
+    std::error_code ec;
+    std::filesystem::remove_all(state_root, ec);
+
+    inline_proxy::SpliceExecutor executor({.state_root = state_root});
+    const auto request = MakeRequest();
+    const auto proxy_pod = MakePendingProxyPod();
+    const inline_proxy::CniInvocation invocation{
+        .request = request,
+        .container_id = "1234567890abcdef",
+        .ifname = "eth0",
+    };
+
+    const auto result = executor.HandleAdd(invocation, proxy_pod, std::nullopt);
+    ASSERT_TRUE(result.success);
     EXPECT_FALSE(std::filesystem::exists(executor.StatePathForContainerId(invocation.container_id)));
 
     std::filesystem::remove_all(state_root, ec);

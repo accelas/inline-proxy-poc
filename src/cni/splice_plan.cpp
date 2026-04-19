@@ -60,7 +60,14 @@ SplicePlan BuildSplicePlan(std::string_view container_id,
 }
 
 bool IsProxyPod(const PodInfo& pod) {
-    return MatchesNodeLocalProxy(pod, pod.node_name);
+    if (pod.namespace_name != "inline-proxy-system") {
+        return false;
+    }
+    const auto label = pod.labels.find("app");
+    if (label == pod.labels.end() || label->second != "inline-proxy") {
+        return false;
+    }
+    return !pod.node_name.empty();
 }
 
 bool IsAnnotationEnabled(const PodInfo& pod, std::string_view annotation_key) {

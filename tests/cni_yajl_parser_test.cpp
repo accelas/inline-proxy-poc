@@ -25,14 +25,14 @@ TEST(CniYajlParserTest, ParsesPrevResultInterfaces) {
 
 TEST(CniYajlParserTest, PreservesPrevResultJsonWhenRawExtractionMisses) {
     std::string json =
-        R"({"cniVersion":"1.0.0","name":"k8s-pod-network","prev\u0052esult":{"interfaces":[{"name":"eth0"}]}})";
+        R"({"cniVersion":"1.0.0","name":"k8s-pod-network","prev\u0052esult":{"dns":{"nameservers":["1.1.1.1"]},"interfaces":[{"name":"eth0"}],"routes":[{"dst":"10.0.0.0/8","gw":"10.42.0.1"}]}})";
     auto req = inline_proxy::ParseCniRequest(json);
     ASSERT_TRUE(req.has_value());
     ASSERT_TRUE(req->prev_result.has_value());
     ASSERT_TRUE(req->prev_result_json.has_value());
-    EXPECT_EQ(*req->prev_result_json, R"({"interfaces":[{"name":"eth0"}]})");
+    EXPECT_EQ(*req->prev_result_json,
+              R"({"dns":{"nameservers":["1.1.1.1"]},"interfaces":[{"name":"eth0"}],"routes":[{"dst":"10.0.0.0/8","gw":"10.42.0.1"}]})");
 }
-
 
 TEST(CniYajlParserTest, RejectsMissingName) {
     std::string json = R"({"cniVersion":"1.0.0","prevResult":{"interfaces":[]}})";

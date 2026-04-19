@@ -6,6 +6,7 @@
 #include <string>
 #include <string_view>
 #include <type_traits>
+#include <vector>
 
 #include "yajl/yajl_tree.h"
 
@@ -134,31 +135,154 @@ bool IsJsonWhitespace(char ch) {
     return ch == ' ' || ch == '\n' || ch == '\r' || ch == '\t';
 }
 
+std::optional<std::size_t> ConsumeJsonString(std::string_view input, std::size_t pos);
+std::optional<std::size_t> ConsumeJsonValue(std::string_view input, std::size_t pos);
+
+std::size_t SkipJsonWhitespace(std::string_view input, std::size_t pos) {
+    while (pos < input.size() && IsJsonWhitespace(input[pos])) {
+        ++pos;
+    }
+    return pos;
+}
+
+std::optional<unsigned int> ParseHexDigit(char ch) {
+    if (ch >= '0' && ch <= '9') {
+        return static_cast<unsigned int>(ch - '0');
+    }
+    if (ch >= 'a' && ch <= 'f') {
+        return static_cast<unsigned int>(10 + (ch - 'a'));
+    }
+    if (ch >= 'A' && ch <= 'F') {
+        return static_cast<unsigned int>(10 + (ch - 'A'));
+    }
+    return std::nullopt;
+}
+
+std::optional<char> DecodeJsonEscape(std::string_view input, std::size_t& pos) {
+    if (pos >= input.size()) {
+        return std::nullopt;
+    }
+
+    const char escape = input[pos++];
+    switch (escape) {
+        case '"':
+        case '\\':
+        case '/':
+            return escape;
+        case 'b':
+            return '\b';
+        case 'f':
+            return '\f';
+        case 'n':
+            return '\n';
+        case 'r':
+            return '\r';
+        case 't':
+            return '\t';
+        case 'u': {
+            if (pos + 4 > input.size()) {
+                return std::nullopt;
+            }
+            unsigned int codepoint = 0;
+            for (int i = 0; i < 4; ++i) {
+                const auto digit = ParseHexDigit(input[pos + i]);
+                if (!digit.has_value()) {
+                    return std::nullopt;
+                }
+                codepoint = (codepoint << 4U) | *digit;
+            }
+            pos += 4;
+            if (codepoint > 0x7fU) {
+                return std::nullopt;
+            }
+            return static_cast<char>(codepoint);
+        }
+        default:
+            return std::nullopt;
+    }
+}
+
+std::optional<std::string> DecodeJsonStringToken(std::string_view input,
+                                                 std::size_t string_start,
+                                                 std::size_t string_end) {
+    if (string_start >= input.size() || string_end > input.size() || string_start >= string_end ||
+        input[string_start] != '"' || input[string_end - 1] != '"') {
+        return std::nullopt;
+    }
+
+    std::string decoded;
+    decoded.reserve(string_end - string_start - 2);
+    std::size_t pos = string_start + 1;
+    while (pos + 1 < string_end) {
+        const char ch = input[pos++];
+        if (ch == '\\') {
+            auto decoded_escape = DecodeJsonEscape(input, pos);
+            if (!decoded_escape.has_value() || pos > string_end - 1) {
+                return std::nullopt;
+            }
+            decoded.push_back(*decoded_escape);
+            continue;
+        }
+        decoded.push_back(ch);
+    }
+    return decoded;
+}
+
 std::optional<std::size_t> FindKeyValueStart(std::string_view input, std::string_view key) {
-    const std::string needle = "\"" + std::string(key) + "\"";
-    std::size_t pos = 0;
+    std::size_t pos = SkipJsonWhitespace(input, 0);
+    if (pos >= input.size() || input[pos] != '{') {
+        return std::nullopt;
+    }
+    ++pos;
+
     while (true) {
-        pos = input.find(needle, pos);
-        if (pos == std::string_view::npos) {
+        pos = SkipJsonWhitespace(input, pos);
+        if (pos >= input.size()) {
+            return std::nullopt;
+        }
+        if (input[pos] == '}') {
             return std::nullopt;
         }
 
-        std::size_t cursor = pos + needle.size();
-        while (cursor < input.size() && IsJsonWhitespace(input[cursor])) {
-            ++cursor;
-        }
-        if (cursor >= input.size() || input[cursor] != ':') {
-            pos += 1;
-            continue;
-        }
-        ++cursor;
-        while (cursor < input.size() && IsJsonWhitespace(input[cursor])) {
-            ++cursor;
-        }
-        if (cursor >= input.size()) {
+        const auto key_start = pos;
+        const auto key_end = ConsumeJsonString(input, pos);
+        if (!key_end.has_value()) {
             return std::nullopt;
         }
-        return cursor;
+        const auto decoded_key = DecodeJsonStringToken(input, key_start, *key_end);
+        if (!decoded_key.has_value()) {
+            return std::nullopt;
+        }
+
+        pos = SkipJsonWhitespace(input, *key_end);
+        if (pos >= input.size() || input[pos] != ':') {
+            return std::nullopt;
+        }
+        pos = SkipJsonWhitespace(input, pos + 1);
+        if (pos >= input.size()) {
+            return std::nullopt;
+        }
+
+        if (*decoded_key == key) {
+            return pos;
+        }
+
+        const auto value_end = ConsumeJsonValue(input, pos);
+        if (!value_end.has_value()) {
+            return std::nullopt;
+        }
+        pos = SkipJsonWhitespace(input, *value_end);
+        if (pos >= input.size()) {
+            return std::nullopt;
+        }
+        if (input[pos] == ',') {
+            ++pos;
+            continue;
+        }
+        if (input[pos] == '}') {
+            return std::nullopt;
+        }
+        return std::nullopt;
     }
 }
 
