@@ -42,6 +42,14 @@ std::string Quote(const std::string& value) {
     return "'" + value + "'";
 }
 
+std::string ShortIfName(const std::string& prefix, std::string_view suffix) {
+    std::string ifname = prefix + std::string(suffix);
+    if (ifname.size() > 15) {
+        ifname.resize(15);
+    }
+    return ifname;
+}
+
 bool HasCapNetAdmin() {
     std::ifstream status("/proc/self/status");
     std::string line;
@@ -300,6 +308,9 @@ NetnsFixture::NetnsFixture(std::string prefix,
 
 NetnsFixture::~NetnsFixture() {
     ResetNamespaces();
+    for (const auto& link : root_links_) {
+        RunCommand("/usr/bin/ip link delete " + link);
+    }
     std::error_code ec;
     std::filesystem::remove_all(state_root_, ec);
 }
@@ -347,23 +358,25 @@ std::optional<NetnsFixture> NetnsFixture::Create() {
 bool NetnsFixture::CreateNamespaces() {
     std::error_code ec;
     std::filesystem::create_directories(state_root_, ec);
-    namespaces_created_ = RunCommand("/usr/bin/ip netns add " + Quote(client_ns_)) &&
-                          RunCommand("/usr/bin/ip netns add " + Quote(proxy_ns_)) &&
-                          RunCommand("/usr/bin/ip netns add " + Quote(workload_ns_)) &&
-                          RunCommand("/usr/bin/ip -n " + Quote(client_ns_) + " link set lo up") &&
-                          RunCommand("/usr/bin/ip -n " + Quote(proxy_ns_) + " link set lo up") &&
-                          RunCommand("/usr/bin/ip -n " + Quote(workload_ns_) + " link set lo up");
-    return namespaces_created_;
+    namespaces_created_ = true;
+    const bool ok = RunCommand("/usr/bin/ip netns add " + Quote(client_ns_)) &&
+                    RunCommand("/usr/bin/ip netns add " + Quote(proxy_ns_)) &&
+                    RunCommand("/usr/bin/ip netns add " + Quote(workload_ns_)) &&
+                    RunCommand("/usr/bin/ip -n " + Quote(client_ns_) + " link set lo up") &&
+                    RunCommand("/usr/bin/ip -n " + Quote(proxy_ns_) + " link set lo up") &&
+                    RunCommand("/usr/bin/ip -n " + Quote(workload_ns_) + " link set lo up");
+    if (!ok) {
+        ResetNamespaces();
+    }
+    return ok;
 }
 
 bool NetnsFixture::ResetNamespaces() {
     bool ok = true;
-    if (namespaces_created_) {
-        ok &= RunCommand("/usr/bin/ip netns delete " + Quote(client_ns_));
-        ok &= RunCommand("/usr/bin/ip netns delete " + Quote(proxy_ns_));
-        ok &= RunCommand("/usr/bin/ip netns delete " + Quote(workload_ns_));
-        namespaces_created_ = false;
-    }
+    ok &= RunCommand("/usr/bin/ip netns delete " + Quote(client_ns_));
+    ok &= RunCommand("/usr/bin/ip netns delete " + Quote(proxy_ns_));
+    ok &= RunCommand("/usr/bin/ip netns delete " + Quote(workload_ns_));
+    namespaces_created_ = false;
     return ok;
 }
 
@@ -470,10 +483,12 @@ bool NetnsFixture::RunTransparentRelayScenario() {
 }
 
 bool NetnsFixture::RunSpliceExecutorScenario() {
-    if (!RunCommand("/usr/bin/ip link add host0 type veth peer name eth0") ||
+    const auto host_ifname = ShortIfName("host", prefix_);
+    root_links_.push_back(host_ifname);
+    if (!RunCommand("/usr/bin/ip link add " + host_ifname + " type veth peer name eth0") ||
         !RunCommand("/usr/bin/ip link set eth0 netns " + Quote(workload_ns_)) ||
         !RunCommand("/usr/bin/ip -n " + Quote(workload_ns_) + " link set eth0 up") ||
-        !RunCommand("/usr/bin/ip link set host0 up")) {
+        !RunCommand("/usr/bin/ip link set " + host_ifname + " up")) {
         return false;
     }
 

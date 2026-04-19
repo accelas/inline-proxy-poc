@@ -3,6 +3,7 @@
 #include <filesystem>
 #include <optional>
 #include <string>
+#include <vector>
 
 namespace inline_proxy {
 
@@ -34,6 +35,7 @@ private:
     std::string proxy_ns_;
     std::string workload_ns_;
     std::filesystem::path state_root_;
+    std::vector<std::string> root_links_;
     bool namespaces_created_ = false;
 };
 

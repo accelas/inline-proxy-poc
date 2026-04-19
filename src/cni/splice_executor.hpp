@@ -41,9 +41,9 @@ public:
 
     CniExecutionResult HandleDel(const CniInvocation& invocation) const;
 
+private:
     bool ExecuteSplice(const SplicePlan& plan) const;
 
-private:
     CniExecutionOptions options_;
 };
 
