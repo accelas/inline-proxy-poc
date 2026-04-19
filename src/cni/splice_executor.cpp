@@ -14,6 +14,7 @@
 #include <nlohmann/json.hpp>
 
 #include "cni/netns_resolver.hpp"
+#include "cni/yajl_parser.hpp"
 #include "shared/netlink.hpp"
 #include "shared/netns.hpp"
 #include "shared/scoped_fd.hpp"
@@ -44,6 +45,10 @@ std::string PeerNameForPlan(const SplicePlan& plan) {
     return "peer_" + plan.wan_name.substr(4);
 }
 
+std::string RootWanNameForPlan(const SplicePlan& plan) {
+    return "rwan_" + plan.wan_name.substr(4);
+}
+
 struct RouteConfig {
     std::string dst;
     std::optional<std::string> gw;
@@ -55,14 +60,11 @@ struct WorkloadNetworkConfig {
     std::vector<std::string> pod_ips;
 };
 
-std::optional<unsigned int> WorkloadInterfaceIndex(const CniInvocation& invocation) {
-    if (!invocation.request.prev_result.has_value()) {
-        return std::nullopt;
-    }
-
-    const auto& interfaces = invocation.request.prev_result->interfaces;
+std::optional<unsigned int> WorkloadInterfaceIndex(const PrevResult& prev_result,
+                                                   std::string_view ifname) {
+    const auto& interfaces = prev_result.interfaces;
     for (std::size_t index = 0; index < interfaces.size(); ++index) {
-        if (interfaces[index].name == invocation.ifname) {
+        if (interfaces[index].name == ifname) {
             return static_cast<unsigned int>(index);
         }
     }
@@ -70,18 +72,20 @@ std::optional<unsigned int> WorkloadInterfaceIndex(const CniInvocation& invocati
     return std::nullopt;
 }
 
-std::optional<WorkloadNetworkConfig> ParseWorkloadNetworkConfig(
-    const CniInvocation& invocation) {
-    if (!invocation.request.prev_result_json.has_value()) {
+std::optional<unsigned int> WorkloadInterfaceIndex(const CniInvocation& invocation) {
+    if (!invocation.request.prev_result.has_value()) {
         return std::nullopt;
     }
+    return WorkloadInterfaceIndex(*invocation.request.prev_result, invocation.ifname);
+}
 
-    const auto parsed = Json::parse(*invocation.request.prev_result_json, nullptr, false);
+std::optional<WorkloadNetworkConfig> ParseWorkloadNetworkConfig(std::string_view prev_result_json,
+                                                                std::optional<unsigned int> interface_index) {
+    const auto parsed = Json::parse(prev_result_json, nullptr, false);
     if (parsed.is_discarded() || !parsed.is_object()) {
         return std::nullopt;
     }
 
-    const auto interface_index = WorkloadInterfaceIndex(invocation);
     WorkloadNetworkConfig config;
 
     if (const auto ips_it = parsed.find("ips"); ips_it != parsed.end() && ips_it->is_array()) {
@@ -136,6 +140,15 @@ std::optional<WorkloadNetworkConfig> ParseWorkloadNetworkConfig(
     return config;
 }
 
+std::optional<WorkloadNetworkConfig> ParseWorkloadNetworkConfig(
+    const CniInvocation& invocation) {
+    if (!invocation.request.prev_result_json.has_value()) {
+        return std::nullopt;
+    }
+    return ParseWorkloadNetworkConfig(*invocation.request.prev_result_json,
+                                      WorkloadInterfaceIndex(invocation));
+}
+
 bool RunIp(const std::vector<std::string>& args) {
     if (args.empty()) {
         return false;
@@ -177,8 +190,8 @@ bool FlushInterfaceAddresses(const std::string& ifname) {
     return RunIp({"addr", "flush", "dev", ifname});
 }
 
-bool AddInterfaceRoute(const std::string& ifname, const RouteConfig& route) {
-    std::vector<std::string> args{"route", "add", route.dst};
+bool ReplaceInterfaceRoute(const std::string& ifname, const RouteConfig& route) {
+    std::vector<std::string> args{"route", "replace", route.dst};
     if (route.gw.has_value()) {
         args.push_back("via");
         args.push_back(*route.gw);
@@ -188,14 +201,18 @@ bool AddInterfaceRoute(const std::string& ifname, const RouteConfig& route) {
     return RunIp(args);
 }
 
-bool AddDirectRoute(const std::string& destination, const std::string& ifname) {
-    return RunIp({"route", "add", destination, "dev", ifname});
+bool ReplaceDirectRoute(const std::string& destination, const std::string& ifname) {
+    return RunIp({"route", "replace", destination, "dev", ifname});
 }
 
-bool AddRouteVia(const std::string& destination,
-                const std::string& via,
-                const std::string& ifname) {
-    return RunIp({"route", "add", destination, "via", via, "dev", ifname});
+bool ReplaceRouteVia(const std::string& destination,
+                     const std::string& via,
+                     const std::string& ifname) {
+    return RunIp({"route", "replace", destination, "via", via, "dev", ifname});
+}
+
+bool DeleteRoute(const std::string& destination) {
+    return RunIp({"route", "del", destination});
 }
 
 bool EnableIpv4Forwarding() {
@@ -204,15 +221,6 @@ bool EnableIpv4Forwarding() {
         return false;
     }
     stream << "1\n";
-    return static_cast<bool>(stream);
-}
-
-bool SetInterfaceProxyArp(std::string_view ifname, bool enabled) {
-    std::ofstream stream("/proc/sys/net/ipv4/conf/" + std::string(ifname) + "/proxy_arp");
-    if (!stream) {
-        return false;
-    }
-    stream << (enabled ? "1\n" : "0\n");
     return static_cast<bool>(stream);
 }
 
@@ -226,6 +234,10 @@ std::string ForceHostMask(std::string_view cidr) {
 }
 
 struct RoutedLinkConfig {
+    std::string root_wan_cidr;
+    std::string root_wan_ip;
+    std::string proxy_wan_cidr;
+    std::string proxy_wan_ip;
     std::string proxy_lan_cidr;
     std::string proxy_lan_ip;
     std::string workload_lan_cidr;
@@ -240,13 +252,14 @@ RoutedLinkConfig RoutedLinkConfigForPlan(const SplicePlan& plan) {
     } catch (...) {
         seed = 1;
     }
-    const unsigned int block = seed % (254U * 64U);
-    const unsigned int octet2 = 1U + (block / 64U);
-    const unsigned int octet3_base = (block % 64U) * 4U;
+    const unsigned int octet = 1U + (seed % 254U);
     RoutedLinkConfig cfg;
-    cfg.proxy_lan_ip = "169.254." + std::to_string(octet2) + "." + std::to_string(octet3_base + 1U);
-    cfg.workload_lan_ip =
-        "169.254." + std::to_string(octet2) + "." + std::to_string(octet3_base + 2U);
+    cfg.root_wan_ip = "169.254." + std::to_string(octet) + ".1";
+    cfg.proxy_wan_ip = "169.254." + std::to_string(octet) + ".2";
+    cfg.root_wan_cidr = cfg.root_wan_ip + "/30";
+    cfg.proxy_wan_cidr = cfg.proxy_wan_ip + "/30";
+    cfg.proxy_lan_ip = "169.254." + std::to_string(octet) + ".5";
+    cfg.workload_lan_ip = "169.254." + std::to_string(octet) + ".6";
     cfg.proxy_lan_cidr = cfg.proxy_lan_ip + "/30";
     cfg.workload_lan_cidr = cfg.workload_lan_ip + "/30";
     return cfg;
@@ -261,6 +274,13 @@ int RouteTableForPlan(const SplicePlan& plan) {
         seed = 1;
     }
     return 1000 + static_cast<int>(seed % 30000U);
+}
+
+std::optional<std::string> PrimaryPodIp(const WorkloadNetworkConfig& network_config) {
+    if (network_config.pod_ips.empty()) {
+        return std::nullopt;
+    }
+    return network_config.pod_ips.front();
 }
 
 bool AddDirectRouteInTable(const std::string& destination,
@@ -352,6 +372,8 @@ StateFields BuildStateFields(const SplicePlan& plan,
                              const PodInfo& proxy_pod,
                              const ResolvedNetnsPaths& netns_paths) {
     const auto network_config = ParseWorkloadNetworkConfig(invocation);
+    const auto root_wan_name = RootWanNameForPlan(plan);
+    const auto workload_peer_name = PeerNameForPlan(plan);
     std::string pod_ips_joined;
     if (network_config.has_value()) {
         bool first = true;
@@ -376,7 +398,9 @@ StateFields BuildStateFields(const SplicePlan& plan,
         {"proxy_namespace", proxy_pod.namespace_name},
         {"proxy_node_name", proxy_pod.node_name},
         {"route_table", std::to_string(RouteTableForPlan(plan))},
+        {"root_wan_name", root_wan_name},
         {"wan_name", plan.wan_name},
+        {"workload_peer_name", workload_peer_name},
         {"workload_netns_path", netns_paths.workload.string()},
     };
 }
@@ -440,13 +464,53 @@ CniExecutionResult SpliceExecutor::HandleDel(const CniInvocation& invocation) co
     const StateStore store(StatePathForContainerId(invocation.container_id));
     const auto state = store.Read();
     if (state.has_value()) {
-        const auto wan_it = state->find("wan_name");
+        const auto ifname_it = state->find("ifname");
         const auto lan_it = state->find("lan_name");
         const auto pod_ips_it = state->find("pod_ips");
         const auto proxy_ns_it = state->find("proxy_netns_path");
         const auto route_table_it = state->find("route_table");
-        if (wan_it != state->end() && lan_it != state->end() && proxy_ns_it != state->end() &&
-            !proxy_ns_it->second.empty() &&
+        const auto root_wan_it = state->find("root_wan_name");
+        const auto workload_ns_it = state->find("workload_netns_path");
+        const auto prev_result_it = state->find("prev_result");
+        const auto ifname = ifname_it != state->end() ? ifname_it->second : "eth0";
+        std::optional<WorkloadNetworkConfig> network_config;
+
+        if (prev_result_it != state->end()) {
+            const auto request = ParseCniRequest(std::string(
+                R"({"cniVersion":"1.0.0","name":"restore","prevResult":)" +
+                prev_result_it->second + "}"));
+            if (request.has_value() && request->prev_result.has_value()) {
+                network_config = ParseWorkloadNetworkConfig(
+                    prev_result_it->second,
+                    WorkloadInterfaceIndex(*request->prev_result, ifname));
+            }
+        }
+
+        if (workload_ns_it != state->end() && network_config.has_value() &&
+            std::filesystem::exists(workload_ns_it->second)) {
+            if (auto workload_ns = ScopedNetns::Enter(workload_ns_it->second)) {
+                FlushInterfaceAddresses(ifname);
+                for (const auto& address : network_config->addresses) {
+                    (void)AddInterfaceAddress(ifname, address);
+                }
+                for (const auto& route : network_config->routes) {
+                    (void)ReplaceInterfaceRoute(ifname, route);
+                }
+            }
+        }
+
+        if (root_wan_it != state->end() && pod_ips_it != state->end()) {
+            std::stringstream pod_ips_stream(pod_ips_it->second);
+            std::string pod_ip;
+            while (std::getline(pod_ips_stream, pod_ip, ',')) {
+                if (!pod_ip.empty()) {
+                    (void)DeleteRoute(pod_ip + "/32");
+                }
+            }
+            (void)DeleteLink(root_wan_it->second);
+        }
+
+        if (lan_it != state->end() && proxy_ns_it != state->end() && !proxy_ns_it->second.empty() &&
             std::filesystem::exists(proxy_ns_it->second)) {
             if (auto proxy_ns = ScopedNetns::Enter(proxy_ns_it->second)) {
                 if (route_table_it != state->end()) {
@@ -457,13 +521,13 @@ CniExecutionResult SpliceExecutor::HandleDel(const CniInvocation& invocation) co
                         while (std::getline(pod_ips_stream, pod_ip, ',')) {
                             if (!pod_ip.empty()) {
                                 DeleteSourceRule(pod_ip + "/32", table);
+                                DeleteRoute(pod_ip + "/32");
                             }
                         }
                     }
                     FlushRouteTable(table);
                 }
                 DeleteLink(lan_it->second);
-                DeleteLink(wan_it->second);
             }
         }
     }
@@ -521,255 +585,131 @@ bool SpliceExecutor::ExecuteSplice(const SplicePlan& plan,
         return false;
     }
 
-    SpliceStage stage = SpliceStage::kInitial;
+    const auto root_wan_name = RootWanNameForPlan(plan);
     const auto peer_name = PeerNameForPlan(plan);
+    const auto routed_link = RoutedLinkConfigForPlan(plan);
+    const int route_table = RouteTableForPlan(plan);
+    const auto primary_pod_ip = PrimaryPodIp(*network_config);
     std::optional<unsigned int> workload_mtu;
-
     {
         auto workload_ns = ScopedNetns::Enter(netns_paths.workload);
         if (!workload_ns) {
             return false;
         }
         workload_mtu = ReadLinkMtu(plan.ifname);
-        if (!RenameLink(plan.ifname, plan.wan_name)) {
-            return false;
+    }
+
+    auto cleanup = [&] {
+        (void)DeleteLink(root_wan_name);
+        if (auto proxy_ns = ScopedNetns::Enter(netns_paths.proxy)) {
+            (void)DeleteLink(plan.lan_name);
+            for (const auto& pod_ip : network_config->pod_ips) {
+                (void)DeleteSourceRule(pod_ip + "/32", route_table);
+                (void)DeleteRoute(pod_ip + "/32");
+            }
+            (void)FlushRouteTable(route_table);
         }
-        stage = SpliceStage::kRenamedWorkload;
-        if (!MoveLinkToNetns(plan.wan_name, proxy_netns_fd.get())) {
-            BestEffortRollback(plan,
-                               peer_name,
-                               netns_paths.workload,
-                               netns_paths.proxy,
-                               workload_netns_fd.get(),
-                               stage);
-            return false;
-        }
-        stage = SpliceStage::kMovedWanToProxy;
+    };
+
+    if (!CreateVethPair(root_wan_name, plan.wan_name)) {
+        return false;
+    }
+    if (workload_mtu.has_value() &&
+        (!SetLinkMtu(root_wan_name, *workload_mtu) ||
+         !SetLinkMtu(plan.wan_name, *workload_mtu))) {
+        cleanup();
+        return false;
+    }
+    if (!MoveLinkToNetns(plan.wan_name, proxy_netns_fd.get())) {
+        cleanup();
+        return false;
+    }
+    if (!AddInterfaceAddress(root_wan_name, routed_link.root_wan_cidr) || !SetLinkUp(root_wan_name)) {
+        cleanup();
+        return false;
     }
 
     {
         auto proxy_ns = ScopedNetns::Enter(netns_paths.proxy);
         if (!proxy_ns) {
-            BestEffortRollback(plan,
-                               peer_name,
-                               netns_paths.workload,
-                               netns_paths.proxy,
-                               workload_netns_fd.get(),
-                               stage);
+            cleanup();
             return false;
         }
-        if (!SetLinkUp(plan.wan_name)) {
-            BestEffortRollback(plan,
-                               peer_name,
-                               netns_paths.workload,
-                               netns_paths.proxy,
-                               workload_netns_fd.get(),
-                               stage);
+        if (!AddInterfaceAddress(plan.wan_name, routed_link.proxy_wan_cidr) ||
+            !SetLinkUp(plan.wan_name) ||
+            !CreateVethPair(plan.lan_name, peer_name)) {
+            cleanup();
             return false;
         }
-        if (!SetInterfaceProxyArp(plan.wan_name, true)) {
-            BestEffortRollback(plan,
-                               peer_name,
-                               netns_paths.workload,
-                               netns_paths.proxy,
-                               workload_netns_fd.get(),
-                               stage);
-            return false;
-        }
-        if (!CreateVethPair(plan.lan_name, peer_name)) {
-            BestEffortRollback(plan,
-                               peer_name,
-                               netns_paths.workload,
-                               netns_paths.proxy,
-                               workload_netns_fd.get(),
-                               stage);
-            return false;
-        }
-        stage = SpliceStage::kCreatedReplacementPair;
         if (workload_mtu.has_value() &&
-            (!SetLinkMtu(plan.lan_name, *workload_mtu) ||
-             !SetLinkMtu(peer_name, *workload_mtu))) {
-            BestEffortRollback(plan,
-                               peer_name,
-                               netns_paths.workload,
-                               netns_paths.proxy,
-                               workload_netns_fd.get(),
-                               stage);
+            (!SetLinkMtu(plan.lan_name, *workload_mtu) || !SetLinkMtu(peer_name, *workload_mtu))) {
+            cleanup();
             return false;
         }
-        if (!FlushInterfaceAddresses(plan.wan_name)) {
-            BestEffortRollback(plan,
-                               peer_name,
-                               netns_paths.workload,
-                               netns_paths.proxy,
-                               workload_netns_fd.get(),
-                               stage);
-            return false;
-        }
-        if (!SetLinkUp(plan.lan_name)) {
-            BestEffortRollback(plan,
-                               peer_name,
-                               netns_paths.workload,
-                               netns_paths.proxy,
-                               workload_netns_fd.get(),
-                               stage);
-            return false;
-        }
-        if (!MoveLinkToNetns(peer_name, workload_netns_fd.get())) {
-            BestEffortRollback(plan,
-                               peer_name,
-                               netns_paths.workload,
-                               netns_paths.proxy,
-                               workload_netns_fd.get(),
-                               stage);
-            return false;
-        }
-        stage = SpliceStage::kMovedPeerToWorkload;
-    }
-
-    {
-        auto workload_ns = ScopedNetns::Enter(netns_paths.workload);
-        if (!workload_ns) {
-            BestEffortRollback(plan,
-                               peer_name,
-                               netns_paths.workload,
-                               netns_paths.proxy,
-                               workload_netns_fd.get(),
-                               stage);
-            return false;
-        }
-        if (!RenameLink(peer_name, plan.ifname)) {
-            BestEffortRollback(plan,
-                               peer_name,
-                               netns_paths.workload,
-                               netns_paths.proxy,
-                               workload_netns_fd.get(),
-                               stage);
-            return false;
-        }
-        stage = SpliceStage::kInstalledReplacement;
-        if (workload_mtu.has_value() && !SetLinkMtu(plan.ifname, *workload_mtu)) {
-            BestEffortRollback(plan,
-                               peer_name,
-                               netns_paths.workload,
-                               netns_paths.proxy,
-                               workload_netns_fd.get(),
-                               stage);
-            return false;
-        }
-        if (!SetLinkUp(plan.ifname)) {
-            BestEffortRollback(plan,
-                               peer_name,
-                               netns_paths.workload,
-                               netns_paths.proxy,
-                               workload_netns_fd.get(),
-                               stage);
-            return false;
-        }
-        const auto routed_link = RoutedLinkConfigForPlan(plan);
-        if (!AddInterfaceAddress(plan.ifname, routed_link.workload_lan_cidr)) {
-            BestEffortRollback(plan,
-                               peer_name,
-                               netns_paths.workload,
-                               netns_paths.proxy,
-                               workload_netns_fd.get(),
-                               stage);
-            return false;
-        }
-        for (const auto& address : network_config->addresses) {
-            if (!AddInterfaceAddress(plan.ifname, ForceHostMask(address))) {
-                BestEffortRollback(plan,
-                                   peer_name,
-                                   netns_paths.workload,
-                                   netns_paths.proxy,
-                                   workload_netns_fd.get(),
-                                   stage);
-                return false;
-            }
-        }
-        for (const auto& route : network_config->routes) {
-            if (!AddRouteVia(route.dst, routed_link.proxy_lan_ip, plan.ifname)) {
-                BestEffortRollback(plan,
-                                   peer_name,
-                                   netns_paths.workload,
-                                   netns_paths.proxy,
-                                   workload_netns_fd.get(),
-                                   stage);
-                return false;
-            }
-        }
-        stage = SpliceStage::kConfiguredWorkloadRoutes;
-    }
-
-    {
-        auto proxy_ns = ScopedNetns::Enter(netns_paths.proxy);
-        if (!proxy_ns) {
-            BestEffortRollback(plan,
-                               peer_name,
-                               netns_paths.workload,
-                               netns_paths.proxy,
-                               workload_netns_fd.get(),
-                               stage);
-            return false;
-        }
-        const auto routed_link = RoutedLinkConfigForPlan(plan);
-        const int route_table = RouteTableForPlan(plan);
-        if (!AddInterfaceAddress(plan.lan_name, routed_link.proxy_lan_cidr) ||
+        if (!MoveLinkToNetns(peer_name, workload_netns_fd.get()) ||
+            !AddInterfaceAddress(plan.lan_name, routed_link.proxy_lan_cidr) ||
+            !SetLinkUp(plan.lan_name) ||
             !EnableIpv4Forwarding()) {
-            BestEffortRollback(plan,
-                               peer_name,
-                               netns_paths.workload,
-                               netns_paths.proxy,
-                               workload_netns_fd.get(),
-                               stage);
+            cleanup();
             return false;
         }
-        stage = SpliceStage::kConfiguredProxyLan;
-        for (const auto& pod_ip : network_config->pod_ips) {
-            if (!AddRouteVia(pod_ip + "/32", routed_link.workload_lan_ip, plan.lan_name)) {
-                BestEffortRollback(plan,
-                                   peer_name,
-                                   netns_paths.workload,
-                                   netns_paths.proxy,
-                                   workload_netns_fd.get(),
-                                   stage);
-                return false;
-            }
+        if (primary_pod_ip.has_value() &&
+            !ReplaceRouteVia(*primary_pod_ip + "/32", routed_link.workload_lan_ip, plan.lan_name)) {
+            cleanup();
+            return false;
         }
         for (const auto& route : network_config->routes) {
-            if (route.gw.has_value()) {
-                if (!AddDirectRouteInTable(*route.gw + "/32", plan.wan_name, route_table) ||
-                    !AddRouteViaInTable(route.dst, *route.gw, plan.wan_name, route_table)) {
-                    BestEffortRollback(plan,
-                                       peer_name,
-                                       netns_paths.workload,
-                                       netns_paths.proxy,
-                                       workload_netns_fd.get(),
-                                       stage);
-                    return false;
-                }
-            } else if (!AddDirectRouteInTable(route.dst, plan.wan_name, route_table)) {
-                BestEffortRollback(plan,
-                                   peer_name,
-                                   netns_paths.workload,
-                                   netns_paths.proxy,
-                                   workload_netns_fd.get(),
-                                   stage);
+            if (!AddRouteViaInTable(route.dst, routed_link.root_wan_ip, plan.wan_name, route_table)) {
+                cleanup();
                 return false;
             }
         }
         for (const auto& pod_ip : network_config->pod_ips) {
             if (!ReplaceSourceRule(pod_ip + "/32", route_table)) {
-                BestEffortRollback(plan,
-                                   peer_name,
-                                   netns_paths.workload,
-                                   netns_paths.proxy,
-                                   workload_netns_fd.get(),
-                                   stage);
+                cleanup();
                 return false;
             }
         }
-        stage = SpliceStage::kConfiguredProxyRoutes;
+    }
+
+    {
+        auto workload_ns = ScopedNetns::Enter(netns_paths.workload);
+        if (!workload_ns) {
+            cleanup();
+            return false;
+        }
+        if (workload_mtu.has_value() && !SetLinkMtu(peer_name, *workload_mtu)) {
+            cleanup();
+            return false;
+        }
+        if (!AddInterfaceAddress(peer_name, routed_link.workload_lan_cidr) ||
+            !SetLinkUp(peer_name) ||
+            !FlushInterfaceAddresses(plan.ifname)) {
+            cleanup();
+            return false;
+        }
+        for (const auto& address : network_config->addresses) {
+            if (!AddInterfaceAddress(plan.ifname, ForceHostMask(address))) {
+                cleanup();
+                return false;
+            }
+        }
+        if (!SetLinkUp(plan.ifname)) {
+            cleanup();
+            return false;
+        }
+        for (const auto& route : network_config->routes) {
+            if (!ReplaceRouteVia(route.dst, routed_link.proxy_lan_ip, peer_name)) {
+                cleanup();
+                return false;
+            }
+        }
+    }
+
+    if (primary_pod_ip.has_value() &&
+        !ReplaceRouteVia(*primary_pod_ip + "/32", routed_link.proxy_wan_ip, root_wan_name)) {
+        cleanup();
+        return false;
     }
 
     return true;
@@ -780,16 +720,11 @@ void SpliceExecutor::RollbackSplice(const SplicePlan& plan,
     if (options_.splice_runner) {
         return;
     }
-    auto workload_netns_fd = OpenNetnsFd(netns_paths.workload);
-    if (!workload_netns_fd) {
-        return;
+    (void)DeleteLink(RootWanNameForPlan(plan));
+    if (auto proxy_ns = ScopedNetns::Enter(netns_paths.proxy)) {
+        (void)DeleteLink(plan.lan_name);
+        (void)FlushRouteTable(RouteTableForPlan(plan));
     }
-    BestEffortRollback(plan,
-                       PeerNameForPlan(plan),
-                       netns_paths.workload,
-                       netns_paths.proxy,
-                       workload_netns_fd.get(),
-                       SpliceStage::kInstalledReplacement);
 }
 
 }  // namespace inline_proxy

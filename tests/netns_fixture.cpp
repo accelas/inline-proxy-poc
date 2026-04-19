@@ -417,6 +417,17 @@ bool NetnsFixture::BuildBridgeBackedWorkloadTopology(const std::string& workload
                       gateway_ip + " dev ceth0");
 }
 
+bool NetnsFixture::RootLinkExists(const std::string& ifname) const {
+    return LinkIndex(ifname).has_value();
+}
+
+bool NetnsFixture::RootRouteContains(const std::string& destination,
+                                     const std::string& needle) const {
+    const std::string command =
+        "/usr/bin/ip route show exact " + destination + " | /usr/bin/grep -F " + Quote(needle);
+    return RunCommand(command);
+}
+
 bool NetnsFixture::RunTransparentRelayScenario() {
     if (!RunCommand("/usr/bin/ip link add cproxy0 type veth peer name ceth0") ||
         !RunCommand("/usr/bin/ip link set cproxy0 netns " + Quote(proxy_ns_)) ||
@@ -569,7 +580,9 @@ bool NetnsFixture::RunSpliceExecutorScenario() {
     if (!LinkExistsInNamespace(NamespacePath(proxy_ns_), result.plan->wan_name) ||
         !LinkExistsInNamespace(NamespacePath(proxy_ns_), result.plan->lan_name) ||
         !LinkExistsInNamespace(NamespacePath(workload_ns_), "eth0") ||
-        LinkExistsInNamespace(NamespacePath(proxy_ns_), "br_" + result.plan->wan_name.substr(4))) {
+        !LinkExistsInNamespace(NamespacePath(workload_ns_), "peer_" + result.plan->wan_name.substr(4)) ||
+        !RootLinkExists("rwan_" + result.plan->wan_name.substr(4)) ||
+        !RootRouteContains(workload_host_ip + "/32", "rwan_" + result.plan->wan_name.substr(4))) {
         return false;
     }
 

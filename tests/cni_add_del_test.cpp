@@ -52,7 +52,7 @@ inline_proxy::PodInfo MakePendingProxyPod() {
 }
 
 inline_proxy::CniRequest MakeRequest() {
-    const std::string json = R"({"cniVersion":"1.0.0","name":"k8s-pod-network","prevResult":{"dns":{"nameservers":["1.1.1.1"],"search":["svc.cluster.local"]},"interfaces":[{"name":"eth0","sandbox":"/var/run/netns/test"}],"routes":[{"dst":"10.0.0.0/8","gw":"10.42.0.1"}]}})";
+    const std::string json = R"({"cniVersion":"1.0.0","name":"k8s-pod-network","prevResult":{"dns":{"nameservers":["1.1.1.1"],"search":["svc.cluster.local"]},"interfaces":[{"name":"cni0"},{"name":"eth0","sandbox":"/var/run/netns/test"}],"ips":[{"address":"10.42.0.65/24","gateway":"10.42.0.1","interface":1}],"routes":[{"dst":"10.0.0.0/8","gw":"10.42.0.1"},{"dst":"0.0.0.0/0","gw":"10.42.0.1"}]}})";
     auto request = inline_proxy::ParseCniRequest(json);
     EXPECT_TRUE(request.has_value());
     return *request;
@@ -97,7 +97,7 @@ TEST(CniAddDelTest, AnnotatedAddWritesStateAndPassesThroughPrevResult) {
     const auto result = executor.HandleAdd(invocation, workload_pod, proxy_pod);
     ASSERT_TRUE(result.success);
     EXPECT_EQ(result.stdout_json,
-              R"({"dns":{"nameservers":["1.1.1.1"],"search":["svc.cluster.local"]},"interfaces":[{"name":"eth0","sandbox":"/var/run/netns/test"}],"routes":[{"dst":"10.0.0.0/8","gw":"10.42.0.1"}]})");
+              R"({"dns":{"nameservers":["1.1.1.1"],"search":["svc.cluster.local"]},"interfaces":[{"name":"cni0"},{"name":"eth0","sandbox":"/var/run/netns/test"}],"ips":[{"address":"10.42.0.65/24","gateway":"10.42.0.1","interface":1}],"routes":[{"dst":"10.0.0.0/8","gw":"10.42.0.1"},{"dst":"0.0.0.0/0","gw":"10.42.0.1"}]})");
     ASSERT_EQ(runner_paths.size(), 2U);
     EXPECT_EQ(runner_paths[0], fake_netns.string() + "-workload");
     EXPECT_EQ(runner_paths[1], fake_netns.string() + "-proxy");
@@ -108,8 +108,11 @@ TEST(CniAddDelTest, AnnotatedAddWritesStateAndPassesThroughPrevResult) {
     EXPECT_EQ(saved->at("container_id"), invocation.container_id);
     EXPECT_EQ(saved->at("wan_name"), "wan_12345678");
     EXPECT_EQ(saved->at("lan_name"), "lan_12345678");
+    EXPECT_EQ(saved->at("root_wan_name"), "rwan_12345678");
+    EXPECT_EQ(saved->at("workload_peer_name"), "peer_12345678");
+    EXPECT_EQ(saved->at("pod_ips"), "10.42.0.65");
     EXPECT_EQ(saved->at("prev_result"),
-              R"({"dns":{"nameservers":["1.1.1.1"],"search":["svc.cluster.local"]},"interfaces":[{"name":"eth0","sandbox":"/var/run/netns/test"}],"routes":[{"dst":"10.0.0.0/8","gw":"10.42.0.1"}]})");
+              R"({"dns":{"nameservers":["1.1.1.1"],"search":["svc.cluster.local"]},"interfaces":[{"name":"cni0"},{"name":"eth0","sandbox":"/var/run/netns/test"}],"ips":[{"address":"10.42.0.65/24","gateway":"10.42.0.1","interface":1}],"routes":[{"dst":"10.0.0.0/8","gw":"10.42.0.1"},{"dst":"0.0.0.0/0","gw":"10.42.0.1"}]})");
     EXPECT_EQ(saved->at("proxy_name"), proxy_pod.name);
 
     EXPECT_TRUE(store.Remove());
@@ -152,7 +155,7 @@ TEST(CniAddDelTest, AnnotatedAddAutoResolvesNetnsPathsBeforeRunningSplice) {
     });
 
     auto request = MakeRequest();
-    request.prev_result->interfaces[0].sandbox = "/var/run/netns/workload-auto";
+    request.prev_result->interfaces[1].sandbox = "/var/run/netns/workload-auto";
     const auto workload_pod = MakeWorkloadPod();
     const auto proxy_pod = MakeProxyPod();
     const inline_proxy::CniInvocation invocation{
@@ -219,7 +222,7 @@ TEST(CniAddDelTest, ProxyPodAddDoesNotWriteState) {
     const auto result = executor.HandleAdd(invocation, proxy_pod, std::nullopt);
     ASSERT_TRUE(result.success);
     EXPECT_EQ(result.stdout_json,
-              R"({"dns":{"nameservers":["1.1.1.1"],"search":["svc.cluster.local"]},"interfaces":[{"name":"eth0","sandbox":"/var/run/netns/test"}],"routes":[{"dst":"10.0.0.0/8","gw":"10.42.0.1"}]})");
+              R"({"dns":{"nameservers":["1.1.1.1"],"search":["svc.cluster.local"]},"interfaces":[{"name":"cni0"},{"name":"eth0","sandbox":"/var/run/netns/test"}],"ips":[{"address":"10.42.0.65/24","gateway":"10.42.0.1","interface":1}],"routes":[{"dst":"10.0.0.0/8","gw":"10.42.0.1"},{"dst":"0.0.0.0/0","gw":"10.42.0.1"}]})");
     EXPECT_FALSE(std::filesystem::exists(executor.StatePathForContainerId(invocation.container_id)));
 
     std::filesystem::remove_all(state_root, ec);
@@ -264,7 +267,7 @@ TEST(CniAddDelTest, UnannotatedAddPassesThroughWithoutState) {
     const auto result = executor.HandleAdd(invocation, workload_pod, proxy_pod);
     ASSERT_TRUE(result.success);
     EXPECT_EQ(result.stdout_json,
-              R"({"dns":{"nameservers":["1.1.1.1"],"search":["svc.cluster.local"]},"interfaces":[{"name":"eth0","sandbox":"/var/run/netns/test"}],"routes":[{"dst":"10.0.0.0/8","gw":"10.42.0.1"}]})");
+              R"({"dns":{"nameservers":["1.1.1.1"],"search":["svc.cluster.local"]},"interfaces":[{"name":"cni0"},{"name":"eth0","sandbox":"/var/run/netns/test"}],"ips":[{"address":"10.42.0.65/24","gateway":"10.42.0.1","interface":1}],"routes":[{"dst":"10.0.0.0/8","gw":"10.42.0.1"},{"dst":"0.0.0.0/0","gw":"10.42.0.1"}]})");
     EXPECT_FALSE(std::filesystem::exists(executor.StatePathForContainerId(invocation.container_id)));
 
     std::filesystem::remove_all(state_root, ec);

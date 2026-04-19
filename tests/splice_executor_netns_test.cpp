@@ -2,7 +2,7 @@
 
 #include "tests/netns_fixture.hpp"
 
-TEST(SpliceExecutorNetnsTest, LeavesWorkloadWithWorkingReplacementEth0) {
+TEST(SpliceExecutorNetnsTest, RoutesProtectedPodThroughProxyWithoutReplacingEth0) {
     if (!inline_proxy::NetnsFixture::HasRequiredPrivileges()) {
         GTEST_SKIP() << "Requires CAP_NET_ADMIN/root and /usr/bin/ip";
     }

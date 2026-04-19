@@ -32,6 +32,8 @@ private:
     bool BuildBridgeBackedWorkloadTopology(const std::string& workload_ip_cidr,
                                            const std::string& client_ip_cidr,
                                            const std::string& gateway_ip);
+    bool RootLinkExists(const std::string& ifname) const;
+    bool RootRouteContains(const std::string& destination, const std::string& needle) const;
 
     std::string prefix_;
     std::string client_ns_;
