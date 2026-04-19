@@ -14,9 +14,18 @@ This directory contains k3s-oriented deployment artifacts for the inline proxy P
 
 ## Installer behavior
 
-`scripts/install-cni.sh` installs the `inline_proxy_cni` binary into the active
-k3s or generic CNI bin directory, then calls `scripts/reconcile-cni.sh` to append
-the chained plugin into the active CNI conflist.
+`scripts/install-cni.sh` assumes the installer container image already includes:
+
+- `/opt/inline-proxy/bin/inline_proxy_cni`
+- `/opt/inline-proxy/scripts/install-cni.sh`
+- `/opt/inline-proxy/scripts/reconcile-cni.sh`
+
+It installs the `inline_proxy_cni` binary into the active k3s or generic CNI bin
+directory, then calls `scripts/reconcile-cni.sh` to append the chained plugin into
+the active CNI conflist.
+
+If the node has multiple plausible CNI configs, set `INLINE_PROXY_CNI_CONF_FILE`
+in the installer DaemonSet to force the exact file to patch.
 
 The reconciler adds an entry like:
 

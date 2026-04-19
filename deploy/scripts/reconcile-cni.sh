@@ -17,22 +17,58 @@ if ! command -v python3 >/dev/null 2>&1; then
   exit 1
 fi
 
-TARGET_CONF=$(find "$CONF_DIR" -maxdepth 1 \( -name '*.conflist' -o -name '*.conf' \) | sort | head -n1)
-if [ -z "${TARGET_CONF:-}" ]; then
-  echo "no active CNI config found in $CONF_DIR" >&2
-  exit 1
-fi
-
-python3 - "$TARGET_CONF" "$PLUGIN_NAME" "$PROXY_NAMESPACE" "$PROXY_LABEL" "$ANNOTATION_KEY" <<'PY'
+python3 - "$CONF_DIR" "$PLUGIN_NAME" "$PROXY_NAMESPACE" "$PROXY_LABEL" "$ANNOTATION_KEY" "${INLINE_PROXY_CNI_CONF_FILE:-}" <<'PY'
 import json
 import pathlib
 import sys
 
-conf_path = pathlib.Path(sys.argv[1])
+conf_dir = pathlib.Path(sys.argv[1])
 plugin_name = sys.argv[2]
 proxy_namespace = sys.argv[3]
 proxy_label = sys.argv[4]
 annotation_key = sys.argv[5]
+explicit_path = sys.argv[6]
+
+def load_json(path: pathlib.Path):
+    try:
+        return json.loads(path.read_text())
+    except Exception:
+        return None
+
+def score_candidate(path: pathlib.Path) -> int:
+    score = 0
+    if path.name.endswith(".conflist"):
+        score += 100
+    if path.name == "10-flannel.conflist":
+        score += 200
+    payload = load_json(path)
+    if payload is None:
+        return -1
+    plugins = payload.get("plugins", [payload])
+    for plugin in plugins:
+        plugin_type = plugin.get("type", "")
+        if plugin_type == "flannel":
+            score += 75
+        if plugin_type == "bridge":
+            score += 25
+        if plugin_type == plugin_name:
+            score += 500
+    return score
+
+if explicit_path:
+    conf_path = pathlib.Path(explicit_path)
+else:
+    candidates = sorted(conf_dir.glob("*.conflist")) + sorted(conf_dir.glob("*.conf"))
+    if not candidates:
+        raise SystemExit(f"no CNI config found in {conf_dir}")
+    scored = sorted(
+        ((score_candidate(path), path) for path in candidates),
+        key=lambda item: (item[0], item[1].name),
+        reverse=True,
+    )
+    best_score, conf_path = scored[0]
+    if best_score < 0:
+        raise SystemExit(f"unable to parse any CNI config in {conf_dir}")
 
 config = json.loads(conf_path.read_text())
 

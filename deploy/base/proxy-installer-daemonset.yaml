@@ -40,6 +40,8 @@ spec:
               value: app=inline-proxy
             - name: INLINE_PROXY_ANNOTATION_KEY
               value: inline-proxy.example.com/enabled
+            - name: INLINE_PROXY_CNI_CONF_FILE
+              value: ""
           volumeMounts:
             - name: host-cni-bin
               mountPath: /host/opt/cni/bin
@@ -49,12 +51,6 @@ spec:
               mountPath: /host/etc/cni/net.d
             - name: host-k3s-conf
               mountPath: /host/var/lib/rancher/k3s/agent/etc/cni/net.d
-            - name: inline-proxy-bin
-              mountPath: /opt/inline-proxy/bin
-              readOnly: true
-            - name: inline-proxy-scripts
-              mountPath: /opt/inline-proxy/scripts
-              readOnly: true
       volumes:
         - name: host-cni-bin
           hostPath:
@@ -72,11 +68,3 @@ spec:
           hostPath:
             path: /var/lib/rancher/k3s/agent/etc/cni/net.d
             type: DirectoryOrCreate
-        - name: inline-proxy-bin
-          configMap:
-            name: inline-proxy-installer-bin
-            optional: true
-        - name: inline-proxy-scripts
-          configMap:
-            name: inline-proxy-installer-scripts
-            defaultMode: 0755
