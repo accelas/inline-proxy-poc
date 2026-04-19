@@ -79,11 +79,17 @@ Expands to:
 
 Consumers write `#include "bpf/ingress_redirect_skel.skel.h"` and add `//src/bpf:ingress_redirect_skel` to their `cc_library` deps.
 
-A hermetic clang toolchain is explicitly out of scope. The rule relies on `clang-19` being available on the host via `/usr/bin/clang-19` and fails clearly if not. A future change can swap in `toolchains_llvm` without touching consumers of the macro.
+A hermetic clang toolchain is explicitly out of scope. The project's main C++ toolchain (see `toolchain/cc_toolchain_config.bzl`) continues to be GCC 14; clang is not added to the C++ build. The `bpf_skeleton` macro shells out to host-installed `clang-19` via `/usr/bin/clang-19` **for the BPF compile step only**, and fails clearly if not found. A future change can swap in `toolchains_llvm` without touching consumers of the macro.
 
 ### 3. CO-RE with checked-in `vmlinux.h`
 
-The rewritten `.bpf.c` uses `#include "vmlinux.h"` and libbpf's `bpf_helpers.h` / `bpf_endian.h` macros. `vmlinux.h` is generated once via a new `scripts/regenerate_vmlinux_h.sh` one-liner wrapping `bpftool btf dump file /sys/kernel/btf/vmlinux format c` and checked into `src/bpf/vmlinux.h`. This keeps the build hermetic (the file is a source input, not a build-time side effect of the host kernel) and matches how production BPF projects like Cilium ship.
+The rewritten `.bpf.c` uses `#include "vmlinux.h"` and libbpf's `bpf_helpers.h` / `bpf_endian.h` macros. `vmlinux.h` is generated once and checked into `src/bpf/vmlinux.h`. The new `scripts/regenerate_vmlinux_h.sh` is a thin wrapper that runs exactly:
+
+```sh
+bpftool btf dump file /sys/kernel/btf/vmlinux format c > src/bpf/vmlinux.h
+```
+
+(The script also `cd`s to the repo root so the output path is correct regardless of where it's invoked.) Checking the file in keeps the build hermetic — the file is a source input, not a build-time side effect of the host kernel — and matches how production BPF projects like Cilium ship.
 
 ### 4. Functional rewrite of the BPF program
 
@@ -117,7 +123,7 @@ int ingress_redirect(struct __sk_buff *skb) { /* body per section 5 */ }
 char LICENSE[] SEC("license") = "GPL";
 ```
 
-Debug `bpf_printk` calls are retained behind a compile-time `-DDEBUG_TRACE`, **on by default**, to match the current build's `kEnableDebugPrintk = true`.
+Debug `bpf_printk` calls are retained behind a compile-time `-DDEBUG_TRACE`, **on by default**, to match the current build's `kEnableDebugPrintk = true`. The `-DDEBUG_TRACE` flag is set by the `bpf_skeleton` macro itself (hardcoded inside `bazel/bpf/defs.bzl` — not per-call-site), so every BPF source processed by the macro gets the same default. A follow-up can lift this into a macro keyword argument if more than one `.bpf.c` ever needs different tracing defaults.
 
 ### 5. Semantic parity table
 
@@ -173,6 +179,10 @@ The netlink code already works and this rewrite is narrowly about the load path.
 
 - `BuildIngressProgramForTesting()` — obsolete; the program comes from the skeleton
 - `MarkIngressAttachedForTesting(std::string_view)` — its last consumer (`PreservesAttachedStateWhenDetachFails`) is being dropped
+
+**New test hook:**
+
+- `bool BpfLoader::LoadProgramForTesting()` — calls `ingress_redirect__open` + `ingress_redirect__load` without any netlink attach, returns `true` on success. This is the only new public method. It is the entry point for the `LoadsSkeleton` test (see Testing); it exists specifically so the test can verify the skeleton loads without needing a real interface or the netlink path. Marked clearly as a test-only hook in a comment.
 
 **New member state** in `BpfLoader`:
 
@@ -234,7 +244,7 @@ The netlink code already works and this rewrite is narrowly about the load path.
 
 **Unchanged:**
 
-- `src/bpf/ingress_redirect_common.h` — struct and constants remain; the helper-ID enum is no longer needed by user-space but is left in place to avoid churn (it can be deleted in a separate commit)
+- `src/bpf/ingress_redirect_common.h` — the `struct ingress_redirect_config` remains (shared between `.bpf.c` and `loader.cpp`). The `INGRESS_REDIRECT_HELPER_*` enum values become dead (no user-space or BPF-side consumer once the handwritten codegen is gone) but are left in the header to avoid churn and deleted in a separate follow-up commit. The `INGRESS_REDIRECT_MAP_KEY_ZERO`, `INGRESS_REDIRECT_IPV4_WIRE_VALUE`, and `INGRESS_REDIRECT_TCP_PROTOCOL` constants: the new `.bpf.c` replaces them with libbpf/CO-RE idioms (a local `__u32 key = 0;`, `bpf_htons(ETH_P_IP)` via `bpf_endian.h`, `IPPROTO_TCP` from `vmlinux.h`), so these three constants also become dead and follow the same "leave for a separate cleanup commit" rule. `loader.cpp` does not reference them.
 - All of `src/proxy/`, `src/cni/`, `src/shared/`
 - All netlink helpers in `loader.cpp`
 
