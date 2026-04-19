@@ -6,6 +6,8 @@
 #include <cerrno>
 #include <cstdint>
 #include <cstring>
+#include <ifaddrs.h>
+#include <linux/if_addr.h>
 #include <linux/if_link.h>
 #include <linux/netlink.h>
 #include <linux/rtnetlink.h>
@@ -138,6 +140,66 @@ std::vector<char> MakeRawIfInfo() {
     return std::vector<char>(sizeof(ifinfomsg), '\0');
 }
 
+std::vector<char> MakeAddressRequest(std::uint16_t type,
+                                     std::uint16_t flags,
+                                     unsigned int index,
+                                     std::uint8_t prefix_len) {
+    std::vector<char> request(NLMSG_LENGTH(sizeof(ifaddrmsg)));
+    auto* header = reinterpret_cast<nlmsghdr*>(request.data());
+    header->nlmsg_len = static_cast<std::uint32_t>(request.size());
+    header->nlmsg_type = type;
+    header->nlmsg_flags = static_cast<std::uint16_t>(flags | NLM_F_REQUEST | NLM_F_ACK);
+    header->nlmsg_seq = 1;
+
+    auto* addr = reinterpret_cast<ifaddrmsg*>(NLMSG_DATA(header));
+    std::memset(addr, 0, sizeof(*addr));
+    addr->ifa_family = AF_INET;
+    addr->ifa_prefixlen = prefix_len;
+    addr->ifa_scope = RT_SCOPE_HOST;
+    addr->ifa_index = index;
+    return request;
+}
+
+bool SendAddressRequest(std::vector<char> request) {
+    auto* header = reinterpret_cast<nlmsghdr*>(request.data());
+    header->nlmsg_len = static_cast<std::uint32_t>(request.size());
+
+    auto socket = NetlinkSocket::Open();
+    if (!socket) {
+        return false;
+    }
+    if (!socket->Send(request)) {
+        return false;
+    }
+    return socket->ReceiveAck();
+}
+
+bool InterfaceHasAddress(const std::string& ifname, const in_addr& address) {
+    ifaddrs* interfaces = nullptr;
+    if (::getifaddrs(&interfaces) != 0) {
+        return false;
+    }
+
+    bool found = false;
+    for (ifaddrs* current = interfaces; current != nullptr; current = current->ifa_next) {
+        if (current->ifa_name == nullptr || current->ifa_addr == nullptr ||
+            current->ifa_addr->sa_family != AF_INET) {
+            continue;
+        }
+        if (ifname != current->ifa_name) {
+            continue;
+        }
+        const auto& ipv4 = reinterpret_cast<const sockaddr_in&>(*current->ifa_addr);
+        if (ipv4.sin_addr.s_addr == address.s_addr) {
+            found = true;
+            break;
+        }
+    }
+
+    ::freeifaddrs(interfaces);
+    return found;
+}
+
 }  // namespace
 
 std::optional<unsigned int> LinkIndex(const std::string& ifname) noexcept {
@@ -209,6 +271,36 @@ bool CreateVethPair(const std::string& left_ifname, const std::string& right_ifn
     AppendStringAttr(request, IFLA_IFNAME, left_ifname);
     AppendAttr(request, IFLA_LINKINFO, linkinfo.data(), linkinfo.size(), true);
     return SendLinkRequest(std::move(request));
+}
+
+bool AddLocalAddress(const std::string& ifname, const in_addr& address, std::uint8_t prefix_len) {
+    const auto index = LinkIndex(ifname);
+    if (!index) {
+        return false;
+    }
+    if (InterfaceHasAddress(ifname, address)) {
+        return true;
+    }
+
+    auto request = MakeAddressRequest(RTM_NEWADDR, NLM_F_CREATE | NLM_F_EXCL, *index, prefix_len);
+    AppendAttr(request, IFA_LOCAL, &address, sizeof(address));
+    AppendAttr(request, IFA_ADDRESS, &address, sizeof(address));
+    return SendAddressRequest(std::move(request));
+}
+
+bool RemoveLocalAddress(const std::string& ifname, const in_addr& address, std::uint8_t prefix_len) {
+    const auto index = LinkIndex(ifname);
+    if (!index) {
+        return false;
+    }
+    if (!InterfaceHasAddress(ifname, address)) {
+        return true;
+    }
+
+    auto request = MakeAddressRequest(RTM_DELADDR, 0, *index, prefix_len);
+    AppendAttr(request, IFA_LOCAL, &address, sizeof(address));
+    AppendAttr(request, IFA_ADDRESS, &address, sizeof(address));
+    return SendAddressRequest(std::move(request));
 }
 
 }  // namespace inline_proxy

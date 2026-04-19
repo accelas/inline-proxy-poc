@@ -9,22 +9,28 @@
 #include <cstdlib>
 #include <cstring>
 #include <functional>
+#include <filesystem>
 #include <iostream>
 #include <list>
 #include <memory>
+#include <poll.h>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <vector>
 #include <sys/socket.h>
+#include <sys/wait.h>
 #include <netinet/in.h>
 #include <unistd.h>
 
 #include "proxy/admin_http.hpp"
 #include "proxy/interface_registry.hpp"
 #include "proxy/relay_session.hpp"
+#include "proxy/state_reconciler.hpp"
 #include "proxy/transparent_listener.hpp"
 #include "proxy/transparent_socket.hpp"
 #include "shared/event_loop.hpp"
+#include "shared/netlink.hpp"
 #include "shared/scoped_fd.hpp"
 #include "shared/sockaddr.hpp"
 
@@ -37,11 +43,43 @@ constexpr std::string_view kAdminPortEnv = "INLINE_PROXY_ADMIN_PORT";
 constexpr std::string_view kAdminAddressEnv = "INLINE_PROXY_ADMIN_ADDRESS";
 constexpr std::string_view kTransparentPortEnv = "INLINE_PROXY_TRANSPARENT_PORT";
 constexpr std::string_view kTransparentAddressEnv = "INLINE_PROXY_TRANSPARENT_ADDRESS";
+constexpr std::string_view kInterceptPortEnv = "INLINE_PROXY_INTERCEPT_PORT";
+constexpr std::string_view kPreserveClientPortEnv = "INLINE_PROXY_PRESERVE_CLIENT_PORT";
+constexpr std::string_view kDebugDirectResponseEnv = "INLINE_PROXY_DEBUG_DIRECT_RESPONSE";
+constexpr std::string_view kDebugDirectWithUpstreamEnv = "INLINE_PROXY_DEBUG_DIRECT_WITH_UPSTREAM";
+constexpr std::string_view kDebugDirectLargeResponseEnv = "INLINE_PROXY_DEBUG_DIRECT_LARGE_RESPONSE";
+constexpr std::string_view kDebugDirectFullUpstreamEnv = "INLINE_PROXY_DEBUG_DIRECT_FULL_UPSTREAM";
+constexpr std::string_view kDebugDirectHoldOpenMsEnv = "INLINE_PROXY_DEBUG_DIRECT_HOLD_OPEN_MS";
+constexpr std::string_view kDebugDirectNonblockingClientEnv = "INLINE_PROXY_DEBUG_DIRECT_NONBLOCKING_CLIENT";
+constexpr std::string_view kDebugDirectLocalizeSourceEnv = "INLINE_PROXY_DEBUG_DIRECT_LOCALIZE_SOURCE";
+constexpr std::string_view kDebugDirectUpstreamConnectOnlyEnv =
+    "INLINE_PROXY_DEBUG_DIRECT_UPSTREAM_CONNECT_ONLY";
+constexpr std::string_view kDebugDirectReleaseSourceAfterConnectEnv =
+    "INLINE_PROXY_DEBUG_DIRECT_RELEASE_SOURCE_AFTER_CONNECT";
+constexpr std::string_view kDebugDirectCloseUpstreamBeforeResponseEnv =
+    "INLINE_PROXY_DEBUG_DIRECT_CLOSE_UPSTREAM_BEFORE_RESPONSE";
+constexpr std::string_view kDebugDirectCloseUpstreamAfterResponseEnv =
+    "INLINE_PROXY_DEBUG_CLOSE_UPSTREAM_AFTER_RESPONSE";
+constexpr std::string_view kDebugSyncRelayEnv = "INLINE_PROXY_DEBUG_SYNC_RELAY";
+constexpr std::string_view kDebugSyncConnectTimeoutEnv = "INLINE_PROXY_DEBUG_SYNC_CONNECT_TIMEOUT_MS";
+constexpr std::string_view kDebugSyncNonblockingClientEnv = "INLINE_PROXY_DEBUG_SYNC_NONBLOCKING_CLIENT";
+constexpr std::string_view kDebugSyncHoldOpenMsEnv = "INLINE_PROXY_DEBUG_SYNC_HOLD_OPEN_MS";
+constexpr std::string_view kDebugCloseUpstreamOnFirstResponseEnv =
+    "INLINE_PROXY_DEBUG_CLOSE_UPSTREAM_ON_FIRST_RESPONSE";
+constexpr std::string_view kDebugShutdownUpstreamOnFirstResponseEnv =
+    "INLINE_PROXY_DEBUG_SHUTDOWN_UPSTREAM_ON_FIRST_RESPONSE";
+constexpr std::string_view kDebugDetachUpstreamOnFirstResponseEnv =
+    "INLINE_PROXY_DEBUG_DETACH_UPSTREAM_ON_FIRST_RESPONSE";
+constexpr std::string_view kDebugCloseClientOnFirstResponseEnv =
+    "INLINE_PROXY_DEBUG_CLOSE_CLIENT_ON_FIRST_RESPONSE";
 constexpr std::string_view kAdminAddressPrefix = "--admin-address=";
 constexpr std::string_view kAdminPrefix = "--admin-port=";
 constexpr std::string_view kTransparentAddressPrefix = "--transparent-address=";
 constexpr std::string_view kTransparentPrefix = "--transparent-port=";
+constexpr std::string_view kInterceptPrefix = "--intercept-port=";
 constexpr std::string_view kInlineProxyPrefix = "INLINE_PROXY_";
+constexpr std::uint32_t kTransparentRoutingMark = 0x100;
+constexpr std::uint32_t kTransparentRoutingTable = 100;
 
 AdminSendHook& AdminSendHookRef() {
     static AdminSendHook hook = nullptr;
@@ -63,6 +101,41 @@ struct PlainListener {
         return ok();
     }
 };
+
+bool RunIp(const std::vector<std::string>& args) {
+    std::vector<char*> argv;
+    argv.reserve(args.size() + 2);
+    argv.push_back(const_cast<char*>("/sbin/ip"));
+    for (const auto& arg : args) {
+        argv.push_back(const_cast<char*>(arg.c_str()));
+    }
+    argv.push_back(nullptr);
+
+    const pid_t child = ::fork();
+    if (child < 0) {
+        return false;
+    }
+    if (child == 0) {
+        ::execv("/sbin/ip", argv.data());
+        _exit(127);
+    }
+
+    int status = 0;
+    if (::waitpid(child, &status, 0) < 0) {
+        return false;
+    }
+    return WIFEXITED(status) && WEXITSTATUS(status) == 0;
+}
+
+bool EnsureTransparentRoutingRule() {
+    const std::string mark = std::to_string(kTransparentRoutingMark);
+    const std::string table = std::to_string(kTransparentRoutingTable);
+    const bool route_ok =
+        RunIp({"route", "replace", "local", "0.0.0.0/0", "dev", "lo", "table", table});
+    const bool rule_ok = RunIp({"rule", "add", "fwmark", mark, "lookup", table}) ||
+                         RunIp({"rule", "replace", "fwmark", mark, "lookup", table});
+    return route_ok && rule_ok;
+}
 
 std::uint16_t ParsePortOrThrow(std::string_view value, std::string_view source) {
     unsigned int parsed = 0;
@@ -91,6 +164,7 @@ struct CliParseResult {
     bool admin_seen = false;
     bool transparent_address_seen = false;
     bool transparent_seen = false;
+    bool intercept_seen = false;
 };
 
 CliParseResult ParseCliOverrides(ProxyConfig& cfg, int argc, char** argv) {
@@ -119,6 +193,11 @@ CliParseResult ParseCliOverrides(ProxyConfig& cfg, int argc, char** argv) {
             seen.transparent_seen = true;
             continue;
         }
+        if (arg.rfind(kInterceptPrefix, 0) == 0) {
+            cfg.intercept_port = ParsePortOrThrow(arg.substr(kInterceptPrefix.size()), kInterceptPrefix);
+            seen.intercept_seen = true;
+            continue;
+        }
         throw std::invalid_argument(std::string("unknown CLI flag: ") + std::string(arg));
     }
     return seen;
@@ -139,6 +218,70 @@ void ApplyOverride(ProxyConfig& cfg, std::string_view name, std::string_view val
     }
     if (name == kTransparentPortEnv) {
         cfg.transparent_port = ParsePortOrThrow(value, kTransparentPortEnv);
+        return;
+    }
+    if (name == kInterceptPortEnv) {
+        cfg.intercept_port = ParsePortOrThrow(value, kInterceptPortEnv);
+        return;
+    }
+    if (name == kPreserveClientPortEnv) {
+        return;
+    }
+    if (name == kDebugDirectResponseEnv) {
+        return;
+    }
+    if (name == kDebugDirectWithUpstreamEnv) {
+        return;
+    }
+    if (name == kDebugDirectLargeResponseEnv) {
+        return;
+    }
+    if (name == kDebugDirectFullUpstreamEnv) {
+        return;
+    }
+    if (name == kDebugDirectHoldOpenMsEnv) {
+        return;
+    }
+    if (name == kDebugDirectNonblockingClientEnv) {
+        return;
+    }
+    if (name == kDebugDirectLocalizeSourceEnv) {
+        return;
+    }
+    if (name == kDebugDirectUpstreamConnectOnlyEnv) {
+        return;
+    }
+    if (name == kDebugDirectReleaseSourceAfterConnectEnv) {
+        return;
+    }
+    if (name == kDebugDirectCloseUpstreamBeforeResponseEnv) {
+        return;
+    }
+    if (name == kDebugDirectCloseUpstreamAfterResponseEnv) {
+        return;
+    }
+    if (name == kDebugShutdownUpstreamOnFirstResponseEnv) {
+        return;
+    }
+    if (name == kDebugDetachUpstreamOnFirstResponseEnv) {
+        return;
+    }
+    if (name == kDebugCloseClientOnFirstResponseEnv) {
+        return;
+    }
+    if (name == kDebugSyncRelayEnv) {
+        return;
+    }
+    if (name == kDebugSyncConnectTimeoutEnv) {
+        return;
+    }
+    if (name == kDebugSyncNonblockingClientEnv) {
+        return;
+    }
+    if (name == kDebugSyncHoldOpenMsEnv) {
+        return;
+    }
+    if (name == kDebugCloseUpstreamOnFirstResponseEnv) {
         return;
     }
     throw std::invalid_argument(std::string("unknown env key: ") + std::string(name));
@@ -189,9 +332,436 @@ void ApplyProcessEnvOverrides(ProxyConfig& cfg, const CliParseResult& cli) {
             }
             continue;
         }
+        if (name == kInterceptPortEnv) {
+            if (!cli.intercept_seen) {
+                cfg.intercept_port = ParsePortOrThrow(value, kInterceptPortEnv);
+            }
+            continue;
+        }
+        if (name == kPreserveClientPortEnv) {
+            continue;
+        }
+        if (name == kDebugDirectResponseEnv) {
+            continue;
+        }
+        if (name == kDebugDirectWithUpstreamEnv) {
+            continue;
+        }
+        if (name == kDebugDirectLargeResponseEnv) {
+            continue;
+        }
+        if (name == kDebugDirectFullUpstreamEnv) {
+            continue;
+        }
+        if (name == kDebugDirectHoldOpenMsEnv) {
+            continue;
+        }
+        if (name == kDebugDirectNonblockingClientEnv) {
+            continue;
+        }
+        if (name == kDebugDirectLocalizeSourceEnv) {
+            continue;
+        }
+        if (name == kDebugDirectUpstreamConnectOnlyEnv) {
+            continue;
+        }
+        if (name == kDebugDirectReleaseSourceAfterConnectEnv) {
+            continue;
+        }
+        if (name == kDebugDirectCloseUpstreamBeforeResponseEnv) {
+            continue;
+        }
+        if (name == kDebugDirectCloseUpstreamAfterResponseEnv) {
+            continue;
+        }
+        if (name == kDebugShutdownUpstreamOnFirstResponseEnv) {
+            continue;
+        }
+        if (name == kDebugDetachUpstreamOnFirstResponseEnv) {
+            continue;
+        }
+        if (name == kDebugCloseClientOnFirstResponseEnv) {
+            continue;
+        }
+        if (name == kDebugSyncRelayEnv) {
+            continue;
+        }
+        if (name == kDebugSyncConnectTimeoutEnv) {
+            continue;
+        }
+        if (name == kDebugSyncNonblockingClientEnv) {
+            continue;
+        }
+        if (name == kDebugSyncHoldOpenMsEnv) {
+            continue;
+        }
+        if (name == kDebugCloseUpstreamOnFirstResponseEnv) {
+            continue;
+        }
 
         throw std::invalid_argument(std::string("unknown env key: ") + std::string(name));
     }
+}
+
+bool DebugDirectResponseEnabled() {
+    const char* value = std::getenv(std::string(kDebugDirectResponseEnv).c_str());
+    return value != nullptr && std::string_view(value) == "1";
+}
+
+bool DebugDirectWithUpstreamEnabled() {
+    const char* value = std::getenv(std::string(kDebugDirectWithUpstreamEnv).c_str());
+    return value != nullptr && std::string_view(value) == "1";
+}
+
+bool DebugDirectLargeResponseEnabled() {
+    const char* value = std::getenv(std::string(kDebugDirectLargeResponseEnv).c_str());
+    return value != nullptr && std::string_view(value) == "1";
+}
+
+bool DebugDirectFullUpstreamEnabled() {
+    const char* value = std::getenv(std::string(kDebugDirectFullUpstreamEnv).c_str());
+    return value != nullptr && std::string_view(value) == "1";
+}
+
+int DebugDirectHoldOpenMs() {
+    const char* value = std::getenv(std::string(kDebugDirectHoldOpenMsEnv).c_str());
+    if (value == nullptr || *value == '\0') {
+        return 0;
+    }
+    try {
+        const int parsed = std::stoi(value);
+        return parsed > 0 ? parsed : 0;
+    } catch (...) {
+        return 0;
+    }
+}
+
+bool DebugDirectNonblockingClientEnabled() {
+    const char* value = std::getenv(std::string(kDebugDirectNonblockingClientEnv).c_str());
+    return value != nullptr && std::string_view(value) == "1";
+}
+
+bool DebugDirectLocalizeSourceEnabled() {
+    const char* value = std::getenv(std::string(kDebugDirectLocalizeSourceEnv).c_str());
+    return value != nullptr && std::string_view(value) == "1";
+}
+
+bool DebugDirectUpstreamConnectOnlyEnabled() {
+    const char* value = std::getenv(std::string(kDebugDirectUpstreamConnectOnlyEnv).c_str());
+    return value != nullptr && std::string_view(value) == "1";
+}
+
+bool DebugDirectReleaseSourceAfterConnectEnabled() {
+    const char* value = std::getenv(std::string(kDebugDirectReleaseSourceAfterConnectEnv).c_str());
+    return value != nullptr && std::string_view(value) == "1";
+}
+
+bool DebugDirectCloseUpstreamBeforeResponseEnabled() {
+    const char* value = std::getenv(std::string(kDebugDirectCloseUpstreamBeforeResponseEnv).c_str());
+    return value != nullptr && std::string_view(value) == "1";
+}
+
+bool DebugDirectCloseUpstreamAfterResponseEnabled() {
+    const char* value = std::getenv(std::string(kDebugDirectCloseUpstreamAfterResponseEnv).c_str());
+    return value != nullptr && std::string_view(value) == "1";
+}
+
+bool DebugSyncRelayEnabled() {
+    const char* value = std::getenv(std::string(kDebugSyncRelayEnv).c_str());
+    return value != nullptr && std::string_view(value) == "1";
+}
+
+int DebugSyncConnectTimeoutMs() {
+    const char* value = std::getenv(std::string(kDebugSyncConnectTimeoutEnv).c_str());
+    if (value == nullptr || *value == '\0') {
+        return 3000;
+    }
+    try {
+        const int parsed = std::stoi(value);
+        return parsed > 0 ? parsed : 3000;
+    } catch (...) {
+        return 3000;
+    }
+}
+
+bool DebugSyncNonblockingClientEnabled() {
+    const char* value = std::getenv(std::string(kDebugSyncNonblockingClientEnv).c_str());
+    return value != nullptr && std::string_view(value) == "1";
+}
+
+int DebugSyncHoldOpenMs() {
+    const char* value = std::getenv(std::string(kDebugSyncHoldOpenMsEnv).c_str());
+    if (value == nullptr || *value == '\0') {
+        return 0;
+    }
+    try {
+        const int parsed = std::stoi(value);
+        return parsed > 0 ? parsed : 0;
+    } catch (...) {
+        return 0;
+    }
+}
+
+bool CompleteDebugConnect(int fd) {
+    pollfd pfd{
+        .fd = fd,
+        .events = POLLOUT,
+        .revents = 0,
+    };
+    const int ready = ::poll(&pfd, 1, DebugSyncConnectTimeoutMs());
+    std::cerr << "debug connect poll"
+              << " fd=" << fd
+              << " ready=" << ready
+              << " revents=" << pfd.revents
+              << '\n';
+    if (ready != 1) {
+        return false;
+    }
+    int socket_error = 0;
+    socklen_t len = sizeof(socket_error);
+    if (::getsockopt(fd, SOL_SOCKET, SO_ERROR, &socket_error, &len) != 0) {
+        std::cerr << "debug connect getsockopt failed"
+                  << " fd=" << fd
+                  << " errno=" << errno
+                  << " error=" << std::strerror(errno)
+                  << '\n';
+        return false;
+    }
+    std::cerr << "debug connect so_error"
+              << " fd=" << fd
+              << " so_error=" << socket_error
+              << '\n';
+    return socket_error == 0;
+}
+
+bool WaitReadable(int fd, int timeout_ms) {
+    pollfd pfd{.fd = fd, .events = POLLIN, .revents = 0};
+    return ::poll(&pfd, 1, timeout_ms) == 1;
+}
+
+bool SendAllDebug(int fd, const char* data, std::size_t size) {
+    std::size_t offset = 0;
+    while (offset < size) {
+        const ssize_t n = ::send(fd, data + offset, size - offset, MSG_NOSIGNAL);
+        if (n > 0) {
+            offset += static_cast<std::size_t>(n);
+            continue;
+        }
+        if (n < 0 && errno == EINTR) {
+            continue;
+        }
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            if (!WaitReadable(fd, 1000)) {
+                return false;
+            }
+            continue;
+        }
+        return false;
+    }
+    return true;
+}
+
+std::vector<std::string> DebugWanInterfaces() {
+    std::vector<std::string> interfaces;
+    for (const auto& entry : std::filesystem::directory_iterator("/sys/class/net")) {
+        const auto name = entry.path().filename().string();
+        if (name.rfind("wan_", 0) == 0) {
+            interfaces.push_back(name);
+        }
+    }
+    return interfaces;
+}
+
+std::vector<std::string> DebugAcquireLocalSource(const sockaddr_storage& addr) {
+    std::vector<std::string> installed;
+    if (addr.ss_family != AF_INET) {
+        return installed;
+    }
+
+    const auto& ipv4 = reinterpret_cast<const sockaddr_in&>(addr);
+    for (const auto& ifname : DebugWanInterfaces()) {
+        if (!AddLocalAddress(ifname, ipv4.sin_addr, 32)) {
+            for (const auto& added : installed) {
+                (void)RemoveLocalAddress(added, ipv4.sin_addr, 32);
+            }
+            installed.clear();
+            break;
+        }
+        installed.push_back(ifname);
+    }
+    return installed;
+}
+
+void DebugReleaseLocalSource(const sockaddr_storage& addr,
+                             const std::vector<std::string>& interfaces) {
+    if (addr.ss_family != AF_INET) {
+        return;
+    }
+    const auto& ipv4 = reinterpret_cast<const sockaddr_in&>(addr);
+    for (const auto& ifname : interfaces) {
+        (void)RemoveLocalAddress(ifname, ipv4.sin_addr, 32);
+    }
+}
+
+bool DriveDebugSyncRelay(ScopedFd& accepted, const SessionEndpoints& endpoints) {
+    if (DebugSyncNonblockingClientEnabled() && !SetNonBlocking(accepted.get())) {
+        std::cerr << "debug sync relay failed to set nonblocking client"
+                  << " errno=" << errno
+                  << " error=" << std::strerror(errno)
+                  << '\n';
+        return false;
+    }
+    char request[4096];
+    if (!WaitReadable(accepted.get(), 3000)) {
+        std::cerr << "debug sync relay client wait timeout"
+                  << " client=" << FormatSockaddr(endpoints.client)
+                  << " original_dst=" << FormatSockaddr(endpoints.original_dst)
+                  << '\n';
+        return false;
+    }
+    const ssize_t request_n = ::recv(accepted.get(), request, sizeof(request), 0);
+    if (request_n <= 0) {
+        std::cerr << "debug sync relay client recv failed"
+                  << " request_n=" << request_n
+                  << " errno=" << errno
+                  << " error=" << std::strerror(errno)
+                  << '\n';
+        return false;
+    }
+    std::cerr << "debug sync relay client recv"
+              << " bytes=" << request_n
+              << '\n';
+
+    const auto debug_local_source = DebugAcquireLocalSource(endpoints.client);
+    auto upstream = CreateTransparentSocket(endpoints.client, endpoints.original_dst);
+    if (!upstream) {
+        std::cerr << "debug sync relay upstream create failed"
+                  << " client=" << FormatSockaddr(endpoints.client)
+                  << " original_dst=" << FormatSockaddr(endpoints.original_dst)
+                  << " errno=" << errno
+                  << " error=" << std::strerror(errno)
+                  << '\n';
+        DebugReleaseLocalSource(endpoints.client, debug_local_source);
+        return false;
+    }
+    if (upstream.connecting && !CompleteDebugConnect(upstream.fd.get())) {
+        std::cerr << "debug sync relay upstream connect incomplete"
+                  << " local=" << FormatSockaddr(GetSockName(upstream.fd.get()))
+                  << " peer=" << FormatSockaddr(GetPeer(upstream.fd.get()))
+                  << '\n';
+        DebugReleaseLocalSource(endpoints.client, debug_local_source);
+        return false;
+    }
+    if (!SendAllDebug(upstream.fd.get(), request, static_cast<std::size_t>(request_n))) {
+        std::cerr << "debug sync relay upstream send failed"
+                  << " errno=" << errno
+                  << " error=" << std::strerror(errno)
+                  << '\n';
+        DebugReleaseLocalSource(endpoints.client, debug_local_source);
+        return false;
+    }
+    std::cerr << "debug sync relay upstream send ok"
+              << " bytes=" << request_n
+              << '\n';
+
+    std::string response;
+    response.reserve(32768);
+    char buffer[4096];
+    while (WaitReadable(upstream.fd.get(), 1000)) {
+        const ssize_t n = ::recv(upstream.fd.get(), buffer, sizeof(buffer), 0);
+        if (n > 0) {
+            response.append(buffer, buffer + n);
+            continue;
+        }
+        if (n == 0) {
+            break;
+        }
+        if (errno == EINTR) {
+            continue;
+        }
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            continue;
+        }
+        DebugReleaseLocalSource(endpoints.client, debug_local_source);
+        return false;
+    }
+    std::cerr << "debug sync relay upstream recv"
+              << " bytes=" << response.size()
+              << '\n';
+
+    if (response.empty()) {
+        DebugReleaseLocalSource(endpoints.client, debug_local_source);
+        return false;
+    }
+    const bool sent = SendAllDebug(accepted.get(), response.data(), response.size());
+    std::cerr << "debug sync relay downstream send"
+              << " bytes=" << response.size()
+              << " ok=" << sent
+              << " errno=" << errno
+              << " error=" << std::strerror(errno)
+              << '\n';
+    if (sent) {
+        if (const int hold_open_ms = DebugSyncHoldOpenMs(); hold_open_ms > 0) {
+            ::poll(nullptr, 0, hold_open_ms);
+        }
+    }
+    DebugReleaseLocalSource(endpoints.client, debug_local_source);
+    return sent;
+}
+
+struct DebugUpstreamContext {
+    ScopedFd fd;
+    sockaddr_storage local_source{};
+    std::vector<std::string> interfaces;
+};
+
+void DriveDebugUpstream(DebugUpstreamContext& ctx, const SessionEndpoints& endpoints) {
+    if (DebugDirectLocalizeSourceEnabled()) {
+        ctx.local_source = endpoints.client;
+        ctx.interfaces = DebugAcquireLocalSource(endpoints.client);
+    }
+
+    auto upstream = CreateTransparentSocket(endpoints.client, endpoints.original_dst);
+    if (!upstream) {
+        return;
+    }
+    if (upstream.connecting && !CompleteDebugConnect(upstream.fd.get())) {
+        return;
+    }
+    if (!ctx.interfaces.empty() && DebugDirectReleaseSourceAfterConnectEnabled()) {
+        DebugReleaseLocalSource(ctx.local_source, ctx.interfaces);
+        ctx.interfaces.clear();
+        ctx.local_source = {};
+    }
+    if (DebugDirectUpstreamConnectOnlyEnabled()) {
+        ctx.fd = std::move(upstream.fd);
+        return;
+    }
+
+    static constexpr char kDebugRequest[] =
+        "GET / HTTP/1.1\r\n"
+        "Host: debug\r\n"
+        "Connection: close\r\n"
+        "\r\n";
+    (void)::send(upstream.fd.get(),
+                 kDebugRequest,
+                 sizeof(kDebugRequest) - 1,
+                 MSG_NOSIGNAL);
+
+    std::string buffer(4096, '\0');
+    pollfd pfd{
+        .fd = upstream.fd.get(),
+        .events = POLLIN,
+        .revents = 0,
+    };
+    if (::poll(&pfd, 1, 3000) == 1) {
+        (void)::recv(upstream.fd.get(), buffer.data(), buffer.size(), 0);
+    }
+
+    if (DebugDirectCloseUpstreamBeforeResponseEnabled()) {
+        upstream.fd.reset();
+    }
+    ctx.fd = std::move(upstream.fd);
 }
 
 PlainListener CreatePlainListener(const std::string& address, std::uint16_t port) {
@@ -463,11 +1033,21 @@ ProxyConfig ProxyConfig::FromArgs(int argc, char** argv) {
     return cfg;
 }
 
+bool InstallTransparentRoutingRule() {
+    return EnsureTransparentRoutingRule();
+}
+
 int RunProxyDaemon(const ProxyConfig& cfg) {
     ProxyState state;
     state.set_ready(false);
 
+    if (!EnsureTransparentRoutingRule()) {
+        std::cerr << "failed to install transparent routing rule\n";
+        return 1;
+    }
+
     InterfaceRegistry registry;
+    StateReconciler state_reconciler;
     auto admin_listener = CreatePlainListener(cfg.admin_address, cfg.admin_port);
     if (!admin_listener) {
         std::cerr << "failed to create admin listener on port " << cfg.admin_port << '\n';
@@ -480,7 +1060,7 @@ int RunProxyDaemon(const ProxyConfig& cfg) {
         return 1;
     }
 
-    if (!registry.ConfigureIngressListener(transparent_listener.fd())) {
+    if (!registry.ConfigureIngressListener(transparent_listener.fd(), cfg.intercept_port)) {
         std::cerr << "failed to configure ingress listener for transparent port " << cfg.transparent_port << '\n';
         return 1;
     }
@@ -492,15 +1072,18 @@ int RunProxyDaemon(const ProxyConfig& cfg) {
     }
 
     auto admin_http = BuildAdminHttp(state, registry);
+    state_reconciler.Sync(registry);
 
     state.set_ready(true);
     auto& loop = state.loop();
 
     std::list<std::shared_ptr<RelaySession>> sessions;
     std::list<std::shared_ptr<AdminConnection>> admin_connections;
+    std::list<DebugUpstreamContext> debug_upstreams;
 
     std::function<void()> sweep;
     sweep = [&] {
+        state_reconciler.Sync(registry);
         PruneClosedSessions(sessions);
         PruneClosedConnections(admin_connections);
         loop.Schedule(std::chrono::seconds(1), sweep);
@@ -556,14 +1139,61 @@ int RunProxyDaemon(const ProxyConfig& cfg) {
                 }
 
                 ScopedFd accepted(accepted_fd);
-                if (!SetNonBlocking(accepted.get())) {
-                    continue;
-                }
-
                 SessionEndpoints endpoints{
                     .client = GetPeer(accepted.get()),
                     .original_dst = GetSockName(accepted.get()),
                 };
+                std::cerr << "accepted transparent connection"
+                          << " client=" << FormatSockaddr(endpoints.client)
+                          << " original_dst=" << FormatSockaddr(endpoints.original_dst)
+                          << '\n';
+                if (DebugDirectResponseEnabled() && DebugDirectNonblockingClientEnabled() &&
+                    !SetNonBlocking(accepted.get())) {
+                    accepted.reset();
+                    continue;
+                }
+                if (DebugSyncRelayEnabled()) {
+                    (void)DriveDebugSyncRelay(accepted, endpoints);
+                    accepted.reset();
+                    continue;
+                }
+                if (!SetNonBlocking(accepted.get())) {
+                    continue;
+                }
+                if (DebugDirectResponseEnabled()) {
+                    if (DebugDirectWithUpstreamEnabled()) {
+                        DebugUpstreamContext debug_upstream;
+                        if (DebugDirectFullUpstreamEnabled()) {
+                            DriveDebugUpstream(debug_upstream, endpoints);
+                        } else {
+                            auto upstream = CreateTransparentSocket(endpoints.client, endpoints.original_dst);
+                            if (upstream) {
+                                debug_upstream.fd = std::move(upstream.fd);
+                            }
+                        }
+                        if (debug_upstream.fd) {
+                            debug_upstreams.push_back(std::move(debug_upstream));
+                        }
+                    }
+                    std::string body = DebugDirectLargeResponseEnabled()
+                        ? std::string(18880, 'x')
+                        : std::string("ok");
+                    std::string response = "HTTP/1.1 200 OK\r\nContent-Length: " +
+                                           std::to_string(body.size()) +
+                                           "\r\nConnection: close\r\n\r\n" + body;
+                    (void)::send(accepted.get(),
+                                 response.data(),
+                                 response.size(),
+                                 MSG_NOSIGNAL);
+                    if (DebugDirectCloseUpstreamAfterResponseEnabled()) {
+                        debug_upstreams.clear();
+                    }
+                    if (const int hold_open_ms = DebugDirectHoldOpenMs(); hold_open_ms > 0) {
+                        ::poll(nullptr, 0, hold_open_ms);
+                    }
+                    accepted.reset();
+                    continue;
+                }
                 auto session = CreateRelaySession(
                     loop,
                     std::move(accepted),
@@ -589,6 +1219,9 @@ int RunProxyDaemon(const ProxyConfig& cfg) {
     (void)transparent_handle;
 
     loop.Run();
+    for (auto& ctx : debug_upstreams) {
+        DebugReleaseLocalSource(ctx.local_source, ctx.interfaces);
+    }
     state.set_ready(false);
     bool cleanup_ok = true;
     if (!registry.RemoveInterface(admin_interface_name)) {

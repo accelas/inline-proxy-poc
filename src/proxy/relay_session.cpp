@@ -1,11 +1,21 @@
 #include "proxy/relay_session.hpp"
 
 #include <algorithm>
+#include <arpa/inet.h>
+#include <cstring>
 #include <cerrno>
+#include <cstdlib>
+#include <filesystem>
+#include <iostream>
+#include <mutex>
+#include <unordered_map>
 #include <sys/socket.h>
 #include <unistd.h>
 
 #include <utility>
+
+#include "shared/netlink.hpp"
+#include "shared/sockaddr.hpp"
 
 namespace inline_proxy {
 namespace {
@@ -20,6 +30,16 @@ SendHook& SendHookRef() {
 
 ShutdownHook& ShutdownHookRef() {
     static ShutdownHook hook = nullptr;
+    return hook;
+}
+
+AcquireLocalSourceHook& AcquireLocalSourceHookRef() {
+    static AcquireLocalSourceHook hook = nullptr;
+    return hook;
+}
+
+ReleaseLocalSourceHook& ReleaseLocalSourceHookRef() {
+    static ReleaseLocalSourceHook hook = nullptr;
     return hook;
 }
 
@@ -41,6 +61,26 @@ std::size_t PendingBytes(const std::string& buffer, std::size_t offset) {
     return offset < buffer.size() ? buffer.size() - offset : 0;
 }
 
+bool DebugCloseUpstreamOnFirstResponseEnabled() {
+    const char* value = std::getenv("INLINE_PROXY_DEBUG_CLOSE_UPSTREAM_ON_FIRST_RESPONSE");
+    return value != nullptr && std::string_view(value) == "1";
+}
+
+bool DebugShutdownUpstreamOnFirstResponseEnabled() {
+    const char* value = std::getenv("INLINE_PROXY_DEBUG_SHUTDOWN_UPSTREAM_ON_FIRST_RESPONSE");
+    return value != nullptr && std::string_view(value) == "1";
+}
+
+bool DebugDetachUpstreamOnFirstResponseEnabled() {
+    const char* value = std::getenv("INLINE_PROXY_DEBUG_DETACH_UPSTREAM_ON_FIRST_RESPONSE");
+    return value != nullptr && std::string_view(value) == "1";
+}
+
+bool DebugCloseClientOnFirstResponseEnabled() {
+    const char* value = std::getenv("INLINE_PROXY_DEBUG_CLOSE_CLIENT_ON_FIRST_RESPONSE");
+    return value != nullptr && std::string_view(value) == "1";
+}
+
 void CompactBuffer(std::string& buffer, std::size_t& offset) {
     if (offset == 0) {
         return;
@@ -56,6 +96,108 @@ void CompactBuffer(std::string& buffer, std::size_t& offset) {
     }
 }
 
+class LocalSourceManager {
+public:
+    bool Acquire(const sockaddr_storage& addr) {
+        if (addr.ss_family != AF_INET) {
+            return true;
+        }
+
+        const auto& ipv4 = reinterpret_cast<const sockaddr_in&>(addr);
+        const std::uint32_t key = ipv4.sin_addr.s_addr;
+
+        std::lock_guard<std::mutex> lock(mu_);
+        auto& entry = refs_[key];
+        if (entry.refs == 0) {
+            entry.interfaces = CandidateInterfaces();
+            if (entry.interfaces.empty()) {
+                entry.interfaces = {"lo"};
+            }
+            for (const auto& ifname : entry.interfaces) {
+                if (AddLocalAddress(ifname, ipv4.sin_addr, 32)) {
+                    continue;
+                }
+                for (const auto& added : entry.interfaces) {
+                    if (added == ifname) {
+                        break;
+                    }
+                    (void)RemoveLocalAddress(added, ipv4.sin_addr, 32);
+                }
+                entry.interfaces.clear();
+                refs_.erase(key);
+                return false;
+            }
+        }
+        ++entry.refs;
+        return true;
+    }
+
+    void Release(const sockaddr_storage& addr) {
+        if (addr.ss_family != AF_INET) {
+            return;
+        }
+
+        const auto& ipv4 = reinterpret_cast<const sockaddr_in&>(addr);
+        const std::uint32_t key = ipv4.sin_addr.s_addr;
+
+        std::lock_guard<std::mutex> lock(mu_);
+        const auto it = refs_.find(key);
+        if (it == refs_.end()) {
+            return;
+        }
+
+        if (it->second.refs > 1) {
+            --it->second.refs;
+            return;
+        }
+
+        for (const auto& ifname : it->second.interfaces) {
+            (void)RemoveLocalAddress(ifname, ipv4.sin_addr, 32);
+        }
+        refs_.erase(it);
+    }
+
+private:
+    struct RefEntry {
+        std::size_t refs = 0;
+        std::vector<std::string> interfaces;
+    };
+
+    static std::vector<std::string> CandidateInterfaces() {
+        std::vector<std::string> interfaces;
+        for (const auto& entry : std::filesystem::directory_iterator("/sys/class/net")) {
+            const auto name = entry.path().filename().string();
+            if (name.rfind("wan_", 0) == 0) {
+                interfaces.push_back(name);
+            }
+        }
+        return interfaces;
+    }
+
+    std::mutex mu_;
+    std::unordered_map<std::uint32_t, RefEntry> refs_;
+};
+
+LocalSourceManager& LocalSourceManagerRef() {
+    static LocalSourceManager manager;
+    return manager;
+}
+
+bool AcquireLocalSourceAddress(const sockaddr_storage& addr) {
+    if (auto hook = AcquireLocalSourceHookRef()) {
+        return hook(addr);
+    }
+    return LocalSourceManagerRef().Acquire(addr);
+}
+
+void ReleaseLocalSourceAddress(const sockaddr_storage& addr) {
+    if (auto hook = ReleaseLocalSourceHookRef()) {
+        hook(addr);
+        return;
+    }
+    LocalSourceManagerRef().Release(addr);
+}
+
 }  // namespace
 
 void SetSendHookForTesting(SendHook hook) {
@@ -64,6 +206,14 @@ void SetSendHookForTesting(SendHook hook) {
 
 void SetShutdownHookForTesting(ShutdownHook hook) {
     ShutdownHookRef() = hook;
+}
+
+void SetAcquireLocalSourceHookForTesting(AcquireLocalSourceHook hook) {
+    AcquireLocalSourceHookRef() = hook;
+}
+
+void SetReleaseLocalSourceHookForTesting(ReleaseLocalSourceHook hook) {
+    ReleaseLocalSourceHookRef() = hook;
 }
 
 std::size_t RelaySessionBufferHighWaterMark() noexcept {
@@ -93,14 +243,30 @@ std::shared_ptr<RelaySession> RelaySession::Create(EventLoop& loop,
         return {};
     }
 
+    if (!AcquireLocalSourceAddress(endpoints.client)) {
+        std::cerr << "relay session local source acquire failed"
+                  << " client=" << FormatSockaddr(endpoints.client)
+                  << " original_dst=" << FormatSockaddr(endpoints.original_dst)
+                  << '\n';
+        return {};
+    }
+
     auto upstream = CreateTransparentSocket(endpoints.client, endpoints.original_dst);
     if (!upstream) {
+        std::cerr << "relay session upstream create failed"
+                  << " client=" << FormatSockaddr(endpoints.client)
+                  << " original_dst=" << FormatSockaddr(endpoints.original_dst)
+                  << " errno=" << errno
+                  << " error=" << std::strerror(errno) << '\n';
+        ReleaseLocalSourceAddress(endpoints.client);
         return {};
     }
 
     auto session = std::shared_ptr<RelaySession>(
         new RelaySession(loop, std::move(client_fd), std::move(upstream.fd)));
     session->upstream_connecting_ = upstream.connecting;
+    session->owns_local_source_ = true;
+    session->local_source_ = endpoints.client;
     session->on_close_ = std::move(on_close);
     session->Arm();
     session->UpdateInterest();
@@ -188,6 +354,32 @@ void RelaySession::OnUpstreamReadable() {
         Close();
         return;
     }
+    if (!upstream_closed_ &&
+        DebugShutdownUpstreamOnFirstResponseEnabled() &&
+        PendingBytes(upstream_to_client_, upstream_to_client_offset_) > 0) {
+        (void)DoShutdown(upstream_fd_.get(), SHUT_RDWR);
+        upstream_closed_ = true;
+    }
+    if (!upstream_closed_ &&
+        DebugDetachUpstreamOnFirstResponseEnabled() &&
+        PendingBytes(upstream_to_client_, upstream_to_client_offset_) > 0) {
+        upstream_closed_ = true;
+        upstream_handle_.reset();
+    }
+    if (!upstream_closed_ &&
+        DebugCloseUpstreamOnFirstResponseEnabled() &&
+        PendingBytes(upstream_to_client_, upstream_to_client_offset_) > 0) {
+        upstream_closed_ = true;
+        upstream_handle_.reset();
+        upstream_fd_.reset();
+    }
+    if (!client_closed_ &&
+        DebugCloseClientOnFirstResponseEnabled() &&
+        PendingBytes(upstream_to_client_, upstream_to_client_offset_) > 0) {
+        client_closed_ = true;
+        client_handle_.reset();
+        client_fd_.reset();
+    }
     if (!MaybePropagateHalfClose()) {
         Close();
         return;
@@ -223,9 +415,19 @@ bool RelaySession::CompleteUpstreamConnect() {
     int socket_error = 0;
     socklen_t len = sizeof(socket_error);
     if (::getsockopt(upstream_fd_.get(), SOL_SOCKET, SO_ERROR, &socket_error, &len) != 0) {
+        std::cerr << "relay session upstream getsockopt failed"
+                  << " local=" << FormatSockaddr(GetSockName(upstream_fd_.get()))
+                  << " peer=" << FormatSockaddr(GetPeer(upstream_fd_.get()))
+                  << " errno=" << errno
+                  << " error=" << std::strerror(errno) << '\n';
         return false;
     }
     if (socket_error != 0) {
+        std::cerr << "relay session upstream connect failed"
+                  << " local=" << FormatSockaddr(GetSockName(upstream_fd_.get()))
+                  << " peer=" << FormatSockaddr(GetPeer(upstream_fd_.get()))
+                  << " so_error=" << socket_error
+                  << " error=" << std::strerror(socket_error) << '\n';
         errno = socket_error;
         return false;
     }
@@ -357,10 +559,6 @@ void RelaySession::Close() {
         return;
     }
     closed_ = true;
-    if (on_close_) {
-        on_close_();
-        on_close_ = {};
-    }
     if (client_handle_) {
         client_handle_.reset();
     }
@@ -369,6 +567,15 @@ void RelaySession::Close() {
     }
     client_fd_.reset();
     upstream_fd_.reset();
+    if (owns_local_source_) {
+        ReleaseLocalSourceAddress(local_source_);
+        owns_local_source_ = false;
+        local_source_ = {};
+    }
+    if (on_close_) {
+        on_close_();
+        on_close_ = {};
+    }
 }
 
 std::shared_ptr<RelaySession> CreateRelaySession(EventLoop& loop,

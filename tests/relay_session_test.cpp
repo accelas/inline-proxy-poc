@@ -29,17 +29,28 @@ namespace {
 bool g_fake_transparent_options = false;
 std::optional<ssize_t> g_send_result;
 int g_last_send_flags = 0;
+int g_acquire_local_source_calls = 0;
+int g_release_local_source_calls = 0;
+sockaddr_storage g_last_local_source{};
 
 class HookScope {
 public:
     HookScope() = default;
     ~HookScope() {
         inline_proxy::SetSetSockOptHookForTesting(nullptr);
+        inline_proxy::SetBindHookForTesting(nullptr);
+        inline_proxy::SetConnectHookForTesting(nullptr);
+        inline_proxy::SetFcntlHookForTesting(nullptr);
         inline_proxy::SetSendHookForTesting(nullptr);
         inline_proxy::SetShutdownHookForTesting(nullptr);
+        inline_proxy::SetAcquireLocalSourceHookForTesting(nullptr);
+        inline_proxy::SetReleaseLocalSourceHookForTesting(nullptr);
         g_fake_transparent_options = false;
         g_send_result.reset();
         g_last_send_flags = 0;
+        g_acquire_local_source_calls = 0;
+        g_release_local_source_calls = 0;
+        g_last_local_source = {};
     }
 };
 
@@ -58,6 +69,22 @@ ssize_t RecordingSend(int fd, const void* buffer, size_t length, int flags) {
         return *g_send_result;
     }
     return ::send(fd, buffer, length, flags);
+}
+
+bool RecordAcquireLocalSource(const sockaddr_storage& addr) {
+    ++g_acquire_local_source_calls;
+    g_last_local_source = addr;
+    return true;
+}
+
+void RecordReleaseLocalSource(const sockaddr_storage& addr) {
+    ++g_release_local_source_calls;
+    g_last_local_source = addr;
+}
+
+int FailingBind(int, const sockaddr*, socklen_t) {
+    errno = EADDRNOTAVAIL;
+    return -1;
 }
 
 struct TcpListener {
@@ -313,6 +340,91 @@ TEST(RelaySessionTest, PropagatesUpstreamEofToClient) {
     loop_thread.join();
     session.reset();
     upstream_thread.join();
+}
+
+TEST(RelaySessionTest, AcquiresAndReleasesLocalSourceAcrossSessionLifecycle) {
+    HookScope hooks;
+    g_fake_transparent_options = true;
+    inline_proxy::SetSetSockOptHookForTesting(TestSetSockOpt);
+    inline_proxy::SetAcquireLocalSourceHookForTesting(RecordAcquireLocalSource);
+    inline_proxy::SetReleaseLocalSourceHookForTesting(RecordReleaseLocalSource);
+
+    auto upstream = MakeTcpListener("127.0.0.1");
+    auto proxy_listener = inline_proxy::CreateTransparentListener("127.0.0.1", 0);
+    ASSERT_TRUE(proxy_listener.ok());
+
+    std::promise<void> upstream_accepted;
+    std::thread upstream_thread([&] {
+        int accepted_fd = ::accept(upstream.fd.get(), nullptr, nullptr);
+        ASSERT_GE(accepted_fd, 0);
+        inline_proxy::ScopedFd accepted(accepted_fd);
+        upstream_accepted.set_value();
+    });
+
+    const auto proxy_addr = inline_proxy::GetSockName(proxy_listener.fd());
+    inline_proxy::ScopedFd client(::socket(AF_INET, SOCK_STREAM, 0));
+    ASSERT_TRUE(client);
+    ASSERT_EQ(::connect(client.get(), reinterpret_cast<const sockaddr*>(&proxy_addr), sizeof(sockaddr_in)), 0);
+
+    int accepted_fd = ::accept(proxy_listener.fd(), nullptr, nullptr);
+    ASSERT_GE(accepted_fd, 0);
+    inline_proxy::ScopedFd accepted(accepted_fd);
+
+    inline_proxy::SessionEndpoints endpoints{
+        .client = inline_proxy::MakeSockaddr4("127.0.0.1", 12345),
+        .original_dst = upstream.addr,
+    };
+
+    inline_proxy::EventLoop loop;
+    auto session = inline_proxy::CreateRelaySession(loop, std::move(accepted), endpoints);
+    ASSERT_TRUE(session);
+    EXPECT_EQ(g_acquire_local_source_calls, 1);
+    EXPECT_EQ(g_release_local_source_calls, 0);
+
+    std::thread loop_thread([&] { loop.Run(); });
+    ASSERT_EQ(upstream_accepted.get_future().wait_for(std::chrono::seconds(1)), std::future_status::ready);
+
+    client.reset();
+    loop.Stop();
+    loop_thread.join();
+    session.reset();
+    upstream_thread.join();
+
+    EXPECT_EQ(g_release_local_source_calls, 1);
+    EXPECT_EQ(inline_proxy::FormatSockaddr(g_last_local_source), "127.0.0.1:12345");
+}
+
+TEST(RelaySessionTest, ReleasesLocalSourceWhenUpstreamCreateFails) {
+    HookScope hooks;
+    g_fake_transparent_options = true;
+    inline_proxy::SetSetSockOptHookForTesting(TestSetSockOpt);
+    inline_proxy::SetAcquireLocalSourceHookForTesting(RecordAcquireLocalSource);
+    inline_proxy::SetReleaseLocalSourceHookForTesting(RecordReleaseLocalSource);
+
+    auto proxy_listener = inline_proxy::CreateTransparentListener("127.0.0.1", 0);
+    ASSERT_TRUE(proxy_listener.ok());
+    inline_proxy::SetBindHookForTesting(FailingBind);
+
+    const auto proxy_addr = inline_proxy::GetSockName(proxy_listener.fd());
+    inline_proxy::ScopedFd client(::socket(AF_INET, SOCK_STREAM, 0));
+    ASSERT_TRUE(client);
+    ASSERT_EQ(::connect(client.get(), reinterpret_cast<const sockaddr*>(&proxy_addr), sizeof(sockaddr_in)), 0);
+
+    int accepted_fd = ::accept(proxy_listener.fd(), nullptr, nullptr);
+    ASSERT_GE(accepted_fd, 0);
+    inline_proxy::ScopedFd accepted(accepted_fd);
+
+    inline_proxy::SessionEndpoints endpoints{
+        .client = inline_proxy::MakeSockaddr4("127.0.0.1", 23456),
+        .original_dst = inline_proxy::MakeSockaddr4("127.0.0.1", 80),
+    };
+
+    inline_proxy::EventLoop loop;
+    auto session = inline_proxy::CreateRelaySession(loop, std::move(accepted), endpoints);
+    EXPECT_FALSE(session);
+    EXPECT_EQ(g_acquire_local_source_calls, 1);
+    EXPECT_EQ(g_release_local_source_calls, 1);
+    client.reset();
 }
 
 TEST(RelaySessionTest, AppliesBackpressureWhenUpstreamWriteStalls) {

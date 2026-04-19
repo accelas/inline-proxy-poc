@@ -17,6 +17,7 @@ struct ProxyConfig {
     std::uint16_t admin_port = 8080;
     std::string transparent_address = "0.0.0.0";
     std::uint16_t transparent_port = 15001;
+    std::uint16_t intercept_port = 80;
 
     // Injected env overrides for tests or callers that already resolved env state.
     static ProxyConfig FromEnv(std::initializer_list<EnvOverride> env = {});
@@ -29,6 +30,7 @@ using AdminSendHook = ssize_t (*)(int fd, const void* buffer, size_t length, int
 void SetAdminSendHookForTesting(AdminSendHook hook);
 ssize_t DoAdminSend(int fd, const void* buffer, size_t length, int flags);
 
+bool InstallTransparentRoutingRule();
 int RunProxyDaemon(const ProxyConfig& cfg);
 
 }  // namespace inline_proxy

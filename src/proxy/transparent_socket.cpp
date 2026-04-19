@@ -1,8 +1,10 @@
 #include "proxy/transparent_socket.hpp"
 
 #include <cerrno>
+#include <cstdlib>
 #include <fcntl.h>
 #include <netinet/in.h>
+#include <string_view>
 #include <unistd.h>
 
 namespace inline_proxy {
@@ -64,6 +66,14 @@ int DoFcntl(int fd, int cmd, int arg) {
 }
 
 namespace {
+
+bool PreserveClientPort() {
+    const char* value = std::getenv("INLINE_PROXY_PRESERVE_CLIENT_PORT");
+    if (value == nullptr) {
+        return true;
+    }
+    return std::string_view(value) != "0";
+}
 
 bool SetSocketOptionInt(int fd, int level, int name, int value) {
     return DoSetSockOpt(fd, level, name, &value, sizeof(value)) == 0;
@@ -164,13 +174,19 @@ TransparentConnectResult CreateTransparentSocket(const sockaddr_storage& origina
         return {};
     }
 
+    auto bind_src = original_src;
+    if (!PreserveClientPort()) {
+        auto* v4 = reinterpret_cast<sockaddr_in*>(&bind_src);
+        v4->sin_port = 0;
+    }
+
     if (!SetNonBlocking(result.fd.get())) {
         return {};
     }
 
     if (DoBind(result.fd.get(),
-               reinterpret_cast<const sockaddr*>(&original_src),
-               SockaddrLength(original_src)) != 0) {
+               reinterpret_cast<const sockaddr*>(&bind_src),
+               SockaddrLength(bind_src)) != 0) {
         return {};
     }
 

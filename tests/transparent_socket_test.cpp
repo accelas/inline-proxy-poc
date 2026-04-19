@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <cstring>
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
@@ -21,6 +22,7 @@ bool g_fake_transparent_options = false;
 int g_failing_socket_option = -1;
 bool g_bind_should_fail = false;
 std::vector<std::string>* g_call_log = nullptr;
+std::string g_preserve_client_port_env;
 
 class HookScope {
 public:
@@ -34,6 +36,13 @@ public:
         g_failing_socket_option = -1;
         g_bind_should_fail = false;
         g_call_log = nullptr;
+        if (g_preserve_client_port_env.empty()) {
+            ::unsetenv("INLINE_PROXY_PRESERVE_CLIENT_PORT");
+        } else {
+            ::setenv("INLINE_PROXY_PRESERVE_CLIENT_PORT",
+                     g_preserve_client_port_env.c_str(),
+                     1);
+        }
     }
 };
 
@@ -62,6 +71,14 @@ int RecordingBind(int fd, const sockaddr*, socklen_t) {
     if (g_call_log != nullptr) {
         g_call_log->push_back("bind");
     }
+    return 0;
+}
+
+sockaddr_storage g_last_bind_addr{};
+
+int CaptureBind(int, const sockaddr* addr, socklen_t addrlen) {
+    std::memset(&g_last_bind_addr, 0, sizeof(g_last_bind_addr));
+    std::memcpy(&g_last_bind_addr, addr, std::min<std::size_t>(addrlen, sizeof(g_last_bind_addr)));
     return 0;
 }
 
@@ -221,4 +238,23 @@ TEST(TransparentSocketTest, TransparentSocketReportsNonblockingConnectInProgress
     auto result = inline_proxy::CreateTransparentSocket(src, dst);
     ASSERT_TRUE(result.ok());
     EXPECT_TRUE(result.connecting);
+}
+
+TEST(TransparentSocketTest, TransparentSocketCanDropClientPortPreservationViaEnv) {
+    HookScope hooks;
+    g_preserve_client_port_env = "1";
+    ::setenv("INLINE_PROXY_PRESERVE_CLIENT_PORT", "0", 1);
+    g_fake_transparent_options = true;
+    inline_proxy::SetSetSockOptHookForTesting(TestSetSockOpt);
+    inline_proxy::SetBindHookForTesting(CaptureBind);
+    inline_proxy::SetConnectHookForTesting(RecordingConnect);
+
+    const auto src = inline_proxy::MakeSockaddr4("127.0.0.1", 12345);
+    const auto dst = inline_proxy::MakeSockaddr4("127.0.0.1", 8080);
+
+    auto result = inline_proxy::CreateTransparentSocket(src, dst);
+    ASSERT_TRUE(result.ok());
+    ASSERT_EQ(g_last_bind_addr.ss_family, AF_INET);
+    const auto* v4 = reinterpret_cast<const sockaddr_in*>(&g_last_bind_addr);
+    EXPECT_EQ(ntohs(v4->sin_port), 0);
 }

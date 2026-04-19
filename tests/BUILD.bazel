@@ -189,6 +189,17 @@ cc_library(
     ],
 )
 
+cc_library(
+    name = "fd_netns_harness",
+    srcs = ["fd_netns_harness.cpp"],
+    hdrs = ["fd_netns_harness.hpp"],
+    deps = [
+        "//src/bpf:loader",
+        "//src/proxy:proxy",
+        "//src/shared:shared",
+    ],
+)
+
 cc_test(
     name = "transparent_relay_netns_test",
     srcs = ["transparent_relay_netns_test.cpp"],
@@ -201,6 +212,16 @@ cc_test(
 )
 
 cc_test(
+    name = "ebpf_intercept_fd_netns_test",
+    srcs = ["ebpf_intercept_fd_netns_test.cpp"],
+    size = "large",
+    local = True,
+    deps = [
+        ":fd_netns_harness",
+        "@googletest//:gtest_main",
+    ],
+)
+cc_test(
     name = "splice_executor_netns_test",
     srcs = ["splice_executor_netns_test.cpp"],
     size = "large",
@@ -208,6 +229,16 @@ cc_test(
     deps = [
         ":netns_fixture",
         "@googletest//:gtest_main",
+    ],
+)
+
+cc_test(
+    name = "state_reconciler_test",
+    srcs = ["state_reconciler_test.cpp"],
+    deps = [
+        "@googletest//:gtest_main",
+        "//src/proxy:proxy",
+        "//src/shared:shared",
     ],
 )
 

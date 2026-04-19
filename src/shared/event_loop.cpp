@@ -425,6 +425,13 @@ void EventLoop::Run() {
                 continue;
             }
 
+            if ((revents & POLLHUP) != 0 &&
+                (revents & POLLIN) == 0 &&
+                registration->want_read.load(std::memory_order_acquire) &&
+                registration->on_read) {
+                registration->on_read();
+            }
+
             const bool terminal = (revents & (POLLERR | POLLHUP | POLLNVAL)) != 0;
             bool should_stop = false;
 

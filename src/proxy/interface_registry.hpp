@@ -11,7 +11,7 @@ namespace inline_proxy {
 
 class InterfaceRegistry {
 public:
-    bool ConfigureIngressListener(int listener_fd);
+    bool ConfigureIngressListener(int listener_fd, std::uint16_t intercept_port);
 
     bool RecordInterface(std::string_view name);
     bool RemoveInterface(std::string_view name);

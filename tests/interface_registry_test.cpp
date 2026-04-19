@@ -38,7 +38,7 @@ TEST(InterfaceRegistryTest, ConfiguresIngressListenerOnLoader) {
     addr.sin_port = 0;
     ASSERT_EQ(::bind(listener_fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)), 0);
 
-    EXPECT_TRUE(registry.ConfigureIngressListener(listener_fd));
+    EXPECT_TRUE(registry.ConfigureIngressListener(listener_fd, 80));
     EXPECT_EQ(registry.bpf_loader().listener_socket_fd(), listener_fd);
 
     ::close(listener_fd);
@@ -60,7 +60,7 @@ TEST(InterfaceRegistryTest, ReplaysRecordedWanInterfacesWhenListenerIsConfigured
     addr.sin_port = 0;
     ASSERT_EQ(::bind(listener_fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)), 0);
 
-    EXPECT_TRUE(registry.ConfigureIngressListener(listener_fd));
+    EXPECT_TRUE(registry.ConfigureIngressListener(listener_fd, 80));
     EXPECT_EQ(registry.bpf_loader().listener_socket_fd(), listener_fd);
     EXPECT_NE(registry.bpf_loader().listener_port(), 0U);
     EXPECT_FALSE(registry.bpf_loader().IsIngressAttached("wan_missing0"));
@@ -74,7 +74,7 @@ TEST(InterfaceRegistryTest, RejectsInvalidIngressListenerConfiguration) {
     int pipe_fds[2];
     ASSERT_EQ(::pipe(pipe_fds), 0);
 
-    EXPECT_FALSE(registry.ConfigureIngressListener(pipe_fds[0]));
+    EXPECT_FALSE(registry.ConfigureIngressListener(pipe_fds[0], 80));
     EXPECT_FALSE(registry.bpf_loader().listener_socket_fd().has_value());
     EXPECT_EQ(registry.bpf_loader().listener_port(), 0U);
 

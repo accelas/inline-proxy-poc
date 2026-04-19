@@ -21,7 +21,7 @@ public:
     bool AttachIngress(std::string_view interface_name);
     bool DetachIngress(std::string_view interface_name);
 
-    bool ConfigureListenerSocket(int listener_fd);
+    bool ConfigureListenerSocket(int listener_fd, std::uint32_t intercept_port = 0);
     std::optional<int> listener_socket_fd() const noexcept;
     std::uint32_t listener_port() const noexcept;
 
@@ -36,6 +36,7 @@ private:
     std::uint32_t listener_port_ = 0;
     IngressRedirectConfig runtime_config_{};
     ScopedFd config_map_;
+    ScopedFd listener_map_;
     ScopedFd program_fd_;
 };
 

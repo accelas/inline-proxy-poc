@@ -42,6 +42,7 @@ TEST(ProxyConfigTest, ParsesDefaultAdminAndTransparentPorts) {
     ScopedEnvVar admin_env("INLINE_PROXY_ADMIN_PORT", nullptr);
     ScopedEnvVar transparent_address_env("INLINE_PROXY_TRANSPARENT_ADDRESS", nullptr);
     ScopedEnvVar transparent_env("INLINE_PROXY_TRANSPARENT_PORT", nullptr);
+    ScopedEnvVar intercept_env("INLINE_PROXY_INTERCEPT_PORT", nullptr);
     char arg0[] = "proxy_daemon";
     char* argv[] = {arg0};
     auto cfg = inline_proxy::ProxyConfig::FromArgs(1, argv);
@@ -49,6 +50,7 @@ TEST(ProxyConfigTest, ParsesDefaultAdminAndTransparentPorts) {
     EXPECT_EQ(cfg.admin_port, 8080);
     EXPECT_EQ(cfg.transparent_address, "0.0.0.0");
     EXPECT_EQ(cfg.transparent_port, 15001);
+    EXPECT_EQ(cfg.intercept_port, 80);
 }
 
 TEST(ProxyConfigTest, ParsesEnvOverridesForPorts) {
@@ -57,12 +59,14 @@ TEST(ProxyConfigTest, ParsesEnvOverridesForPorts) {
         {"INLINE_PROXY_ADMIN_PORT", "18080"},
         {"INLINE_PROXY_TRANSPARENT_ADDRESS", "127.0.0.1"},
         {"INLINE_PROXY_TRANSPARENT_PORT", "25001"},
+        {"INLINE_PROXY_INTERCEPT_PORT", "8080"},
     });
 
     EXPECT_EQ(cfg.admin_address, "0.0.0.0");
     EXPECT_EQ(cfg.admin_port, 18080);
     EXPECT_EQ(cfg.transparent_address, "127.0.0.1");
     EXPECT_EQ(cfg.transparent_port, 25001);
+    EXPECT_EQ(cfg.intercept_port, 8080);
 }
 
 TEST(ProxyConfigTest, ParsesCliOverridesForPorts) {
@@ -70,25 +74,29 @@ TEST(ProxyConfigTest, ParsesCliOverridesForPorts) {
     ScopedEnvVar admin_env("INLINE_PROXY_ADMIN_PORT", "19080");
     ScopedEnvVar transparent_address_env("INLINE_PROXY_TRANSPARENT_ADDRESS", "0.0.0.0");
     ScopedEnvVar transparent_env("INLINE_PROXY_TRANSPARENT_PORT", "29001");
+    ScopedEnvVar intercept_env("INLINE_PROXY_INTERCEPT_PORT", "8080");
 
     char arg0[] = "proxy_daemon";
     char arg1[] = "--admin-address=0.0.0.0";
     char arg2[] = "--admin-port=28080";
     char arg3[] = "--transparent-address=127.0.0.1";
     char arg4[] = "--transparent-port=35001";
-    char* argv[] = {arg0, arg1, arg2, arg3, arg4};
+    char arg5[] = "--intercept-port=443";
+    char* argv[] = {arg0, arg1, arg2, arg3, arg4, arg5};
 
-    auto cfg = inline_proxy::ProxyConfig::FromArgs(5, argv);
+    auto cfg = inline_proxy::ProxyConfig::FromArgs(6, argv);
 
     EXPECT_EQ(cfg.admin_address, "0.0.0.0");
     EXPECT_EQ(cfg.admin_port, 28080);
     EXPECT_EQ(cfg.transparent_address, "127.0.0.1");
     EXPECT_EQ(cfg.transparent_port, 35001);
+    EXPECT_EQ(cfg.intercept_port, 443);
 }
 
 TEST(ProxyConfigTest, CliOverridesTakePrecedenceOverInvalidEnvValuesForSameField) {
     ScopedEnvVar admin_env("INLINE_PROXY_ADMIN_PORT", "not-a-number");
     ScopedEnvVar transparent_env("INLINE_PROXY_TRANSPARENT_PORT", "29001");
+    ScopedEnvVar intercept_env("INLINE_PROXY_INTERCEPT_PORT", "80");
 
     char arg0[] = "proxy_daemon";
     char arg1[] = "--admin-port=28080";
@@ -98,6 +106,7 @@ TEST(ProxyConfigTest, CliOverridesTakePrecedenceOverInvalidEnvValuesForSameField
 
     EXPECT_EQ(cfg.admin_port, 28080);
     EXPECT_EQ(cfg.transparent_port, 29001);
+    EXPECT_EQ(cfg.intercept_port, 80);
 }
 
 TEST(ProxyConfigTest, RejectsInvalidEnvPortValues) {
@@ -105,6 +114,7 @@ TEST(ProxyConfigTest, RejectsInvalidEnvPortValues) {
     ScopedEnvVar admin_env("INLINE_PROXY_ADMIN_PORT", "not-a-number");
     ScopedEnvVar transparent_address_env("INLINE_PROXY_TRANSPARENT_ADDRESS", nullptr);
     ScopedEnvVar transparent_env("INLINE_PROXY_TRANSPARENT_PORT", nullptr);
+    ScopedEnvVar intercept_env("INLINE_PROXY_INTERCEPT_PORT", nullptr);
     char arg0[] = "proxy_daemon";
     char* argv[] = {arg0};
 
@@ -116,6 +126,7 @@ TEST(ProxyConfigTest, RejectsInvalidCliPortValues) {
     ScopedEnvVar admin_env("INLINE_PROXY_ADMIN_PORT", nullptr);
     ScopedEnvVar transparent_address_env("INLINE_PROXY_TRANSPARENT_ADDRESS", nullptr);
     ScopedEnvVar transparent_env("INLINE_PROXY_TRANSPARENT_PORT", nullptr);
+    ScopedEnvVar intercept_env("INLINE_PROXY_INTERCEPT_PORT", nullptr);
     char arg0[] = "proxy_daemon";
     char arg1[] = "--admin-port=abc";
     char* argv[] = {arg0, arg1};
@@ -151,6 +162,7 @@ TEST(ProxyConfigTest, RejectsUnknownRuntimeEnvKeys) {
     ScopedEnvVar admin_env("INLINE_PROXY_ADMIN_PORT", nullptr);
     ScopedEnvVar transparent_address_env("INLINE_PROXY_TRANSPARENT_ADDRESS", nullptr);
     ScopedEnvVar transparent_env("INLINE_PROXY_TRANSPARENT_PORT", nullptr);
+    ScopedEnvVar intercept_env("INLINE_PROXY_INTERCEPT_PORT", nullptr);
 
     char arg0[] = "proxy_daemon";
     char* argv[] = {arg0};

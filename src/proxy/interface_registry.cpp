@@ -4,8 +4,8 @@
 #include <string>
 
 namespace inline_proxy {
-bool InterfaceRegistry::ConfigureIngressListener(int listener_fd) {
-    if (!bpf_loader_.ConfigureListenerSocket(listener_fd)) {
+bool InterfaceRegistry::ConfigureIngressListener(int listener_fd, std::uint16_t intercept_port) {
+    if (!bpf_loader_.ConfigureListenerSocket(listener_fd, intercept_port)) {
         return false;
     }
 
