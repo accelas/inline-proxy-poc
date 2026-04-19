@@ -64,6 +64,8 @@ constexpr std::string_view kDebugSyncRelayEnv = "INLINE_PROXY_DEBUG_SYNC_RELAY";
 constexpr std::string_view kDebugSyncConnectTimeoutEnv = "INLINE_PROXY_DEBUG_SYNC_CONNECT_TIMEOUT_MS";
 constexpr std::string_view kDebugSyncNonblockingClientEnv = "INLINE_PROXY_DEBUG_SYNC_NONBLOCKING_CLIENT";
 constexpr std::string_view kDebugSyncHoldOpenMsEnv = "INLINE_PROXY_DEBUG_SYNC_HOLD_OPEN_MS";
+constexpr std::string_view kDebugUseProxySourceEnv = "INLINE_PROXY_DEBUG_USE_PROXY_SOURCE";
+constexpr std::string_view kDebugSkipLocalSourceEnv = "INLINE_PROXY_DEBUG_SKIP_LOCAL_SOURCE";
 constexpr std::string_view kDebugCloseUpstreamOnFirstResponseEnv =
     "INLINE_PROXY_DEBUG_CLOSE_UPSTREAM_ON_FIRST_RESPONSE";
 constexpr std::string_view kDebugShutdownUpstreamOnFirstResponseEnv =
@@ -284,6 +286,12 @@ void ApplyOverride(ProxyConfig& cfg, std::string_view name, std::string_view val
     if (name == kDebugCloseUpstreamOnFirstResponseEnv) {
         return;
     }
+    if (name == kDebugUseProxySourceEnv) {
+        return;
+    }
+    if (name == kDebugSkipLocalSourceEnv) {
+        return;
+    }
     throw std::invalid_argument(std::string("unknown env key: ") + std::string(name));
 }
 
@@ -396,6 +404,12 @@ void ApplyProcessEnvOverrides(ProxyConfig& cfg, const CliParseResult& cli) {
             continue;
         }
         if (name == kDebugCloseUpstreamOnFirstResponseEnv) {
+            continue;
+        }
+        if (name == kDebugUseProxySourceEnv) {
+            continue;
+        }
+        if (name == kDebugSkipLocalSourceEnv) {
             continue;
         }
 

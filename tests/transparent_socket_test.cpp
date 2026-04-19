@@ -23,6 +23,7 @@ int g_failing_socket_option = -1;
 bool g_bind_should_fail = false;
 std::vector<std::string>* g_call_log = nullptr;
 std::string g_preserve_client_port_env;
+std::string g_use_proxy_source_env;
 
 class HookScope {
 public:
@@ -41,6 +42,13 @@ public:
         } else {
             ::setenv("INLINE_PROXY_PRESERVE_CLIENT_PORT",
                      g_preserve_client_port_env.c_str(),
+                     1);
+        }
+        if (g_use_proxy_source_env.empty()) {
+            ::unsetenv("INLINE_PROXY_DEBUG_USE_PROXY_SOURCE");
+        } else {
+            ::setenv("INLINE_PROXY_DEBUG_USE_PROXY_SOURCE",
+                     g_use_proxy_source_env.c_str(),
                      1);
         }
     }
@@ -256,5 +264,25 @@ TEST(TransparentSocketTest, TransparentSocketCanDropClientPortPreservationViaEnv
     ASSERT_TRUE(result.ok());
     ASSERT_EQ(g_last_bind_addr.ss_family, AF_INET);
     const auto* v4 = reinterpret_cast<const sockaddr_in*>(&g_last_bind_addr);
+    EXPECT_EQ(ntohs(v4->sin_port), 0);
+}
+
+TEST(TransparentSocketTest, TransparentSocketCanUseProxySourceViaEnv) {
+    HookScope hooks;
+    g_use_proxy_source_env = "1";
+    ::setenv("INLINE_PROXY_DEBUG_USE_PROXY_SOURCE", "1", 1);
+    g_fake_transparent_options = true;
+    inline_proxy::SetSetSockOptHookForTesting(TestSetSockOpt);
+    inline_proxy::SetBindHookForTesting(CaptureBind);
+    inline_proxy::SetConnectHookForTesting(RecordingConnect);
+
+    const auto src = inline_proxy::MakeSockaddr4("10.42.0.50", 12345);
+    const auto dst = inline_proxy::MakeSockaddr4("10.42.0.90", 8080);
+
+    auto result = inline_proxy::CreateTransparentSocket(src, dst);
+    ASSERT_TRUE(result.ok());
+    ASSERT_EQ(g_last_bind_addr.ss_family, AF_INET);
+    const auto* v4 = reinterpret_cast<const sockaddr_in*>(&g_last_bind_addr);
+    EXPECT_EQ(v4->sin_addr.s_addr, htonl(INADDR_ANY));
     EXPECT_EQ(ntohs(v4->sin_port), 0);
 }

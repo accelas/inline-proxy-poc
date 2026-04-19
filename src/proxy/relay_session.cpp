@@ -187,12 +187,20 @@ bool AcquireLocalSourceAddress(const sockaddr_storage& addr) {
     if (auto hook = AcquireLocalSourceHookRef()) {
         return hook(addr);
     }
+    if (const char* value = std::getenv("INLINE_PROXY_DEBUG_SKIP_LOCAL_SOURCE");
+        value != nullptr && std::string_view(value) == "1") {
+        return true;
+    }
     return LocalSourceManagerRef().Acquire(addr);
 }
 
 void ReleaseLocalSourceAddress(const sockaddr_storage& addr) {
     if (auto hook = ReleaseLocalSourceHookRef()) {
         hook(addr);
+        return;
+    }
+    if (const char* value = std::getenv("INLINE_PROXY_DEBUG_SKIP_LOCAL_SOURCE");
+        value != nullptr && std::string_view(value) == "1") {
         return;
     }
     LocalSourceManagerRef().Release(addr);
