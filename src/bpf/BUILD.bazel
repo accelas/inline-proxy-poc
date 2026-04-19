@@ -24,6 +24,10 @@ cc_library(
         "ingress_redirect_common.h",
         "loader.hpp",
     ],
-    deps = ["//src/shared:shared"],
+    deps = [
+        ":ingress_redirect_skel",
+        "//src/shared:shared",
+        "@libbpf//:libbpf",
+    ],
     include_prefix = "bpf",
 )
