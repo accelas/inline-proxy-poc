@@ -252,6 +252,20 @@ void WritePemFiles(const TempCertBundle& bundle) {
     }
 }
 
+std::string Base64Encode(std::string_view input) {
+    if (input.empty()) {
+        return {};
+    }
+    std::string encoded;
+    encoded.resize(4 * ((input.size() + 2) / 3));
+    const int written =
+        EVP_EncodeBlock(reinterpret_cast<unsigned char*>(encoded.data()),
+                        reinterpret_cast<const unsigned char*>(input.data()),
+                        static_cast<int>(input.size()));
+    encoded.resize(static_cast<std::size_t>(written));
+    return encoded;
+}
+
 int CountOpenFileDescriptors() {
     int count = 0;
     for (const auto& entry : std::filesystem::directory_iterator("/proc/self/fd")) {
@@ -756,6 +770,77 @@ TEST(K8sClientTest, FetchPodInfoLoadsDefaultOptionsFromKubeconfig) {
             EXPECT_EQ(options.ca_path, ca_path);
             EXPECT_EQ(options.client_cert_path, client_cert_path);
             EXPECT_EQ(options.client_key_path, client_key_path);
+            return std::optional<std::string>(R"({
+                "metadata":{"name":"proxy-1","namespace":"inline-proxy-system"},
+                "spec":{"nodeName":"worker-1"},
+                "status":{"phase":"Running"}
+            })");
+        });
+
+    const auto pod = inline_proxy::FetchPodInfo(query);
+    EXPECT_EQ(pod.name, "proxy-1");
+    EXPECT_EQ(pod.node_name, "worker-1");
+    EXPECT_TRUE(pod.running);
+
+    inline_proxy::SetK8sResponseFetcherForTesting({});
+}
+
+TEST(K8sClientTest, FetchPodInfoLoadsEmbeddedCredentialsFromKubeconfig) {
+    const auto base = std::filesystem::temp_directory_path() /
+                      ("inline-proxy-kubeconfig-" + std::to_string(::getpid()) + "-embedded");
+    std::filesystem::create_directories(base);
+    const auto kubeconfig_path = base / "kubeconfig";
+
+    {
+        std::ofstream kubeconfig(kubeconfig_path);
+        ASSERT_TRUE(static_cast<bool>(kubeconfig));
+        kubeconfig << "apiVersion: v1\n"
+                   << "clusters:\n"
+                   << "- cluster:\n"
+                   << "    server: https://127.0.0.1:6443\n"
+                   << "    certificate-authority-data: " << Base64Encode(kTestCertPem) << "\n"
+                   << "  name: local\n"
+                   << "users:\n"
+                   << "- name: user\n"
+                   << "  user:\n"
+                   << "    client-certificate-data: " << Base64Encode(kTestCertPem) << "\n"
+                   << "    client-key-data: " << Base64Encode(kTestKeyPem) << "\n";
+    }
+
+    ScopedEnvVar service_host("KUBERNETES_SERVICE_HOST", std::nullopt);
+    ScopedEnvVar service_port("KUBERNETES_SERVICE_PORT", std::nullopt);
+    ScopedEnvVar token_path("INLINE_PROXY_K8S_TOKEN_PATH", std::nullopt);
+    ScopedEnvVar ca_override("INLINE_PROXY_K8S_CA_PATH", std::nullopt);
+    ScopedEnvVar kubeconfig_override("INLINE_PROXY_KUBECONFIG_PATH", kubeconfig_path.string());
+
+    const inline_proxy::K8sQuery query{.namespace_name = "inline-proxy-system", .pod_name = "proxy-1"};
+
+    inline_proxy::SetK8sResponseFetcherForTesting(
+        [&](const inline_proxy::K8sClientOptions& options, const inline_proxy::K8sQuery&) {
+            EXPECT_EQ(options.api_server_host, "127.0.0.1");
+            EXPECT_EQ(options.api_server_port, "6443");
+            EXPECT_FALSE(options.ca_path.empty());
+            EXPECT_FALSE(options.client_cert_path.empty());
+            EXPECT_FALSE(options.client_key_path.empty());
+
+            std::ifstream ca_file(options.ca_path);
+            std::ifstream cert_file(options.client_cert_path);
+            std::ifstream key_file(options.client_key_path);
+            EXPECT_TRUE(static_cast<bool>(ca_file));
+            EXPECT_TRUE(static_cast<bool>(cert_file));
+            EXPECT_TRUE(static_cast<bool>(key_file));
+
+            std::ostringstream ca_buffer;
+            std::ostringstream cert_buffer;
+            std::ostringstream key_buffer;
+            ca_buffer << ca_file.rdbuf();
+            cert_buffer << cert_file.rdbuf();
+            key_buffer << key_file.rdbuf();
+
+            EXPECT_EQ(ca_buffer.str(), std::string(kTestCertPem));
+            EXPECT_EQ(cert_buffer.str(), std::string(kTestCertPem));
+            EXPECT_EQ(key_buffer.str(), std::string(kTestKeyPem));
+
             return std::optional<std::string>(R"({
                 "metadata":{"name":"proxy-1","namespace":"inline-proxy-system"},
                 "spec":{"nodeName":"worker-1"},

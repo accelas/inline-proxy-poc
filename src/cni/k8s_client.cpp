@@ -26,6 +26,7 @@
 #include <nlohmann/json.hpp>
 
 #include <openssl/err.h>
+#include <openssl/evp.h>
 #include <openssl/ssl.h>
 
 namespace inline_proxy {
@@ -131,7 +132,97 @@ void ParseServerUrl(std::string_view server_url, K8sClientOptions& options) {
     options.api_server_host = authority;
 }
 
-void ApplyKubeconfigLine(std::string_view line, K8sClientOptions& options) {
+struct KubeconfigMaterial {
+    std::optional<std::filesystem::path> ca_path;
+    std::optional<std::filesystem::path> client_cert_path;
+    std::optional<std::filesystem::path> client_key_path;
+    std::optional<std::string> ca_data;
+    std::optional<std::string> client_cert_data;
+    std::optional<std::string> client_key_data;
+};
+
+std::string RemoveWhitespace(std::string_view input) {
+    std::string cleaned;
+    cleaned.reserve(input.size());
+    for (char ch : input) {
+        if (!std::isspace(static_cast<unsigned char>(ch))) {
+            cleaned.push_back(ch);
+        }
+    }
+    return cleaned;
+}
+
+std::string DecodeBase64(std::string_view input) {
+    const std::string cleaned = RemoveWhitespace(input);
+    if (cleaned.empty()) {
+        return {};
+    }
+    std::string decoded;
+    decoded.resize((cleaned.size() * 3) / 4 + 3);
+    const int rc = EVP_DecodeBlock(reinterpret_cast<unsigned char*>(decoded.data()),
+                                   reinterpret_cast<const unsigned char*>(cleaned.data()),
+                                   static_cast<int>(cleaned.size()));
+    if (rc < 0) {
+        throw std::runtime_error("failed to decode embedded kubeconfig credential");
+    }
+    std::size_t decoded_size = static_cast<std::size_t>(rc);
+    std::size_t padding = 0;
+    if (!cleaned.empty() && cleaned.back() == '=') {
+        ++padding;
+        if (cleaned.size() >= 2 && cleaned[cleaned.size() - 2] == '=') {
+            ++padding;
+        }
+    }
+    decoded.resize(decoded_size - padding);
+    return decoded;
+}
+
+std::filesystem::path WriteTempCredentialFile(std::string_view prefix, std::string_view contents) {
+    std::string path_template = "/tmp/inline-proxy-";
+    path_template += std::string(prefix);
+    path_template += "-XXXXXX";
+    std::vector<char> buffer(path_template.begin(), path_template.end());
+    buffer.push_back('\0');
+    const int fd = ::mkstemp(buffer.data());
+    if (fd < 0) {
+        throw std::runtime_error("failed to create temporary kubeconfig credential file");
+    }
+    std::string path(buffer.data());
+    const std::string data(contents);
+    std::size_t offset = 0;
+    while (offset < data.size()) {
+        const ssize_t written = ::write(fd, data.data() + offset, data.size() - offset);
+        if (written < 0) {
+            ::close(fd);
+            throw std::runtime_error("failed to persist embedded kubeconfig credential");
+        }
+        offset += static_cast<std::size_t>(written);
+    }
+    ::close(fd);
+    return path;
+}
+
+void ApplyKubeconfigMaterial(K8sClientOptions& options, const KubeconfigMaterial& material) {
+    if (material.ca_path.has_value()) {
+        options.ca_path = *material.ca_path;
+    } else if (material.ca_data.has_value()) {
+        options.ca_path = WriteTempCredentialFile("ca", DecodeBase64(*material.ca_data));
+    }
+
+    if (material.client_cert_path.has_value()) {
+        options.client_cert_path = *material.client_cert_path;
+    } else if (material.client_cert_data.has_value()) {
+        options.client_cert_path = WriteTempCredentialFile("client-cert", DecodeBase64(*material.client_cert_data));
+    }
+
+    if (material.client_key_path.has_value()) {
+        options.client_key_path = *material.client_key_path;
+    } else if (material.client_key_data.has_value()) {
+        options.client_key_path = WriteTempCredentialFile("client-key", DecodeBase64(*material.client_key_data));
+    }
+}
+
+void ApplyKubeconfigLine(std::string_view line, K8sClientOptions& options, KubeconfigMaterial& material) {
     const std::string trimmed = TrimCopy(line);
     if (trimmed.empty() || trimmed.front() == '#') {
         return;
@@ -151,11 +242,17 @@ void ApplyKubeconfigLine(std::string_view line, K8sClientOptions& options) {
     if (key == "server") {
         ParseServerUrl(value, options);
     } else if (key == "certificate-authority") {
-        options.ca_path = value;
+        material.ca_path = value;
+    } else if (key == "certificate-authority-data") {
+        material.ca_data = value;
     } else if (key == "client-certificate") {
-        options.client_cert_path = value;
+        material.client_cert_path = value;
+    } else if (key == "client-certificate-data") {
+        material.client_cert_data = value;
     } else if (key == "client-key") {
-        options.client_key_path = value;
+        material.client_key_path = value;
+    } else if (key == "client-key-data") {
+        material.client_key_data = value;
     }
 }
 
@@ -166,9 +263,11 @@ void ApplyKubeconfig(const std::filesystem::path& path, K8sClientOptions& option
     }
 
     std::string line;
+    KubeconfigMaterial material;
     while (std::getline(stream, line)) {
-        ApplyKubeconfigLine(line, options);
+        ApplyKubeconfigLine(line, options, material);
     }
+    ApplyKubeconfigMaterial(options, material);
 }
 
 K8sClientOptions LoadDefaultOptions() {
@@ -208,6 +307,7 @@ K8sClientOptions LoadDefaultOptions() {
         const auto kubeconfig_path = kubeconfig_env
                                          ? std::optional<std::filesystem::path>(kubeconfig_env)
                                          : FirstExistingPath({
+                                               "/etc/rancher/k3s/k3s.yaml",
                                                "/var/lib/rancher/k3s/agent/kubelet.kubeconfig",
                                            });
         if (kubeconfig_path.has_value()) {
