@@ -917,6 +917,9 @@ std::optional<PodInfo> ParsePodInfo(std::string_view json) {
             info.phase = std::move(*phase);
             info.running = (info.phase == "Running");
         }
+        if (auto pod_ip = ReadString(*status_it, "podIP")) {
+            info.pod_ip = std::move(*pod_ip);
+        }
     }
 
     ReadStringMap(*metadata_it, "labels", info.labels);

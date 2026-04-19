@@ -36,6 +36,7 @@ struct PodInfo {
     std::string name;
     std::string namespace_name;
     std::string node_name;
+    std::string pod_ip;
     std::string phase;
     bool running = false;
     std::map<std::string, std::string> labels;

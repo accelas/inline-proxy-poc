@@ -29,6 +29,9 @@ private:
     bool CreateNamespaces();
     bool ResetNamespaces();
     bool RunCommand(const std::string& command) const;
+    bool BuildBridgeBackedWorkloadTopology(const std::string& workload_ip_cidr,
+                                           const std::string& client_ip_cidr,
+                                           const std::string& gateway_ip);
 
     std::string prefix_;
     std::string client_ns_;

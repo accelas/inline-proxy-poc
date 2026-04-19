@@ -1,9 +1,12 @@
 #include <filesystem>
+#include <fstream>
 #include <optional>
 #include <string>
+#include <vector>
 
 #include <gtest/gtest.h>
 
+#include "cni/netns_resolver.hpp"
 #include "cni/splice_executor.hpp"
 #include "cni/splice_plan.hpp"
 #include "cni/k8s_client.hpp"
@@ -34,6 +37,7 @@ inline_proxy::PodInfo MakeProxyPod() {
     pod.name = "inline-proxy-daemon-worker-1";
     pod.namespace_name = "inline-proxy-system";
     pod.node_name = "worker-1";
+    pod.pod_ip = "10.42.0.9";
     pod.phase = "Running";
     pod.running = true;
     pod.labels["app"] = "inline-proxy";
@@ -58,13 +62,32 @@ inline_proxy::CniRequest MakeRequest() {
 
 TEST(CniAddDelTest, AnnotatedAddWritesStateAndPassesThroughPrevResult) {
     const auto state_root = std::filesystem::temp_directory_path() / "inline_proxy_cni_add_test";
+    const auto fake_netns = state_root / "fake-netns";
     std::error_code ec;
     std::filesystem::remove_all(state_root, ec);
+    std::filesystem::create_directories(state_root);
+    {
+        std::ofstream workload(fake_netns.string() + "-workload");
+        std::ofstream proxy(fake_netns.string() + "-proxy");
+    }
 
-    inline_proxy::SpliceExecutor executor({.state_root = state_root});
     const auto request = MakeRequest();
     const auto workload_pod = MakeWorkloadPod();
     const auto proxy_pod = MakeProxyPod();
+    std::vector<std::filesystem::path> runner_paths;
+    inline_proxy::SpliceExecutor executor({
+        .state_root = state_root,
+        .workload_netns_path = fake_netns.string() + "-workload",
+        .proxy_netns_path = fake_netns.string() + "-proxy",
+        .splice_runner =
+            [&](const inline_proxy::SplicePlan&,
+                const std::filesystem::path& workload_path,
+                const std::filesystem::path& proxy_path) {
+                runner_paths.push_back(workload_path);
+                runner_paths.push_back(proxy_path);
+                return true;
+            },
+    });
     const inline_proxy::CniInvocation invocation{
         .request = request,
         .container_id = "1234567890abcdef",
@@ -75,6 +98,9 @@ TEST(CniAddDelTest, AnnotatedAddWritesStateAndPassesThroughPrevResult) {
     ASSERT_TRUE(result.success);
     EXPECT_EQ(result.stdout_json,
               R"({"dns":{"nameservers":["1.1.1.1"],"search":["svc.cluster.local"]},"interfaces":[{"name":"eth0","sandbox":"/var/run/netns/test"}],"routes":[{"dst":"10.0.0.0/8","gw":"10.42.0.1"}]})");
+    ASSERT_EQ(runner_paths.size(), 2U);
+    EXPECT_EQ(runner_paths[0], fake_netns.string() + "-workload");
+    EXPECT_EQ(runner_paths[1], fake_netns.string() + "-proxy");
 
     inline_proxy::StateStore store(executor.StatePathForContainerId(invocation.container_id));
     auto saved = store.Read();
@@ -87,6 +113,61 @@ TEST(CniAddDelTest, AnnotatedAddWritesStateAndPassesThroughPrevResult) {
     EXPECT_EQ(saved->at("proxy_name"), proxy_pod.name);
 
     EXPECT_TRUE(store.Remove());
+    std::filesystem::remove_all(state_root, ec);
+}
+
+TEST(CniAddDelTest, AnnotatedAddAutoResolvesNetnsPathsBeforeRunningSplice) {
+    const auto state_root =
+        std::filesystem::temp_directory_path() / "inline_proxy_cni_auto_resolve_test";
+    const auto netns_root = state_root / "netns";
+    std::error_code ec;
+    std::filesystem::remove_all(state_root, ec);
+    std::filesystem::create_directories(netns_root);
+
+    const auto proxy_netns_path = netns_root / "proxy-good";
+    {
+        std::ofstream proxy_stream(proxy_netns_path);
+    }
+
+    inline_proxy::SetNamespaceIpv4MatcherForTesting(
+        [&](const std::filesystem::path& path, std::string_view address) {
+            return path == proxy_netns_path && address == "10.42.0.9";
+        });
+
+    std::filesystem::path resolved_workload_path;
+    std::filesystem::path resolved_proxy_path;
+    bool splice_runner_called = false;
+    inline_proxy::SpliceExecutor executor({
+        .state_root = state_root,
+        .proxy_netns_root = netns_root,
+        .splice_runner =
+            [&](const inline_proxy::SplicePlan&,
+                const std::filesystem::path& workload_path,
+                const std::filesystem::path& proxy_path) {
+                splice_runner_called = true;
+                resolved_workload_path = workload_path;
+                resolved_proxy_path = proxy_path;
+                return true;
+            },
+    });
+
+    auto request = MakeRequest();
+    request.prev_result->interfaces[0].sandbox = "/var/run/netns/workload-auto";
+    const auto workload_pod = MakeWorkloadPod();
+    const auto proxy_pod = MakeProxyPod();
+    const inline_proxy::CniInvocation invocation{
+        .request = request,
+        .container_id = "abcdef0123456789",
+        .ifname = "eth0",
+    };
+
+    const auto result = executor.HandleAdd(invocation, workload_pod, proxy_pod);
+    EXPECT_TRUE(result.success);
+    EXPECT_TRUE(splice_runner_called);
+    EXPECT_EQ(resolved_workload_path, "/var/run/netns/workload-auto");
+    EXPECT_EQ(resolved_proxy_path, proxy_netns_path);
+
+    inline_proxy::SetNamespaceIpv4MatcherForTesting({});
     std::filesystem::remove_all(state_root, ec);
 }
 
@@ -191,13 +272,27 @@ TEST(CniAddDelTest, UnannotatedAddPassesThroughWithoutState) {
 
 TEST(CniAddDelTest, DelRemovesSavedState) {
     const auto state_root = std::filesystem::temp_directory_path() / "inline_proxy_cni_del_test";
+    const auto fake_netns = state_root / "fake-netns";
     std::error_code ec;
     std::filesystem::remove_all(state_root, ec);
+    std::filesystem::create_directories(state_root);
+    {
+        std::ofstream workload(fake_netns.string() + "-workload");
+        std::ofstream proxy(fake_netns.string() + "-proxy");
+    }
 
-    inline_proxy::SpliceExecutor executor({.state_root = state_root});
     const auto request = MakeRequest();
     const auto workload_pod = MakeWorkloadPod();
     const auto proxy_pod = MakeProxyPod();
+    inline_proxy::SpliceExecutor executor({
+        .state_root = state_root,
+        .workload_netns_path = fake_netns.string() + "-workload",
+        .proxy_netns_path = fake_netns.string() + "-proxy",
+        .splice_runner =
+            [](const inline_proxy::SplicePlan&,
+               const std::filesystem::path&,
+               const std::filesystem::path&) { return true; },
+    });
     const inline_proxy::CniInvocation invocation{
         .request = request,
         .container_id = "1234567890abcdef",

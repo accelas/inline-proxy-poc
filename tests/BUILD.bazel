@@ -130,6 +130,16 @@ cc_test(
 )
 
 cc_test(
+    name = "cni_netns_resolver_test",
+    srcs = ["cni_netns_resolver_test.cpp"],
+    deps = [
+        "@googletest//:gtest_main",
+        "//src/cni:cni_parser",
+        "//src/cni:cni_splice",
+    ],
+)
+
+cc_test(
     name = "cni_args_test",
     srcs = ["cni_args_test.cpp"],
     deps = [

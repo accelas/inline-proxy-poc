@@ -384,6 +384,39 @@ bool NetnsFixture::RunCommand(const std::string& command) const {
     return std::system(command.c_str()) == 0;
 }
 
+bool NetnsFixture::BuildBridgeBackedWorkloadTopology(const std::string& workload_ip_cidr,
+                                                     const std::string& client_ip_cidr,
+                                                     const std::string& gateway_ip) {
+    const auto bridge = UniqueRootIfName(prefix_ + "-br");
+    const auto workload_host = UniqueRootIfName(prefix_ + "-wk");
+    const auto client_host = UniqueRootIfName(prefix_ + "-cl");
+    root_links_.push_back(bridge);
+    root_links_.push_back(workload_host);
+    root_links_.push_back(client_host);
+
+    return RunCommand("/usr/bin/ip link add name " + bridge + " type bridge") &&
+           RunCommand("/usr/bin/ip addr add " + gateway_ip + "/24 dev " + bridge) &&
+           RunCommand("/usr/bin/ip link set " + bridge + " up") &&
+           RunCommand("/usr/bin/ip link add " + workload_host + " type veth peer name eth0") &&
+           RunCommand("/usr/bin/ip link set eth0 netns " + Quote(workload_ns_)) &&
+           RunCommand("/usr/bin/ip link set " + workload_host + " master " + bridge) &&
+           RunCommand("/usr/bin/ip link set " + workload_host + " up") &&
+           RunCommand("/usr/bin/ip link add " + client_host + " type veth peer name ceth0") &&
+           RunCommand("/usr/bin/ip link set ceth0 netns " + Quote(client_ns_)) &&
+           RunCommand("/usr/bin/ip link set " + client_host + " master " + bridge) &&
+           RunCommand("/usr/bin/ip link set " + client_host + " up") &&
+           RunCommand("/usr/bin/ip -n " + Quote(workload_ns_) + " addr add " + workload_ip_cidr +
+                      " dev eth0") &&
+           RunCommand("/usr/bin/ip -n " + Quote(workload_ns_) + " link set eth0 up") &&
+           RunCommand("/usr/bin/ip -n " + Quote(workload_ns_) + " route add default via " +
+                      gateway_ip + " dev eth0") &&
+           RunCommand("/usr/bin/ip -n " + Quote(client_ns_) + " addr add " + client_ip_cidr +
+                      " dev ceth0") &&
+           RunCommand("/usr/bin/ip -n " + Quote(client_ns_) + " link set ceth0 up") &&
+           RunCommand("/usr/bin/ip -n " + Quote(client_ns_) + " route add default via " +
+                      gateway_ip + " dev ceth0");
+}
+
 bool NetnsFixture::RunTransparentRelayScenario() {
     if (!RunCommand("/usr/bin/ip link add cproxy0 type veth peer name ceth0") ||
         !RunCommand("/usr/bin/ip link set cproxy0 netns " + Quote(proxy_ns_)) ||
@@ -483,17 +516,21 @@ bool NetnsFixture::RunTransparentRelayScenario() {
 }
 
 bool NetnsFixture::RunSpliceExecutorScenario() {
-    const auto host_ifname = UniqueRootIfName(prefix_);
-    root_links_.push_back(host_ifname);
-    if (!RunCommand("/usr/bin/ip link add " + host_ifname + " type veth peer name eth0") ||
-        !RunCommand("/usr/bin/ip link set eth0 netns " + Quote(workload_ns_)) ||
-        !RunCommand("/usr/bin/ip -n " + Quote(workload_ns_) + " link set eth0 up") ||
-        !RunCommand("/usr/bin/ip link set " + host_ifname + " up")) {
+    constexpr std::uint16_t kPort = 19090;
+    const std::string payload = "splice-ok";
+    const std::string workload_ip = "10.42.0.65/24";
+    const std::string workload_host_ip = "10.42.0.65";
+    const std::string gateway_ip = "10.42.0.1";
+
+    if (!BuildBridgeBackedWorkloadTopology(workload_ip, "10.42.0.12/24", gateway_ip)) {
         return false;
     }
 
-    auto request = ParseCniRequest(
-        R"({"cniVersion":"1.0.0","name":"k8s-pod-network","prevResult":{"interfaces":[{"name":"eth0","sandbox":"/var/run/netns/test"}]}})");
+    const std::string request_json =
+        R"({"cniVersion":"1.0.0","name":"k8s-pod-network","prevResult":{"interfaces":[{"name":"cni0"},{"name":"veth-root"},{"name":"eth0","sandbox":")" +
+        NamespacePath(workload_ns_) +
+        R"("}],"ips":[{"address":"10.42.0.65/24","gateway":"10.42.0.1","interface":2}],"routes":[{"dst":"10.42.0.0/16"},{"dst":"0.0.0.0/0","gw":"10.42.0.1"}]}})";
+    auto request = ParseCniRequest(request_json);
     if (!request.has_value()) {
         return false;
     }
@@ -531,26 +568,29 @@ bool NetnsFixture::RunSpliceExecutorScenario() {
 
     if (!LinkExistsInNamespace(NamespacePath(proxy_ns_), result.plan->wan_name) ||
         !LinkExistsInNamespace(NamespacePath(proxy_ns_), result.plan->lan_name) ||
-        !LinkExistsInNamespace(NamespacePath(workload_ns_), "eth0")) {
+        !LinkExistsInNamespace(NamespacePath(workload_ns_), "eth0") ||
+        LinkExistsInNamespace(NamespacePath(proxy_ns_), "br_" + result.plan->wan_name.substr(4))) {
         return false;
     }
 
-    if (!RunCommand("/usr/bin/ip -n " + Quote(proxy_ns_) + " addr add 169.254.100.1/30 dev " +
-                    result.plan->lan_name) ||
-        !RunCommand("/usr/bin/ip -n " + Quote(workload_ns_) + " addr add 169.254.100.2/30 dev eth0") ||
-        !RunCommand("/usr/bin/ip -n " + Quote(proxy_ns_) + " link set " + result.plan->lan_name + " up") ||
-        !RunCommand("/usr/bin/ip -n " + Quote(workload_ns_) + " link set eth0 up")) {
-        return false;
-    }
+    std::promise<std::optional<std::string>> server_peer_promise;
+    auto server_peer_future = server_peer_promise.get_future();
+    std::thread server([&] {
+        server_peer_promise.set_value(
+            RunEchoServer(NamespacePath(workload_ns_), workload_host_ip, kPort, payload));
+    });
 
-    const bool round_trip =
-        StartListenerAndRoundTrip(NamespacePath(proxy_ns_),
-                                  NamespacePath(workload_ns_),
-                                  "169.254.100.1",
-                                  19090,
-                                  "splice-ok");
+    std::string reply;
+    const bool client_ok =
+        ConnectAndRoundTrip(NamespacePath(client_ns_), workload_host_ip, kPort, payload, &reply);
+    server.join();
+    bool server_ok = false;
+    if (server_peer_future.wait_for(kIoTimeout) == std::future_status::ready) {
+        const auto server_peer = server_peer_future.get();
+        server_ok = server_peer.has_value() && *server_peer == "10.42.0.12";
+    }
     const auto del_result = executor.HandleDel(invocation);
-    return round_trip && del_result.success;
+    return client_ok && server_ok && reply == payload && del_result.success;
 }
 
 }  // namespace inline_proxy

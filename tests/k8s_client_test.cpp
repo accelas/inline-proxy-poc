@@ -687,7 +687,7 @@ TEST(K8sClientTest, ParsesPodLookupResponse) {
             "annotations":{"inline-proxy.example.com/enabled":"true"}
         },
         "spec":{"nodeName":"worker-1"},
-        "status":{"phase":"Running"}
+        "status":{"phase":"Running","podIP":"10.42.0.9"}
     })";
 
     auto pod = inline_proxy::ParsePodInfo(json);
@@ -695,6 +695,7 @@ TEST(K8sClientTest, ParsesPodLookupResponse) {
     EXPECT_EQ(pod->name, "proxy-1");
     EXPECT_EQ(pod->namespace_name, "inline-proxy-system");
     EXPECT_EQ(pod->node_name, "worker-1");
+    EXPECT_EQ(pod->pod_ip, "10.42.0.9");
     EXPECT_TRUE(pod->running);
     EXPECT_EQ(pod->labels.at("app"), "inline-proxy");
     EXPECT_EQ(pod->annotations.at("inline-proxy.example.com/enabled"), "true");

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <filesystem>
+#include <functional>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -18,8 +19,13 @@ struct CniInvocation {
 
 struct CniExecutionOptions {
     std::filesystem::path state_root = "/var/run/inline-proxy-cni";
+    std::filesystem::path proxy_netns_root = "/var/run/netns";
     std::optional<std::filesystem::path> workload_netns_path;
     std::optional<std::filesystem::path> proxy_netns_path;
+    std::function<bool(const SplicePlan&,
+                       const std::filesystem::path&,
+                       const std::filesystem::path&)>
+        splice_runner;
 };
 
 struct CniExecutionResult {
@@ -27,6 +33,11 @@ struct CniExecutionResult {
     std::string stdout_json;
     std::string stderr_text;
     std::optional<SplicePlan> plan;
+};
+
+struct ResolvedNetnsPaths {
+    std::filesystem::path workload;
+    std::filesystem::path proxy;
 };
 
 class SpliceExecutor {
@@ -42,8 +53,13 @@ public:
     CniExecutionResult HandleDel(const CniInvocation& invocation) const;
 
 private:
-    bool ExecuteSplice(const SplicePlan& plan) const;
-    void RollbackSplice(const SplicePlan& plan) const;
+    std::optional<ResolvedNetnsPaths> ResolveNetnsPaths(
+        const CniInvocation& invocation,
+        const PodInfo& proxy_pod) const;
+    bool ExecuteSplice(const SplicePlan& plan,
+                       const ResolvedNetnsPaths& netns_paths,
+                       const CniInvocation& invocation) const;
+    void RollbackSplice(const SplicePlan& plan, const ResolvedNetnsPaths& netns_paths) const;
 
     CniExecutionOptions options_;
 };

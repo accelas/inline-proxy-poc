@@ -41,10 +41,12 @@ cc_library(
 cc_library(
     name = "cni_splice",
     srcs = [
+        "netns_resolver.cpp",
         "splice_executor.cpp",
         "splice_plan.cpp",
     ],
     hdrs = [
+        "netns_resolver.hpp",
         "splice_executor.hpp",
         "splice_plan.hpp",
     ],
