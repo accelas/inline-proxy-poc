@@ -31,3 +31,11 @@ TEST(DeployManifestTest, UsesProductizableInlineProxyNames) {
     EXPECT_NE(installer.find("inline-proxy-installer"), std::string::npos);
     EXPECT_NE(caddy.find("inline-proxy.example.com/enabled"), std::string::npos);
 }
+
+TEST(DeployManifestTest, TargetsK3sCniBinaryDirectory) {
+    const auto installer = ReadText("deploy/base/proxy-installer-daemonset.yaml");
+    const auto script = ReadText("deploy/scripts/install-cni.sh");
+
+    EXPECT_NE(installer.find("/var/lib/rancher/k3s/data/cni"), std::string::npos);
+    EXPECT_NE(script.find("/host/var/lib/rancher/k3s/data/cni"), std::string::npos);
+}

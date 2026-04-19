@@ -28,7 +28,7 @@ choose_conf_dir() {
   return 1
 }
 
-HOST_BIN_DIR=$(choose_bin_dir /host/var/lib/rancher/k3s/data/current/bin /host/opt/cni/bin)
+HOST_BIN_DIR=$(choose_bin_dir /host/var/lib/rancher/k3s/data/cni /host/var/lib/rancher/k3s/data/current/bin /host/opt/cni/bin)
 HOST_CONF_DIR=$(choose_conf_dir /host/var/lib/rancher/k3s/agent/etc/cni/net.d /host/etc/cni/net.d)
 
 if [ ! -f "$INLINE_PROXY_CNI_BINARY_SOURCE" ]; then

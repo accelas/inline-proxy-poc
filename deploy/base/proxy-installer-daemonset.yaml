@@ -55,6 +55,8 @@ spec:
               mountPath: /host/opt/cni/bin
             - name: host-k3s-bin
               mountPath: /host/var/lib/rancher/k3s/data/current/bin
+            - name: host-k3s-cni-bin
+              mountPath: /host/var/lib/rancher/k3s/data/cni
             - name: host-cni-conf
               mountPath: /host/etc/cni/net.d
             - name: host-k3s-conf
@@ -67,6 +69,10 @@ spec:
         - name: host-k3s-bin
           hostPath:
             path: /var/lib/rancher/k3s/data/current/bin
+            type: DirectoryOrCreate
+        - name: host-k3s-cni-bin
+          hostPath:
+            path: /var/lib/rancher/k3s/data/cni
             type: DirectoryOrCreate
         - name: host-cni-conf
           hostPath:
