@@ -137,3 +137,23 @@ cc_test(
         "//src/cni:k8s_client",
     ],
 )
+
+cc_test(
+    name = "splice_plan_test",
+    srcs = ["splice_plan_test.cpp"],
+    deps = [
+        "@googletest//:gtest_main",
+        "//src/cni:cni_splice",
+    ],
+)
+
+cc_test(
+    name = "cni_add_del_test",
+    srcs = ["cni_add_del_test.cpp"],
+    deps = [
+        "@googletest//:gtest_main",
+        "//src/cni:cni_splice",
+        "//src/cni:cni_parser",
+        "//src/shared:shared",
+    ],
+)

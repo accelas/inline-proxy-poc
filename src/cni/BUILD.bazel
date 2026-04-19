@@ -31,11 +31,30 @@ cc_library(
     include_prefix = "cni",
 )
 
+cc_library(
+    name = "cni_splice",
+    srcs = [
+        "splice_executor.cpp",
+        "splice_plan.cpp",
+    ],
+    hdrs = [
+        "splice_executor.hpp",
+        "splice_plan.hpp",
+    ],
+    deps = [
+        ":cni_parser",
+        ":cni_types",
+        ":k8s_client",
+        "//src/shared:shared",
+    ],
+    include_prefix = "cni",
+)
+
 cc_binary(
     name = "inline_proxy_cni",
     srcs = ["main.cpp"],
     deps = [
-        "//src/shared:core",
+        ":cni_splice",
         ":cni_parser",
         ":k8s_client",
     ],

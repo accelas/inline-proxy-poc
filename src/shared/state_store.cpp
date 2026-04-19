@@ -201,7 +201,7 @@ const std::filesystem::path& StateStore::path() const noexcept {
 }
 
 bool StateStore::Write(const StateFields& fields) const {
-    if (path_.empty()) {
+    if (path_.empty() || path_.filename().empty()) {
         return false;
     }
 
