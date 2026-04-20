@@ -6,8 +6,11 @@
 #include <cerrno>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
+#include <ifaddrs.h>
 #include <iostream>
 #include <mutex>
+#include <sstream>
 #include <unordered_map>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -109,6 +112,18 @@ public:
         std::lock_guard<std::mutex> lock(mu_);
         auto& entry = refs_[key];
         if (entry.refs == 0) {
+            // Do not add a /32 copy of the client IP if it is already
+            // locally assigned in this netns, or if it is a next-hop
+            // gateway referenced in any route (meaning the IP lives in
+            // another netns — for example the cni0 bridge IP in k3s —
+            // and adding a /32 here would break ARP resolution for every
+            // pod in the netns).
+            if (IsLocallyAssigned(ipv4.sin_addr) ||
+                IsGatewayAddress(ipv4.sin_addr)) {
+                entry.interfaces.clear();
+                ++entry.refs;
+                return true;
+            }
             entry.interfaces = CandidateInterfaces();
             if (entry.interfaces.empty()) {
                 entry.interfaces = {"lo"};
@@ -151,6 +166,8 @@ public:
             return;
         }
 
+        // interfaces is empty iff Acquire short-circuited because the IP was
+        // already locally assigned; nothing to remove in that case.
         for (const auto& ifname : it->second.interfaces) {
             (void)RemoveLocalAddress(ifname, ipv4.sin_addr, 32);
         }
@@ -162,6 +179,71 @@ private:
         std::size_t refs = 0;
         std::vector<std::string> interfaces;
     };
+
+    // True if the given IP is assigned locally to any interface in this
+    // netns. Same-netns lookup via getifaddrs.
+    static bool IsLocallyAssigned(const in_addr& address) {
+        ifaddrs* interfaces = nullptr;
+        if (::getifaddrs(&interfaces) != 0) {
+            return false;
+        }
+        bool found = false;
+        for (ifaddrs* c = interfaces; c != nullptr; c = c->ifa_next) {
+            if (c->ifa_addr == nullptr || c->ifa_addr->sa_family != AF_INET) {
+                continue;
+            }
+            const auto& v4 = reinterpret_cast<const sockaddr_in&>(*c->ifa_addr);
+            if (v4.sin_addr.s_addr == address.s_addr) {
+                found = true;
+                break;
+            }
+        }
+        ::freeifaddrs(interfaces);
+        return found;
+    }
+
+    // True if the given IP is a next-hop gateway referenced in any IPv4
+    // route in this netns. Reads /proc/net/route, which is netns-local.
+    // Used to avoid AddLocalAddress for IPs that are actually OFF-netns
+    // (e.g. the cni0 bridge gateway IP 10.42.0.1 in k3s) — assigning a /32
+    // of such an IP to wan_ causes the kernel to suppress ARP replies for
+    // every address whose subnet overlaps the conflicting /32, breaking
+    // host↔pod connectivity throughout the netns.
+    static bool IsGatewayAddress(const in_addr& address) {
+        // Use /proc/self/net/route to read the CURRENT THREAD'S netns
+        // view (not the host's). /proc/net/route is an alias for
+        // /proc/self/net/route in most kernels but we prefer to be
+        // explicit.
+        std::ifstream route("/proc/self/net/route");
+        if (!route) return false;
+        std::string line;
+        std::getline(route, line);  // header
+        while (std::getline(route, line)) {
+            // Fields: Iface Destination Gateway Flags RefCnt Use Metric ...
+            std::istringstream is(line);
+            std::string iface, dst_hex, gw_hex;
+            if (!(is >> iface >> dst_hex >> gw_hex)) continue;
+            if (gw_hex.size() != 8) continue;
+            // Gateway field is stored as 8-hex little-endian (host byte
+            // order). Parse it to a uint32 and compare to in_addr.s_addr
+            // (which is already in network byte order — but reading
+            // /proc/net/route gives LE → reverse). Simpler: reverse the
+            // hex string to LE→BE then compare.
+            std::uint32_t gw_le = 0;
+            try {
+                gw_le = static_cast<std::uint32_t>(std::stoul(gw_hex, nullptr, 16));
+            } catch (...) {
+                continue;
+            }
+            // /proc/net/route stores the gateway as the kernel's in_addr
+            // (network byte order), printed byte-reversed as hex. For
+            // example 0x0100002A is 10.0.0.42 in network order.
+            if (gw_le == address.s_addr) {
+                return true;
+            }
+        }
+        return false;
+    }
 
     static std::vector<std::string> CandidateInterfaces() {
         std::vector<std::string> interfaces;
