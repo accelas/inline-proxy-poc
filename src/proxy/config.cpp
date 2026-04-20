@@ -132,8 +132,19 @@ bool EnsureTransparentRoutingRule() {
     const std::string table = std::to_string(kTransparentRoutingTable);
     const bool route_ok =
         RunIp({"route", "replace", "local", "0.0.0.0/0", "dev", "lo", "table", table});
-    const bool rule_ok = RunIp({"rule", "add", "fwmark", mark, "lookup", table}) ||
-                         RunIp({"rule", "replace", "fwmark", mark, "lookup", table});
+    // Drain any existing copies of the rule before adding a fresh one.
+    // `ip rule add` is not idempotent — repeated calls create duplicates
+    // at successive priorities, which accumulate on every proxy restart
+    // and flood `ip rule` output. Deleting in a loop removes all existing
+    // copies (the kernel returns ENOENT once drained, which fails the
+    // delete silently and terminates the loop).
+    constexpr int kMaxDeleteIters = 256;
+    for (int i = 0; i < kMaxDeleteIters; ++i) {
+        if (!RunIp({"rule", "del", "fwmark", mark, "lookup", table})) {
+            break;
+        }
+    }
+    const bool rule_ok = RunIp({"rule", "add", "fwmark", mark, "lookup", table});
     return route_ok && rule_ok;
 }
 
