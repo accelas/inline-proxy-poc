@@ -101,6 +101,23 @@
   },
   "selectedYankedVersions": {},
   "moduleExtensions": {
+    "//bazel/bpf:host_bpftool.bzl%host_bpftool": {
+      "general": {
+        "bzlTransitiveDigest": "uwMGZHUVoTeVMGAWJnqBtnvV81EAVkAsBV2oiKbqoxQ=",
+        "usagesDigest": "r9DDGsh0cN5MDicOrQA0fyqxRV1wFMOMXHm4Z4OQs+4=",
+        "recordedFileInputs": {},
+        "recordedDirentsInputs": {},
+        "envVariables": {},
+        "generatedRepoSpecs": {
+          "host_bpftool": {
+            "bzlFile": "@@//bazel/bpf:host_bpftool.bzl",
+            "ruleClassName": "host_bpftool_repo",
+            "attributes": {}
+          }
+        },
+        "recordedRepoMappingEntries": []
+      }
+    },
     "@@apple_support~//crosstool:setup.bzl%apple_cc_configure_extension": {
       "general": {
         "bzlTransitiveDigest": "ltCGFbl/LQQZXn/LEMXfKX7pGwyqNiOCHcmiQW0tmjM=",
