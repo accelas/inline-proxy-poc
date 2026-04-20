@@ -2,9 +2,9 @@
 
 #include "bpf/ingress_redirect_skel.skel.h"
 #include "shared/netlink.hpp"
+#include "shared/netlink_builder.hpp"
 #include "shared/scoped_fd.hpp"
 
-#include <array>
 #include <cerrno>
 #include <cstddef>
 #include <cstdint>
@@ -34,31 +34,16 @@ namespace inline_proxy {
 namespace {
 
 // ---------------------------------------------------------------------------
-// Netlink TC attach/detach helpers (copied verbatim from the pre-skeleton
-// loader; unchanged by this rewrite).
+// Netlink TC attach/detach helpers. Low-level primitives (attribute
+// serialisation, the RAII socket wrapper) come from shared/netlink_builder;
+// only the tc-specific message builder and the tc-specific request flow
+// live here.
 // ---------------------------------------------------------------------------
 
-bool AppendAttr(std::vector<char>& buffer, std::uint16_t type, const void* data, std::size_t size, bool nested = false) {
-    constexpr std::size_t kAlignTo = 4;
-    const auto align = [](std::size_t value) { return (value + kAlignTo - 1) & ~(kAlignTo - 1); };
+using netlink::AppendAttr;
+using netlink::AppendStringAttr;
 
-    const auto old_size = buffer.size();
-    const auto total_size = NLA_HDRLEN + size;
-    buffer.resize(old_size + align(total_size));
-
-    auto* attr = reinterpret_cast<nlattr*>(buffer.data() + old_size);
-    attr->nla_type = nested ? static_cast<std::uint16_t>(type | NLA_F_NESTED) : type;
-    attr->nla_len = static_cast<std::uint16_t>(total_size);
-    std::memcpy(reinterpret_cast<char*>(attr) + NLA_HDRLEN, data, size);
-    std::memset(reinterpret_cast<char*>(attr) + total_size, 0, align(total_size) - total_size);
-    return true;
-}
-
-bool AppendStringAttr(std::vector<char>& buffer, std::uint16_t type, const std::string& value, bool nested = false) {
-    return AppendAttr(buffer, type, value.c_str(), value.size() + 1, nested);
-}
-
-std::vector<char> MakeNetlinkMessage(std::uint16_t type, std::uint16_t flags, unsigned int ifindex = 0) {
+std::vector<char> MakeTcRequest(std::uint16_t type, std::uint16_t flags, unsigned int ifindex = 0) {
     std::vector<char> message(NLMSG_LENGTH(sizeof(tcmsg)));
     auto* header = reinterpret_cast<nlmsghdr*>(message.data());
     header->nlmsg_len = static_cast<std::uint32_t>(message.size());
@@ -66,7 +51,7 @@ std::vector<char> MakeNetlinkMessage(std::uint16_t type, std::uint16_t flags, un
     header->nlmsg_flags = static_cast<std::uint16_t>(flags | NLM_F_REQUEST | NLM_F_ACK);
     header->nlmsg_seq = 1;
 
-    auto* tc = reinterpret_cast<tcmsg*>(NLMSG_DATA(header));
+    auto* tc = reinterpret_cast<tcmsg*>(NLMSG_DATA(message.data()));
     std::memset(tc, 0, sizeof(*tc));
     tc->tcm_family = AF_UNSPEC;
     tc->tcm_ifindex = static_cast<int>(ifindex);
@@ -75,57 +60,8 @@ std::vector<char> MakeNetlinkMessage(std::uint16_t type, std::uint16_t flags, un
     return message;
 }
 
-class NetlinkSocket {
-public:
-    static std::optional<NetlinkSocket> Open() {
-        ScopedFd fd(::socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_ROUTE));
-        if (!fd) {
-            return std::nullopt;
-        }
-        sockaddr_nl local{};
-        local.nl_family = AF_NETLINK;
-        local.nl_pid = static_cast<unsigned int>(::getpid());
-        if (::bind(fd.get(), reinterpret_cast<sockaddr*>(&local), sizeof(local)) != 0) {
-            return std::nullopt;
-        }
-        return NetlinkSocket(std::move(fd));
-    }
-
-    bool Send(const std::vector<char>& request) const {
-        sockaddr_nl kernel{};
-        kernel.nl_family = AF_NETLINK;
-        return ::sendto(fd_.get(), request.data(), request.size(), 0,
-                        reinterpret_cast<const sockaddr*>(&kernel), sizeof(kernel)) >= 0;
-    }
-
-    bool ReceiveAck() const {
-        std::array<char, 8192> buffer{};
-        while (true) {
-            const auto length = ::recv(fd_.get(), buffer.data(), buffer.size(), 0);
-            if (length < 0) {
-                if (errno == EINTR) continue;
-                return false;
-            }
-            auto remaining = static_cast<unsigned int>(length);
-            for (nlmsghdr* header = reinterpret_cast<nlmsghdr*>(buffer.data());
-                 NLMSG_OK(header, remaining);
-                 header = NLMSG_NEXT(header, remaining)) {
-                if (header->nlmsg_type == NLMSG_ERROR) {
-                    const auto* error = reinterpret_cast<nlmsgerr*>(NLMSG_DATA(header));
-                    return error->error == 0;
-                }
-                if (header->nlmsg_type == NLMSG_DONE) return true;
-            }
-        }
-    }
-
-private:
-    explicit NetlinkSocket(ScopedFd fd) : fd_(std::move(fd)) {}
-    ScopedFd fd_;
-};
-
 bool SendNetlinkRequest(std::vector<char> request) {
-    auto socket = NetlinkSocket::Open();
+    auto socket = netlink::Socket::Open();
     if (!socket) return false;
     if (!socket->Send(request)) return false;
     return socket->ReceiveAck();
@@ -137,7 +73,7 @@ void FinalizeNetlinkMessage(std::vector<char>& request) {
 }
 
 bool EnsureClsactQdisc(unsigned int ifindex) {
-    auto request = MakeNetlinkMessage(RTM_NEWQDISC, NLM_F_CREATE | NLM_F_REPLACE, ifindex);
+    auto request = MakeTcRequest(RTM_NEWQDISC, NLM_F_CREATE | NLM_F_REPLACE, ifindex);
     auto* tc = reinterpret_cast<tcmsg*>(NLMSG_DATA(reinterpret_cast<nlmsghdr*>(request.data())));
     tc->tcm_parent = TC_H_CLSACT;
     tc->tcm_handle = 0;
@@ -147,7 +83,7 @@ bool EnsureClsactQdisc(unsigned int ifindex) {
 }
 
 bool RemoveIngressFilter(unsigned int ifindex) {
-    auto request = MakeNetlinkMessage(RTM_DELTFILTER, 0, ifindex);
+    auto request = MakeTcRequest(RTM_DELTFILTER, 0, ifindex);
     auto* tc = reinterpret_cast<tcmsg*>(NLMSG_DATA(reinterpret_cast<nlmsghdr*>(request.data())));
     tc->tcm_parent = TC_H_MAKE(TC_H_CLSACT, TC_H_MIN_INGRESS);
     tc->tcm_handle = 0;
@@ -158,7 +94,7 @@ bool RemoveIngressFilter(unsigned int ifindex) {
 }
 
 bool AttachIngressFilter(unsigned int ifindex, int program_fd) {
-    auto request = MakeNetlinkMessage(RTM_NEWTFILTER, NLM_F_CREATE | NLM_F_REPLACE, ifindex);
+    auto request = MakeTcRequest(RTM_NEWTFILTER, NLM_F_CREATE | NLM_F_REPLACE, ifindex);
     auto* tc = reinterpret_cast<tcmsg*>(NLMSG_DATA(reinterpret_cast<nlmsghdr*>(request.data())));
     tc->tcm_parent = TC_H_MAKE(TC_H_CLSACT, TC_H_MIN_INGRESS);
     tc->tcm_handle = 0;

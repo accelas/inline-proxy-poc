@@ -1,8 +1,8 @@
 #include "shared/netlink.hpp"
 
+#include "shared/netlink_builder.hpp"
 #include "shared/scoped_fd.hpp"
 
-#include <array>
 #include <cerrno>
 #include <cstdint>
 #include <cstring>
@@ -24,87 +24,8 @@
 namespace inline_proxy {
 namespace {
 
-constexpr std::size_t kAlignTo = 4;
-
-std::size_t Align(std::size_t size) {
-    return (size + kAlignTo - 1) & ~(kAlignTo - 1);
-}
-
-bool AppendAttr(std::vector<char>& buffer, std::uint16_t type, const void* data, std::size_t size,
-                bool nested = false) {
-    const auto old_size = buffer.size();
-    const auto total_size = NLA_HDRLEN + size;
-    buffer.resize(old_size + Align(total_size));
-
-    auto* attr = reinterpret_cast<nlattr*>(buffer.data() + old_size);
-    attr->nla_type = nested ? static_cast<std::uint16_t>(type | NLA_F_NESTED) : type;
-    attr->nla_len = static_cast<std::uint16_t>(total_size);
-    std::memcpy(reinterpret_cast<char*>(attr) + NLA_HDRLEN, data, size);
-    std::memset(reinterpret_cast<char*>(attr) + total_size, 0, Align(total_size) - total_size);
-    return true;
-}
-
-bool AppendStringAttr(std::vector<char>& buffer, std::uint16_t type, const std::string& value,
-                      bool nested = false) {
-    return AppendAttr(buffer, type, value.c_str(), value.size() + 1, nested);
-}
-
-class NetlinkSocket {
-public:
-    static std::optional<NetlinkSocket> Open() {
-        ScopedFd fd(::socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_ROUTE));
-        if (!fd) {
-            return std::nullopt;
-        }
-
-        sockaddr_nl local{};
-        local.nl_family = AF_NETLINK;
-        local.nl_pid = static_cast<unsigned int>(::getpid());
-        if (::bind(fd.get(), reinterpret_cast<sockaddr*>(&local), sizeof(local)) != 0) {
-            return std::nullopt;
-        }
-
-        return NetlinkSocket(std::move(fd));
-    }
-
-    bool Send(const std::vector<char>& request) const {
-        sockaddr_nl kernel{};
-        kernel.nl_family = AF_NETLINK;
-        return ::sendto(fd_.get(), request.data(), request.size(), 0,
-                        reinterpret_cast<const sockaddr*>(&kernel), sizeof(kernel)) >= 0;
-    }
-
-    bool ReceiveAck() const {
-        std::array<char, 8192> buffer{};
-        while (true) {
-            const auto length = ::recv(fd_.get(), buffer.data(), buffer.size(), 0);
-            if (length < 0) {
-                if (errno == EINTR) {
-                    continue;
-                }
-                return false;
-            }
-
-            auto remaining = static_cast<unsigned int>(length);
-            for (nlmsghdr* header = reinterpret_cast<nlmsghdr*>(buffer.data());
-                 NLMSG_OK(header, remaining);
-                 header = NLMSG_NEXT(header, remaining)) {
-                if (header->nlmsg_type == NLMSG_ERROR) {
-                    const auto* error = reinterpret_cast<nlmsgerr*>(NLMSG_DATA(header));
-                    return error->error == 0;
-                }
-                if (header->nlmsg_type == NLMSG_DONE) {
-                    return true;
-                }
-            }
-        }
-    }
-
-private:
-    explicit NetlinkSocket(ScopedFd fd) : fd_(std::move(fd)) {}
-
-    ScopedFd fd_;
-};
+using netlink::AppendAttr;
+using netlink::AppendStringAttr;
 
 std::vector<char> MakeLinkRequest(std::uint16_t type, std::uint16_t flags, unsigned int index = 0) {
     std::vector<char> request(NLMSG_LENGTH(sizeof(ifinfomsg)));
@@ -126,7 +47,7 @@ bool SendLinkRequest(std::vector<char> request) {
     auto* header = reinterpret_cast<nlmsghdr*>(request.data());
     header->nlmsg_len = static_cast<std::uint32_t>(request.size());
 
-    auto socket = NetlinkSocket::Open();
+    auto socket = netlink::Socket::Open();
     if (!socket) {
         return false;
     }
@@ -164,7 +85,7 @@ bool SendAddressRequest(std::vector<char> request) {
     auto* header = reinterpret_cast<nlmsghdr*>(request.data());
     header->nlmsg_len = static_cast<std::uint32_t>(request.size());
 
-    auto socket = NetlinkSocket::Open();
+    auto socket = netlink::Socket::Open();
     if (!socket) {
         return false;
     }
