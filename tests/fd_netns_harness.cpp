@@ -338,6 +338,7 @@ bool FdNetnsHarness::RunInterceptEchoScenario() {
         }
 
         EventLoop loop;
+        std::vector<std::shared_ptr<RelaySession>> sessions;
         proxy_ready.set_value(true);
         auto handle = loop.Register(
             listener.fd(),
@@ -358,7 +359,9 @@ bool FdNetnsHarness::RunInterceptEchoScenario() {
                 auto session = CreateRelaySession(loop, std::move(accepted), endpoints, [&] { loop.Stop(); });
                 if (!session) {
                     loop.Stop();
+                    return;
                 }
+                sessions.push_back(std::move(session));
             },
             {},
             [&](int) { loop.Stop(); });
