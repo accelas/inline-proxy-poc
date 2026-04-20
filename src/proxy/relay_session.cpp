@@ -5,11 +5,11 @@
 #include <cstring>
 #include <cerrno>
 #include <cstdlib>
-#include <filesystem>
 #include <fstream>
 #include <ifaddrs.h>
 #include <iostream>
 #include <mutex>
+#include <set>
 #include <sstream>
 #include <unordered_map>
 #include <sys/socket.h>
@@ -245,14 +245,30 @@ private:
         return false;
     }
 
+    // Enumerate `wan_*` interfaces in the CURRENT netns. Uses getifaddrs
+    // rather than scanning /sys/class/net because sysfs is not remounted
+    // when a process enters a new netns via setns (it still reflects the
+    // initial namespace), so a sysfs scan returns an empty or wrong
+    // result for processes that joined a netns after startup — notably
+    // the test harness, which calls ScopedNetns::Enter before
+    // RecordInterface. getifaddrs invokes a netlink RTM_GETADDR in the
+    // calling thread's netns and therefore sees the correct interface
+    // list regardless of how the thread arrived in that netns.
     static std::vector<std::string> CandidateInterfaces() {
         std::vector<std::string> interfaces;
-        for (const auto& entry : std::filesystem::directory_iterator("/sys/class/net")) {
-            const auto name = entry.path().filename().string();
-            if (name.rfind("wan_", 0) == 0) {
+        ifaddrs* all = nullptr;
+        if (::getifaddrs(&all) != 0) {
+            return interfaces;
+        }
+        std::set<std::string> seen;
+        for (ifaddrs* c = all; c != nullptr; c = c->ifa_next) {
+            if (c->ifa_name == nullptr) continue;
+            const std::string name(c->ifa_name);
+            if (name.rfind("wan_", 0) == 0 && seen.insert(name).second) {
                 interfaces.push_back(name);
             }
         }
+        ::freeifaddrs(all);
         return interfaces;
     }
 
