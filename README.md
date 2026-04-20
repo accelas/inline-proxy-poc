@@ -14,6 +14,15 @@ Productizable names are deliberately isolated around the `inline-proxy-*` prefix
 the annotation key `inline-proxy.example.com/enabled`. Those values are intended to
 be replaced by a future product name without changing the surrounding architecture.
 
+## Architecture
+
+See [`docs/architecture.md`](docs/architecture.md) for the full topology, a
+walk-through of what the chained CNI plugin does during pod setup, the
+runtime flow of an inbound connection, and which traffic paths work
+end-to-end vs. which hit the BPF intercept but intentionally can't
+complete the return path (e.g., host-originated traffic sourced from the
+`cni0` gateway IP).
+
 ## Build
 
 ```bash
