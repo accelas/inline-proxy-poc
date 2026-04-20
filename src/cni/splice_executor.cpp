@@ -16,7 +16,6 @@
 #include "cni/netns_resolver.hpp"
 #include "shared/netlink.hpp"
 #include "shared/netns.hpp"
-#include "shared/run_ip.hpp"
 #include "shared/scoped_fd.hpp"
 #include "shared/state_store.hpp"
 
@@ -45,14 +44,14 @@ std::string PeerNameForPlan(const SplicePlan& plan) {
     return "peer_" + plan.wan_name.substr(4);
 }
 
-struct RouteConfig {
+struct WorkloadRoute {
     std::string dst;
     std::optional<std::string> gw;
 };
 
 struct WorkloadNetworkConfig {
     std::vector<std::string> addresses;
-    std::vector<RouteConfig> routes;
+    std::vector<WorkloadRoute> routes;
     std::vector<std::string> pod_ips;
 };
 
@@ -121,7 +120,7 @@ std::optional<WorkloadNetworkConfig> ParseWorkloadNetworkConfig(
             if (dst_it == entry.end() || !dst_it->is_string()) {
                 continue;
             }
-            RouteConfig route{.dst = dst_it->get<std::string>()};
+            WorkloadRoute route{.dst = dst_it->get<std::string>()};
             if (const auto gw_it = entry.find("gw");
                 gw_it != entry.end() && gw_it->is_string()) {
                 route.gw = gw_it->get<std::string>();
@@ -135,24 +134,6 @@ std::optional<WorkloadNetworkConfig> ParseWorkloadNetworkConfig(
     }
 
     return config;
-}
-
-bool SetLinkMtu(const std::string& ifname, unsigned int mtu) {
-    return RunIp({"link", "set", "dev", ifname, "mtu", std::to_string(mtu)});
-}
-
-bool AddInterfaceAddress(const std::string& ifname, const std::string& cidr) {
-    return RunIp({"addr", "add", cidr, "dev", ifname});
-}
-
-bool FlushInterfaceAddresses(const std::string& ifname) {
-    return RunIp({"addr", "flush", "dev", ifname});
-}
-
-bool AddRouteVia(const std::string& destination,
-                const std::string& via,
-                const std::string& ifname) {
-    return RunIp({"route", "add", destination, "via", via, "dev", ifname});
 }
 
 bool EnableIpv4Forwarding() {
@@ -220,31 +201,51 @@ int RouteTableForPlan(const SplicePlan& plan) {
     return 1000 + static_cast<int>(seed % 30000U);
 }
 
+bool AddRouteVia(const std::string& destination,
+                 const std::string& via,
+                 const std::string& ifname) {
+    ::inline_proxy::RouteConfig cfg;
+    cfg.cidr = destination;
+    cfg.oif = ifname;
+    cfg.via = via;
+    return AddRoute(cfg, /*replace=*/false);
+}
+
 bool AddDirectRouteInTable(const std::string& destination,
                            const std::string& ifname,
                            int table) {
-    return RunIp({"route", "replace", destination, "dev", ifname, "table", std::to_string(table)});
+    ::inline_proxy::RouteConfig cfg;
+    cfg.cidr = destination;
+    cfg.oif = ifname;
+    cfg.table = static_cast<std::uint32_t>(table);
+    return AddRoute(cfg, /*replace=*/true);
 }
 
 bool AddRouteViaInTable(const std::string& destination,
                         const std::string& via,
                         const std::string& ifname,
                         int table) {
-    return RunIp({"route", "replace", destination, "via", via, "dev", ifname, "table",
-                  std::to_string(table)});
-}
-
-bool FlushRouteTable(int table) {
-    return RunIp({"route", "flush", "table", std::to_string(table)});
+    ::inline_proxy::RouteConfig cfg;
+    cfg.cidr = destination;
+    cfg.oif = ifname;
+    cfg.via = via;
+    cfg.table = static_cast<std::uint32_t>(table);
+    return AddRoute(cfg, /*replace=*/true);
 }
 
 bool ReplaceSourceRule(const std::string& source_cidr, int table) {
-    RunIp({"rule", "del", "from", source_cidr, "table", std::to_string(table)});
-    return RunIp({"rule", "add", "from", source_cidr, "table", std::to_string(table)});
+    RuleConfig rule;
+    rule.src_cidr = source_cidr;
+    rule.table = static_cast<std::uint32_t>(table);
+    (void)DeleteRule(rule);
+    return AddRule(rule);
 }
 
 bool DeleteSourceRule(const std::string& source_cidr, int table) {
-    return RunIp({"rule", "del", "from", source_cidr, "table", std::to_string(table)});
+    RuleConfig rule;
+    rule.src_cidr = source_cidr;
+    rule.table = static_cast<std::uint32_t>(table);
+    return DeleteRule(rule);
 }
 
 std::optional<unsigned int> ReadLinkMtu(const std::string& ifname) {
@@ -417,7 +418,7 @@ CniExecutionResult SpliceExecutor::HandleDel(const CniInvocation& invocation) co
                             }
                         }
                     }
-                    FlushRouteTable(table);
+                    FlushRouteTable(static_cast<std::uint32_t>(table));
                 }
                 DeleteLink(lan_it->second);
                 DeleteLink(wan_it->second);

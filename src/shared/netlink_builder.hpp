@@ -42,7 +42,16 @@ public:
     static std::optional<Socket> Open();
 
     bool Send(const std::vector<char>& request) const;
+
+    // Receive a single ACK/error response; returns true iff NLMSG_ERROR
+    // carried error == 0.
     bool ReceiveAck() const;
+
+    // Receive a multi-part dump response terminated by NLMSG_DONE.
+    // Returns each response payload as a separate heap-allocated copy
+    // (NLMSG_DONE itself is not included). On transport failure the
+    // returned optional is empty.
+    std::optional<std::vector<std::vector<char>>> ReceiveDump() const;
 
 private:
     explicit Socket(ScopedFd fd) : fd_(std::move(fd)) {}

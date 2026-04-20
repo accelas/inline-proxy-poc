@@ -31,9 +31,10 @@
 #include "proxy/transparent_socket.hpp"
 #include "shared/event_loop.hpp"
 #include "shared/netlink.hpp"
-#include "shared/run_ip.hpp"
 #include "shared/scoped_fd.hpp"
 #include "shared/sockaddr.hpp"
+
+#include <linux/rtnetlink.h>
 
 extern char** environ;
 
@@ -104,23 +105,30 @@ struct PlainListener {
 };
 
 bool EnsureTransparentRoutingRule() {
-    const std::string mark = std::to_string(kTransparentRoutingMark);
-    const std::string table = std::to_string(kTransparentRoutingTable);
-    const bool route_ok =
-        RunIp({"route", "replace", "local", "0.0.0.0/0", "dev", "lo", "table", table});
-    // Drain any existing copies of the rule before adding a fresh one.
+    // Equivalent of:
+    //   ip route replace local 0.0.0.0/0 dev lo table <kTransparentRoutingTable>
+    RouteConfig route;
+    route.cidr = "default";
+    route.oif = "lo";
+    route.table = kTransparentRoutingTable;
+    route.type = RTN_LOCAL;
+    route.scope = RT_SCOPE_HOST;
+    const bool route_ok = AddRoute(route, /*replace=*/true);
+
     // `ip rule add` is not idempotent — repeated calls create duplicates
-    // at successive priorities, which accumulate on every proxy restart
-    // and flood `ip rule` output. Deleting in a loop removes all existing
-    // copies (the kernel returns ENOENT once drained, which fails the
-    // delete silently and terminates the loop).
+    // at successive priorities. Drain any existing copies of this rule
+    // before adding exactly one. DeleteRule returns false once the kernel
+    // is out of matching rules (ENOENT), which terminates the loop.
+    RuleConfig rule;
+    rule.fwmark = kTransparentRoutingMark;
+    rule.table = kTransparentRoutingTable;
     constexpr int kMaxDeleteIters = 256;
     for (int i = 0; i < kMaxDeleteIters; ++i) {
-        if (!RunIp({"rule", "del", "fwmark", mark, "lookup", table})) {
+        if (!DeleteRule(rule)) {
             break;
         }
     }
-    const bool rule_ok = RunIp({"rule", "add", "fwmark", mark, "lookup", table});
+    const bool rule_ok = AddRule(rule);
     return route_ok && rule_ok;
 }
 

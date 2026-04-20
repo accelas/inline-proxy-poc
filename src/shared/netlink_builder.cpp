@@ -85,5 +85,40 @@ bool Socket::ReceiveAck() const {
     }
 }
 
+std::optional<std::vector<std::vector<char>>> Socket::ReceiveDump() const {
+    std::vector<std::vector<char>> responses;
+    std::array<char, 32 * 1024> buffer{};
+    while (true) {
+        const auto length = ::recv(fd_.get(), buffer.data(), buffer.size(), 0);
+        if (length < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return std::nullopt;
+        }
+
+        auto remaining = static_cast<unsigned int>(length);
+        for (nlmsghdr* header = reinterpret_cast<nlmsghdr*>(buffer.data());
+             NLMSG_OK(header, remaining);
+             header = NLMSG_NEXT(header, remaining)) {
+            if (header->nlmsg_type == NLMSG_ERROR) {
+                const auto* error = reinterpret_cast<nlmsgerr*>(NLMSG_DATA(header));
+                if (error->error != 0) {
+                    return std::nullopt;
+                }
+                // Shouldn't see a clean ACK in a dump, but tolerate it.
+                continue;
+            }
+            if (header->nlmsg_type == NLMSG_DONE) {
+                return responses;
+            }
+            // Copy the full nlmsghdr + payload so callers can parse
+            // attributes after the Socket goes out of scope.
+            const auto* raw = reinterpret_cast<const char*>(header);
+            responses.emplace_back(raw, raw + header->nlmsg_len);
+        }
+    }
+}
+
 }  // namespace netlink
 }  // namespace inline_proxy

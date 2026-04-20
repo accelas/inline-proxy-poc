@@ -3,10 +3,12 @@
 #include "shared/netlink_builder.hpp"
 #include "shared/scoped_fd.hpp"
 
+#include <arpa/inet.h>
 #include <cerrno>
 #include <cstdint>
 #include <cstring>
 #include <ifaddrs.h>
+#include <linux/fib_rules.h>
 #include <linux/if_addr.h>
 #include <linux/if_link.h>
 #include <linux/netlink.h>
@@ -144,6 +146,17 @@ bool SetLinkUp(const std::string& ifname, bool up) {
     return SendLinkRequest(std::move(request));
 }
 
+bool SetLinkMtu(const std::string& ifname, unsigned int mtu) {
+    const auto index = LinkIndex(ifname);
+    if (!index) {
+        return false;
+    }
+    auto request = MakeLinkRequest(RTM_NEWLINK, 0, *index);
+    const std::uint32_t mtu_value = mtu;
+    AppendAttr(request, IFLA_MTU, &mtu_value, sizeof(mtu_value));
+    return SendLinkRequest(std::move(request));
+}
+
 bool RenameLink(const std::string& ifname, const std::string& new_name) {
     const auto index = LinkIndex(ifname);
     if (!index) {
@@ -222,6 +235,373 @@ bool RemoveLocalAddress(const std::string& ifname, const in_addr& address, std::
     AppendAttr(request, IFA_LOCAL, &address, sizeof(address));
     AppendAttr(request, IFA_ADDRESS, &address, sizeof(address));
     return SendAddressRequest(std::move(request));
+}
+
+// ---------------------------------------------------------------------------
+// Route / Rule / Address helpers. Replace RunIp({...}) shell-outs.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+struct ParsedCidr {
+    in_addr address{};
+    std::uint8_t prefix_len = 0;
+};
+
+std::optional<ParsedCidr> ParseCidr(const std::string& cidr) {
+    // Accept "default", "0.0.0.0/0", "10.42.0.0/24", "10.42.0.1" (= /32).
+    ParsedCidr out;
+    if (cidr == "default") {
+        out.address.s_addr = 0;
+        out.prefix_len = 0;
+        return out;
+    }
+    const auto slash = cidr.find('/');
+    const std::string addr_part = cidr.substr(0, slash);
+    if (::inet_pton(AF_INET, addr_part.c_str(), &out.address) != 1) {
+        return std::nullopt;
+    }
+    if (slash == std::string::npos) {
+        out.prefix_len = 32;
+    } else {
+        try {
+            const auto prefix = std::stoul(cidr.substr(slash + 1));
+            if (prefix > 32u) return std::nullopt;
+            out.prefix_len = static_cast<std::uint8_t>(prefix);
+        } catch (...) {
+            return std::nullopt;
+        }
+    }
+    return out;
+}
+
+std::vector<char> MakeRouteRequest(std::uint16_t type,
+                                   std::uint16_t flags,
+                                   const ParsedCidr& dst,
+                                   unsigned int oif_index,
+                                   const std::optional<in_addr>& gw,
+                                   std::uint32_t table,
+                                   std::uint8_t route_type,
+                                   std::uint8_t scope) {
+    std::vector<char> request(NLMSG_LENGTH(sizeof(rtmsg)));
+    auto* header = reinterpret_cast<nlmsghdr*>(request.data());
+    header->nlmsg_len = static_cast<std::uint32_t>(request.size());
+    header->nlmsg_type = type;
+    header->nlmsg_flags = static_cast<std::uint16_t>(flags | NLM_F_REQUEST | NLM_F_ACK);
+    header->nlmsg_seq = 1;
+
+    auto* rt = reinterpret_cast<rtmsg*>(NLMSG_DATA(header));
+    std::memset(rt, 0, sizeof(*rt));
+    rt->rtm_family = AF_INET;
+    rt->rtm_dst_len = dst.prefix_len;
+    rt->rtm_table = (table <= 255u) ? static_cast<std::uint8_t>(table) : RT_TABLE_UNSPEC;
+    rt->rtm_protocol = RTPROT_BOOT;
+    rt->rtm_scope = scope;
+    rt->rtm_type = route_type;
+
+    if (dst.prefix_len > 0) {
+        AppendAttr(request, RTA_DST, &dst.address, sizeof(dst.address));
+    }
+    if (oif_index != 0) {
+        const std::uint32_t oif = oif_index;
+        AppendAttr(request, RTA_OIF, &oif, sizeof(oif));
+    }
+    if (gw.has_value()) {
+        AppendAttr(request, RTA_GATEWAY, &gw->s_addr, sizeof(gw->s_addr));
+    }
+    // Always pass table as a 32-bit attribute so values > 255 work.
+    AppendAttr(request, RTA_TABLE, &table, sizeof(table));
+    return request;
+}
+
+bool SendSimpleRequest(std::vector<char> request) {
+    auto* header = reinterpret_cast<nlmsghdr*>(request.data());
+    header->nlmsg_len = static_cast<std::uint32_t>(request.size());
+    auto socket = netlink::Socket::Open();
+    if (!socket) return false;
+    if (!socket->Send(request)) return false;
+    return socket->ReceiveAck();
+}
+
+std::vector<char> MakeRuleRequest(std::uint16_t type,
+                                  std::uint16_t flags,
+                                  const std::optional<ParsedCidr>& src,
+                                  const std::optional<std::uint32_t>& fwmark,
+                                  std::uint32_t table) {
+    std::vector<char> request(NLMSG_LENGTH(sizeof(rtmsg)));
+    auto* header = reinterpret_cast<nlmsghdr*>(request.data());
+    header->nlmsg_len = static_cast<std::uint32_t>(request.size());
+    header->nlmsg_type = type;
+    header->nlmsg_flags = static_cast<std::uint16_t>(flags | NLM_F_REQUEST | NLM_F_ACK);
+    header->nlmsg_seq = 1;
+
+    auto* rt = reinterpret_cast<rtmsg*>(NLMSG_DATA(header));
+    std::memset(rt, 0, sizeof(*rt));
+    rt->rtm_family = AF_INET;
+    rt->rtm_src_len = src.has_value() ? src->prefix_len : 0;
+    rt->rtm_table = (table <= 255u) ? static_cast<std::uint8_t>(table) : RT_TABLE_UNSPEC;
+    rt->rtm_type = FR_ACT_TO_TBL;
+    rt->rtm_protocol = RTPROT_BOOT;
+    rt->rtm_scope = RT_SCOPE_UNIVERSE;
+
+    if (src.has_value() && src->prefix_len > 0) {
+        AppendAttr(request, FRA_SRC, &src->address, sizeof(src->address));
+    }
+    if (fwmark.has_value()) {
+        const std::uint32_t mark = *fwmark;
+        AppendAttr(request, FRA_FWMARK, &mark, sizeof(mark));
+    }
+    AppendAttr(request, FRA_TABLE, &table, sizeof(table));
+    return request;
+}
+
+std::vector<char> MakeAddressCidrRequest(std::uint16_t type,
+                                         std::uint16_t flags,
+                                         unsigned int index,
+                                         std::uint8_t prefix_len,
+                                         std::uint8_t scope) {
+    std::vector<char> request(NLMSG_LENGTH(sizeof(ifaddrmsg)));
+    auto* header = reinterpret_cast<nlmsghdr*>(request.data());
+    header->nlmsg_len = static_cast<std::uint32_t>(request.size());
+    header->nlmsg_type = type;
+    header->nlmsg_flags = static_cast<std::uint16_t>(flags | NLM_F_REQUEST | NLM_F_ACK);
+    header->nlmsg_seq = 1;
+
+    auto* addr = reinterpret_cast<ifaddrmsg*>(NLMSG_DATA(header));
+    std::memset(addr, 0, sizeof(*addr));
+    addr->ifa_family = AF_INET;
+    addr->ifa_prefixlen = prefix_len;
+    addr->ifa_scope = scope;
+    addr->ifa_index = index;
+    return request;
+}
+
+std::uint8_t ScopeForPrefix(std::uint8_t prefix_len) {
+    // /32 entries are "host-scope" local addresses; anything else is a
+    // normal on-link route and should be RT_SCOPE_UNIVERSE (== 0).
+    return prefix_len == 32u ? RT_SCOPE_HOST : RT_SCOPE_UNIVERSE;
+}
+
+}  // namespace
+
+bool AddRoute(const RouteConfig& cfg, bool replace) {
+    const auto dst = ParseCidr(cfg.cidr);
+    if (!dst) return false;
+    const auto index = LinkIndex(cfg.oif);
+    if (!index) return false;
+    std::optional<in_addr> via;
+    if (cfg.via.has_value()) {
+        in_addr parsed{};
+        if (::inet_pton(AF_INET, cfg.via->c_str(), &parsed) != 1) return false;
+        via = parsed;
+    }
+    const std::uint16_t flags =
+        static_cast<std::uint16_t>(NLM_F_CREATE | (replace ? NLM_F_REPLACE : NLM_F_EXCL));
+    auto request = MakeRouteRequest(RTM_NEWROUTE, flags, *dst, *index, via,
+                                    cfg.table, cfg.type, cfg.scope);
+    return SendSimpleRequest(std::move(request));
+}
+
+bool DeleteRoute(const RouteConfig& cfg) {
+    const auto dst = ParseCidr(cfg.cidr);
+    if (!dst) return false;
+    const auto index = LinkIndex(cfg.oif);
+    if (!index) return false;
+    std::optional<in_addr> via;
+    if (cfg.via.has_value()) {
+        in_addr parsed{};
+        if (::inet_pton(AF_INET, cfg.via->c_str(), &parsed) != 1) return false;
+        via = parsed;
+    }
+    auto request = MakeRouteRequest(RTM_DELROUTE, 0, *dst, *index, via,
+                                    cfg.table, cfg.type, cfg.scope);
+    return SendSimpleRequest(std::move(request));
+}
+
+bool FlushRouteTable(std::uint32_t table) {
+    // Dump routes, filter by table, issue DELETE for each.
+    std::vector<char> dump_request(NLMSG_LENGTH(sizeof(rtmsg)));
+    {
+        auto* header = reinterpret_cast<nlmsghdr*>(dump_request.data());
+        header->nlmsg_len = static_cast<std::uint32_t>(dump_request.size());
+        header->nlmsg_type = RTM_GETROUTE;
+        header->nlmsg_flags = NLM_F_REQUEST | NLM_F_DUMP;
+        header->nlmsg_seq = 1;
+        auto* rt = reinterpret_cast<rtmsg*>(NLMSG_DATA(header));
+        std::memset(rt, 0, sizeof(*rt));
+        rt->rtm_family = AF_INET;
+    }
+
+    auto socket = netlink::Socket::Open();
+    if (!socket) return false;
+    if (!socket->Send(dump_request)) return false;
+    auto dump = socket->ReceiveDump();
+    if (!dump.has_value()) return false;
+
+    bool all_ok = true;
+    for (const auto& msg : *dump) {
+        const auto* header = reinterpret_cast<const nlmsghdr*>(msg.data());
+        if (header->nlmsg_type != RTM_NEWROUTE) continue;
+        const auto* rt = reinterpret_cast<const rtmsg*>(NLMSG_DATA(header));
+        // Walk attributes, extract RTA_TABLE (may be 32-bit) and RTA_OIF / RTA_DST.
+        std::uint32_t msg_table = rt->rtm_table;
+        std::optional<in_addr> dst_addr;
+        std::uint32_t oif = 0;
+        std::optional<in_addr> gw;
+        const auto* attrs = reinterpret_cast<const char*>(rt) + sizeof(*rt);
+        unsigned int attr_len = header->nlmsg_len - NLMSG_LENGTH(sizeof(*rt));
+        for (const rtattr* a = reinterpret_cast<const rtattr*>(attrs);
+             RTA_OK(a, attr_len);
+             a = RTA_NEXT(a, attr_len)) {
+            const auto* payload = reinterpret_cast<const char*>(RTA_DATA(a));
+            switch (a->rta_type) {
+                case RTA_TABLE:
+                    if (RTA_PAYLOAD(a) == sizeof(std::uint32_t)) {
+                        std::memcpy(&msg_table, payload, sizeof(msg_table));
+                    }
+                    break;
+                case RTA_DST:
+                    if (RTA_PAYLOAD(a) == sizeof(in_addr)) {
+                        in_addr addr{};
+                        std::memcpy(&addr, payload, sizeof(addr));
+                        dst_addr = addr;
+                    }
+                    break;
+                case RTA_OIF:
+                    if (RTA_PAYLOAD(a) == sizeof(std::uint32_t)) {
+                        std::memcpy(&oif, payload, sizeof(oif));
+                    }
+                    break;
+                case RTA_GATEWAY:
+                    if (RTA_PAYLOAD(a) == sizeof(in_addr)) {
+                        in_addr addr{};
+                        std::memcpy(&addr, payload, sizeof(addr));
+                        gw = addr;
+                    }
+                    break;
+                default:
+                    break;
+            }
+        }
+        if (msg_table != table) continue;
+
+        // Synthesize a DELETE for the matching route.
+        ParsedCidr cidr{};
+        if (dst_addr.has_value()) {
+            cidr.address = *dst_addr;
+        } else {
+            cidr.address.s_addr = 0;
+        }
+        cidr.prefix_len = rt->rtm_dst_len;
+        auto del = MakeRouteRequest(RTM_DELROUTE, 0, cidr, oif, gw, table,
+                                    rt->rtm_type, rt->rtm_scope);
+        if (!SendSimpleRequest(std::move(del))) all_ok = false;
+    }
+    return all_ok;
+}
+
+bool AddRule(const RuleConfig& cfg) {
+    std::optional<ParsedCidr> src;
+    if (cfg.src_cidr.has_value()) {
+        src = ParseCidr(*cfg.src_cidr);
+        if (!src) return false;
+    }
+    auto request = MakeRuleRequest(RTM_NEWRULE, NLM_F_CREATE | NLM_F_EXCL,
+                                   src, cfg.fwmark, cfg.table);
+    return SendSimpleRequest(std::move(request));
+}
+
+bool DeleteRule(const RuleConfig& cfg) {
+    std::optional<ParsedCidr> src;
+    if (cfg.src_cidr.has_value()) {
+        src = ParseCidr(*cfg.src_cidr);
+        if (!src) return false;
+    }
+    auto request = MakeRuleRequest(RTM_DELRULE, 0, src, cfg.fwmark, cfg.table);
+    return SendSimpleRequest(std::move(request));
+}
+
+bool AddInterfaceAddress(const std::string& ifname, const std::string& cidr) {
+    const auto parsed = ParseCidr(cidr);
+    if (!parsed) return false;
+    const auto index = LinkIndex(ifname);
+    if (!index) return false;
+    auto request = MakeAddressCidrRequest(RTM_NEWADDR, NLM_F_CREATE | NLM_F_EXCL,
+                                          *index, parsed->prefix_len,
+                                          ScopeForPrefix(parsed->prefix_len));
+    AppendAttr(request, IFA_LOCAL, &parsed->address, sizeof(parsed->address));
+    AppendAttr(request, IFA_ADDRESS, &parsed->address, sizeof(parsed->address));
+    return SendSimpleRequest(std::move(request));
+}
+
+bool RemoveInterfaceAddress(const std::string& ifname, const std::string& cidr) {
+    const auto parsed = ParseCidr(cidr);
+    if (!parsed) return false;
+    const auto index = LinkIndex(ifname);
+    if (!index) return false;
+    auto request = MakeAddressCidrRequest(RTM_DELADDR, 0, *index,
+                                          parsed->prefix_len,
+                                          ScopeForPrefix(parsed->prefix_len));
+    AppendAttr(request, IFA_LOCAL, &parsed->address, sizeof(parsed->address));
+    AppendAttr(request, IFA_ADDRESS, &parsed->address, sizeof(parsed->address));
+    return SendSimpleRequest(std::move(request));
+}
+
+bool FlushInterfaceAddresses(const std::string& ifname) {
+    const auto index = LinkIndex(ifname);
+    if (!index) return false;
+
+    // Dump addresses, filter by ifindex, issue DELADDR for each IPv4 entry.
+    std::vector<char> dump(NLMSG_LENGTH(sizeof(ifaddrmsg)));
+    {
+        auto* header = reinterpret_cast<nlmsghdr*>(dump.data());
+        header->nlmsg_len = static_cast<std::uint32_t>(dump.size());
+        header->nlmsg_type = RTM_GETADDR;
+        header->nlmsg_flags = NLM_F_REQUEST | NLM_F_DUMP;
+        header->nlmsg_seq = 1;
+        auto* addr = reinterpret_cast<ifaddrmsg*>(NLMSG_DATA(header));
+        std::memset(addr, 0, sizeof(*addr));
+        addr->ifa_family = AF_INET;
+    }
+
+    auto socket = netlink::Socket::Open();
+    if (!socket) return false;
+    if (!socket->Send(dump)) return false;
+    auto responses = socket->ReceiveDump();
+    if (!responses.has_value()) return false;
+
+    bool all_ok = true;
+    for (const auto& msg : *responses) {
+        const auto* header = reinterpret_cast<const nlmsghdr*>(msg.data());
+        if (header->nlmsg_type != RTM_NEWADDR) continue;
+        const auto* addr = reinterpret_cast<const ifaddrmsg*>(NLMSG_DATA(header));
+        if (addr->ifa_index != *index) continue;
+        if (addr->ifa_family != AF_INET) continue;
+
+        // Find the IFA_LOCAL (or IFA_ADDRESS) attr.
+        const auto* attrs = reinterpret_cast<const char*>(addr) + sizeof(*addr);
+        unsigned int attr_len = header->nlmsg_len - NLMSG_LENGTH(sizeof(*addr));
+        std::optional<in_addr> local;
+        for (const rtattr* a = reinterpret_cast<const rtattr*>(attrs);
+             RTA_OK(a, attr_len);
+             a = RTA_NEXT(a, attr_len)) {
+            if ((a->rta_type == IFA_LOCAL || a->rta_type == IFA_ADDRESS) &&
+                RTA_PAYLOAD(a) == sizeof(in_addr)) {
+                in_addr v{};
+                std::memcpy(&v, RTA_DATA(a), sizeof(v));
+                local = v;
+                if (a->rta_type == IFA_LOCAL) break;  // prefer IFA_LOCAL
+            }
+        }
+        if (!local.has_value()) continue;
+
+        auto del = MakeAddressCidrRequest(RTM_DELADDR, 0, *index, addr->ifa_prefixlen,
+                                          addr->ifa_scope);
+        AppendAttr(del, IFA_LOCAL, &local->s_addr, sizeof(local->s_addr));
+        AppendAttr(del, IFA_ADDRESS, &local->s_addr, sizeof(local->s_addr));
+        if (!SendSimpleRequest(std::move(del))) all_ok = false;
+    }
+    return all_ok;
 }
 
 }  // namespace inline_proxy
