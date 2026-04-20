@@ -177,21 +177,6 @@ bool FlushInterfaceAddresses(const std::string& ifname) {
     return RunIp({"addr", "flush", "dev", ifname});
 }
 
-bool AddInterfaceRoute(const std::string& ifname, const RouteConfig& route) {
-    std::vector<std::string> args{"route", "add", route.dst};
-    if (route.gw.has_value()) {
-        args.push_back("via");
-        args.push_back(*route.gw);
-    }
-    args.push_back("dev");
-    args.push_back(ifname);
-    return RunIp(args);
-}
-
-bool AddDirectRoute(const std::string& destination, const std::string& ifname) {
-    return RunIp({"route", "add", destination, "dev", ifname});
-}
-
 bool AddRouteVia(const std::string& destination,
                 const std::string& via,
                 const std::string& ifname) {

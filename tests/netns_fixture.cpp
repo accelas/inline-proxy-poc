@@ -228,69 +228,6 @@ bool LinkExistsInNamespace(const std::string& netns_path, const std::string& ifn
     return LinkIndex(ifname).has_value();
 }
 
-bool StartListenerAndRoundTrip(const std::string& server_ns_path,
-                               const std::string& client_ns_path,
-                               const std::string& listen_address,
-                               std::uint16_t port,
-                               const std::string& payload) {
-    std::promise<bool> server_ready;
-    auto server_ready_future = server_ready.get_future();
-    std::promise<bool> accepted_ok;
-    auto accepted_ok_future = accepted_ok.get_future();
-
-    std::thread server([&] {
-        auto entered = ScopedNetns::Enter(server_ns_path);
-        if (!entered) {
-            accepted_ok.set_value(false);
-            return;
-        }
-        ScopedFd listener(::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0));
-        if (!listener) {
-            accepted_ok.set_value(false);
-            return;
-        }
-        const int reuse = 1;
-        if (::setsockopt(listener.get(), SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse)) != 0) {
-            accepted_ok.set_value(false);
-            return;
-        }
-        sockaddr_in server_addr{};
-        server_addr.sin_family = AF_INET;
-        server_addr.sin_port = htons(port);
-        if (::inet_pton(AF_INET, listen_address.c_str(), &server_addr.sin_addr) != 1 ||
-            ::bind(listener.get(), reinterpret_cast<sockaddr*>(&server_addr), sizeof(server_addr)) != 0 ||
-            ::listen(listener.get(), 4) != 0) {
-            accepted_ok.set_value(false);
-            return;
-        }
-        server_ready.set_value(true);
-        ScopedFd accepted = AcceptWithTimeout(listener.get(), std::chrono::duration_cast<std::chrono::milliseconds>(kIoTimeout));
-        if (!accepted) {
-            accepted_ok.set_value(false);
-            return;
-        }
-        const auto request = ReadExact(accepted.get(), payload.size());
-        if (!request.has_value() || *request != payload) {
-            accepted_ok.set_value(false);
-            return;
-        }
-        accepted_ok.set_value(SendAll(accepted.get(), *request));
-    });
-
-    if (server_ready_future.wait_for(kIoTimeout) != std::future_status::ready ||
-        !server_ready_future.get()) {
-        server.join();
-        return false;
-    }
-
-    std::string reply;
-    const bool client_ok = ConnectAndRoundTrip(client_ns_path, listen_address, port, payload, &reply);
-    const bool server_ok =
-        accepted_ok_future.wait_for(kIoTimeout) == std::future_status::ready && accepted_ok_future.get();
-    server.join();
-    return client_ok && server_ok && reply == payload;
-}
-
 std::atomic<unsigned int>& FixtureCounter() {
     static std::atomic<unsigned int> counter{0};
     return counter;
