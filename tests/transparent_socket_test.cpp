@@ -45,9 +45,9 @@ public:
                      1);
         }
         if (g_use_proxy_source_env.empty()) {
-            ::unsetenv("INLINE_PROXY_DEBUG_USE_PROXY_SOURCE");
+            ::unsetenv("INLINE_PROXY_USE_PROXY_SOURCE");
         } else {
-            ::setenv("INLINE_PROXY_DEBUG_USE_PROXY_SOURCE",
+            ::setenv("INLINE_PROXY_USE_PROXY_SOURCE",
                      g_use_proxy_source_env.c_str(),
                      1);
         }
@@ -270,7 +270,7 @@ TEST(TransparentSocketTest, TransparentSocketCanDropClientPortPreservationViaEnv
 TEST(TransparentSocketTest, TransparentSocketCanUseProxySourceViaEnv) {
     HookScope hooks;
     g_use_proxy_source_env = "1";
-    ::setenv("INLINE_PROXY_DEBUG_USE_PROXY_SOURCE", "1", 1);
+    ::setenv("INLINE_PROXY_USE_PROXY_SOURCE", "1", 1);
     g_fake_transparent_options = true;
     inline_proxy::SetSetSockOptHookForTesting(TestSetSockOpt);
     inline_proxy::SetBindHookForTesting(CaptureBind);

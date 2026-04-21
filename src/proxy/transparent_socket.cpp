@@ -75,8 +75,8 @@ bool PreserveClientPort() {
     return std::string_view(value) != "0";
 }
 
-bool DebugUseProxySourceAddress() {
-    const char* value = std::getenv("INLINE_PROXY_DEBUG_USE_PROXY_SOURCE");
+bool UseProxySourceAddress() {
+    const char* value = std::getenv("INLINE_PROXY_USE_PROXY_SOURCE");
     return value != nullptr && std::string_view(value) == "1";
 }
 
@@ -180,7 +180,7 @@ TransparentConnectResult CreateTransparentSocket(const sockaddr_storage& origina
     }
 
     auto bind_src = original_src;
-    if (DebugUseProxySourceAddress()) {
+    if (UseProxySourceAddress()) {
         auto* v4 = reinterpret_cast<sockaddr_in*>(&bind_src);
         v4->sin_addr.s_addr = htonl(INADDR_ANY);
         v4->sin_port = 0;

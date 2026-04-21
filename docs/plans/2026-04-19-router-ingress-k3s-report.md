@@ -32,8 +32,8 @@ Net effect:
 
 2. **k3s-safe proxy behavior**
    - deployment enables:
-     - `INLINE_PROXY_DEBUG_USE_PROXY_SOURCE=1`
-     - `INLINE_PROXY_DEBUG_SKIP_LOCAL_SOURCE=1`
+     - `INLINE_PROXY_USE_PROXY_SOURCE=1`
+     - `INLINE_PROXY_SKIP_LOCAL_SOURCE=1`
      - `INLINE_PROXY_INTERCEPT_PORT=80`
    - these envs are now part of the committed daemonset manifest
 
@@ -71,8 +71,8 @@ kubectl apply --dry-run=server -k deploy/base
 
 The committed daemonset manifest contains the required envs:
 
-- `INLINE_PROXY_DEBUG_USE_PROXY_SOURCE=1`
-- `INLINE_PROXY_DEBUG_SKIP_LOCAL_SOURCE=1`
+- `INLINE_PROXY_USE_PROXY_SOURCE=1`
+- `INLINE_PROXY_SKIP_LOCAL_SOURCE=1`
 - `INLINE_PROXY_INTERCEPT_PORT=80`
 
 ## 3.3 Live k3s verification
