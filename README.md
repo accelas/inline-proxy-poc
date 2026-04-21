@@ -130,14 +130,18 @@ REMOTE
 
 ### 5. Deploy
 
+The `kubectl apply -k` call needs the manifest directory on the machine running kubectl. Stage `deploy/base` alongside the binaries, then apply.
+
 ```bash
-ssh $K3S_HOST kubectl apply -k deploy/base
+scp -r deploy/base $K3S_HOST:/tmp/inline-proxy-build/deploy/
+ssh $K3S_HOST kubectl apply -k /tmp/inline-proxy-build/deploy/base
 ssh $K3S_HOST kubectl -n inline-proxy-system set image \
     ds/inline-proxy-daemon    proxy-daemon=localhost/inline-proxy/proxy-daemon:$TAG
 ssh $K3S_HOST kubectl -n inline-proxy-system set image \
     ds/inline-proxy-installer installer=localhost/inline-proxy/installer:$TAG
 ssh $K3S_HOST kubectl -n inline-proxy-system rollout status ds/inline-proxy-daemon    --timeout=60s
 ssh $K3S_HOST kubectl -n inline-proxy-system rollout status ds/inline-proxy-installer --timeout=60s
+ssh $K3S_HOST kubectl wait --for=condition=Ready pod -l app=inline-proxy-caddy-demo --timeout=120s
 ```
 
 Note: `deploy/base` ships with placeholder images (`ghcr.io/example/...`); the `set image` calls above point them at the tags you just built.
@@ -148,7 +152,7 @@ Drive traffic from an existing pod (coredns) to an annotated caddy pod, and conf
 
 ```bash
 # 6a. Get the proxy pod IP and an annotated caddy pod IP
-PROXY_IP=$(ssh $K3S_HOST kubectl -n inline-proxy-system get pod -l app=inline-proxy-daemon -o jsonpath='{.items[0].status.podIP}')
+PROXY_IP=$(ssh $K3S_HOST kubectl -n inline-proxy-system get pod -l app=inline-proxy -o jsonpath='{.items[0].status.podIP}')
 CADDY_IP=$(ssh $K3S_HOST kubectl get pod -l app=inline-proxy-caddy-demo -o jsonpath='{.items[0].status.podIP}')
 
 # 6b. Baseline counter

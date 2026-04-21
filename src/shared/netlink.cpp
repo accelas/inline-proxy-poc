@@ -7,6 +7,7 @@
 #include <cerrno>
 #include <cstdint>
 #include <cstring>
+#include <iostream>
 #include <ifaddrs.h>
 #include <linux/fib_rules.h>
 #include <linux/if_addr.h>
@@ -386,20 +387,43 @@ std::uint8_t ScopeForPrefix(std::uint8_t prefix_len) {
 
 bool AddRoute(const RouteConfig& cfg, bool replace) {
     const auto dst = ParseCidr(cfg.cidr);
-    if (!dst) return false;
+    if (!dst) {
+        std::cerr << "netlink AddRoute: bad cidr=" << cfg.cidr << '\n';
+        return false;
+    }
     const auto index = LinkIndex(cfg.oif);
-    if (!index) return false;
+    if (!index) {
+        std::cerr << "netlink AddRoute: oif not found oif=" << cfg.oif << '\n';
+        return false;
+    }
     std::optional<in_addr> via;
     if (cfg.via.has_value()) {
         in_addr parsed{};
-        if (::inet_pton(AF_INET, cfg.via->c_str(), &parsed) != 1) return false;
+        if (::inet_pton(AF_INET, cfg.via->c_str(), &parsed) != 1) {
+            std::cerr << "netlink AddRoute: bad via=" << *cfg.via << '\n';
+            return false;
+        }
         via = parsed;
     }
     const std::uint16_t flags =
         static_cast<std::uint16_t>(NLM_F_CREATE | (replace ? NLM_F_REPLACE : NLM_F_EXCL));
+    // Match `ip route add`: on-link device routes (oif set, no gateway,
+    // unicast) default to RT_SCOPE_LINK, not RT_SCOPE_UNIVERSE. Needed so a
+    // subsequent `via <gw>` route can treat <gw> as on-link via that oif.
+    std::uint8_t effective_scope = cfg.scope;
+    if (effective_scope == RT_SCOPE_UNIVERSE && !via.has_value() && cfg.type == RTN_UNICAST) {
+        effective_scope = RT_SCOPE_LINK;
+    }
     auto request = MakeRouteRequest(RTM_NEWROUTE, flags, *dst, *index, via,
-                                    cfg.table, cfg.type, cfg.scope);
-    return SendSimpleRequest(std::move(request));
+                                    cfg.table, cfg.type, effective_scope);
+    if (!SendSimpleRequest(std::move(request))) {
+        std::cerr << "netlink AddRoute: send failed cidr=" << cfg.cidr
+                  << " oif=" << cfg.oif
+                  << " via=" << (cfg.via.value_or("<none>"))
+                  << " table=" << cfg.table << '\n';
+        return false;
+    }
+    return true;
 }
 
 bool DeleteRoute(const RouteConfig& cfg) {
@@ -504,11 +528,19 @@ bool AddRule(const RuleConfig& cfg) {
     std::optional<ParsedCidr> src;
     if (cfg.src_cidr.has_value()) {
         src = ParseCidr(*cfg.src_cidr);
-        if (!src) return false;
+        if (!src) {
+            std::cerr << "netlink AddRule: bad src_cidr=" << *cfg.src_cidr << '\n';
+            return false;
+        }
     }
     auto request = MakeRuleRequest(RTM_NEWRULE, NLM_F_CREATE | NLM_F_EXCL,
                                    src, cfg.fwmark, cfg.table);
-    return SendSimpleRequest(std::move(request));
+    if (!SendSimpleRequest(std::move(request))) {
+        std::cerr << "netlink AddRule: send failed src=" << cfg.src_cidr.value_or("<none>")
+                  << " table=" << cfg.table << '\n';
+        return false;
+    }
+    return true;
 }
 
 bool DeleteRule(const RuleConfig& cfg) {
@@ -523,15 +555,26 @@ bool DeleteRule(const RuleConfig& cfg) {
 
 bool AddInterfaceAddress(const std::string& ifname, const std::string& cidr) {
     const auto parsed = ParseCidr(cidr);
-    if (!parsed) return false;
+    if (!parsed) {
+        std::cerr << "netlink AddInterfaceAddress: bad cidr=" << cidr << '\n';
+        return false;
+    }
     const auto index = LinkIndex(ifname);
-    if (!index) return false;
+    if (!index) {
+        std::cerr << "netlink AddInterfaceAddress: ifname not found ifname=" << ifname << '\n';
+        return false;
+    }
     auto request = MakeAddressCidrRequest(RTM_NEWADDR, NLM_F_CREATE | NLM_F_EXCL,
                                           *index, parsed->prefix_len,
                                           ScopeForPrefix(parsed->prefix_len));
     AppendAttr(request, IFA_LOCAL, &parsed->address, sizeof(parsed->address));
     AppendAttr(request, IFA_ADDRESS, &parsed->address, sizeof(parsed->address));
-    return SendSimpleRequest(std::move(request));
+    if (!SendSimpleRequest(std::move(request))) {
+        std::cerr << "netlink AddInterfaceAddress: send failed ifname=" << ifname
+                  << " cidr=" << cidr << '\n';
+        return false;
+    }
+    return true;
 }
 
 bool RemoveInterfaceAddress(const std::string& ifname, const std::string& cidr) {
