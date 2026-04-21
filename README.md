@@ -133,6 +133,7 @@ REMOTE
 The `kubectl apply -k` call needs the manifest directory on the machine running kubectl. Stage `deploy/base` alongside the binaries, then apply.
 
 ```bash
+ssh $K3S_HOST mkdir -p /tmp/inline-proxy-build/deploy
 scp -r deploy/base $K3S_HOST:/tmp/inline-proxy-build/deploy/
 ssh $K3S_HOST kubectl apply -k /tmp/inline-proxy-build/deploy/base
 ssh $K3S_HOST kubectl -n inline-proxy-system set image \
@@ -148,38 +149,29 @@ Note: `deploy/base` ships with placeholder images (`ghcr.io/example/...`); the `
 
 ### 6. End-to-end verification
 
-Drive traffic from an existing pod (coredns) to an annotated caddy pod, and confirm the proxy intercepted it.
+Drive traffic via the Kubernetes Service (which kube-proxy DNATs to a pod IP in the host netns, so the host's `podIP/32 via rwan_*` route applies and the proxy intercepts).
 
 ```bash
-# 6a. Get the proxy pod IP and an annotated caddy pod IP
+# 6a. Get the proxy pod IP
 PROXY_IP=$(ssh $K3S_HOST kubectl -n inline-proxy-system get pod -l app=inline-proxy -o jsonpath='{.items[0].status.podIP}')
-CADDY_IP=$(ssh $K3S_HOST kubectl get pod -l app=inline-proxy-caddy-demo -o jsonpath='{.items[0].status.podIP}')
 
 # 6b. Baseline counter
 ssh $K3S_HOST "curl -s http://$PROXY_IP:8080/metrics" | grep '^inline_proxy_total_connections '
 
-# 6c. Drive one request from the coredns netns
-ssh $K3S_HOST bash -s "$CADDY_IP" <<'REMOTE'
-set -eu
-CADDY_IP=$1
-CORE_ID=$(sudo crictl ps --name coredns -q)
-CORE_PID=$(sudo crictl inspect "$CORE_ID" | awk '/^    "pid":/ {gsub(/[^0-9]/,"",$2); print $2; exit}')
-sudo nsenter -t "$CORE_PID" -n bash -c "
-  exec 3<>/dev/tcp/$CADDY_IP/80
-  printf 'GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n' >&3
-  head -c 50 <&3
-  echo
-"
-REMOTE
+# 6c. Drive one request from the built-in client-demo pod
+ssh $K3S_HOST kubectl exec inline-proxy-client-demo -- \
+    curl -s --max-time 5 http://inline-proxy-caddy-demo.default.svc.cluster.local/ | head -3
 
 # 6d. Counter should have incremented
 ssh $K3S_HOST "curl -s http://$PROXY_IP:8080/metrics" | grep '^inline_proxy_total_connections '
 
 # 6e. Proxy log should show the intercept
-ssh $K3S_HOST kubectl -n inline-proxy-system logs ds/inline-proxy-daemon --tail=20 | grep 'accepted transparent connection'
+ssh $K3S_HOST kubectl -n inline-proxy-system logs ds/inline-proxy-daemon --tail=10 | grep 'accepted transparent connection'
 ```
 
-Expected: counter goes up by one and the log line reads `accepted transparent connection client=<coredns-ip>:<port> original_dst=<caddy-ip>:80`.
+Expected: the curl returns Caddy's default index page, the counter goes up, and the log has lines like `accepted transparent connection client=10.42.0.154:<port> original_dst=10.42.0.<caddy>:80`.
+
+Caveat: direct pod-IP-to-pod-IP traffic on the same node (e.g. `exec 3<>/dev/tcp/<caddy-ip>/80` from another pod's netns) gets bridged at L2 by `cni0` *before* the host routing decision, so it bypasses the `/32 via rwan_*` route and is **not** intercepted. This is an architectural property of the routed topology — the intercept relies on the packet traversing the host's L3 routing table, which happens for Service/DNAT paths and for cross-node traffic.
 
 ### 7. Tear down
 
