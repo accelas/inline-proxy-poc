@@ -16,12 +16,12 @@ be replaced by a future product name without changing the surrounding architectu
 
 ## Architecture
 
-The current routed-ingress topology is described in the
-[Topology](#topology) section of the Onboarding walkthrough below.
-
-The legacy splice-based topology (eth0 rename/move) is archived in
-[`docs/architecture.md`](docs/architecture.md) and no longer matches
-the code on `main`.
+See [`docs/architecture.md`](docs/architecture.md) for the full
+routed-ingress topology, the step-by-step walk-through of what the
+chained CNI plugin does during pod setup, the inbound and egress
+traffic paths, and a short note on the `/32` transparent-source
+fallback that still lives in `src/proxy/local_source.{hpp,cpp}` but
+is off by default on the current deployment.
 
 ## Build
 
@@ -184,23 +184,8 @@ Expected: counter goes up by one and the log line reads `accepted transparent co
 ### 7. Tear down
 
 ```bash
-ssh $K3S_HOST kubectl delete -k deploy/base
+ssh $K3S_HOST kubectl delete -k /tmp/inline-proxy-build/deploy/base
 ```
-
-### Topology
-
-`main` runs the **routed-ingress** topology:
-
-- Annotated pods keep their primary-CNI `eth0` with the cluster pod IP.
-- A veth pair `rwan_* ↔ wan_*` is created; `rwan_*` stays in the root namespace, `wan_*` moves into the proxy namespace.
-- A second veth pair `lan_* ↔ peer_*` is created; `lan_*` stays in the proxy namespace, `peer_*` is placed in the workload namespace alongside `eth0`.
-- The root namespace routes the pod's IP `/32` at the proxy's `wan_*` IP via `rwan_*`, so all inbound traffic to the pod lands at the proxy.
-- The workload namespace flushes flannel's `/24` on `eth0`, re-adds the pod IP as `/32`, and routes outbound via the proxy's `lan_*` IP on `peer_*`.
-- A per-pod source-routing table sends workload egress back out `wan_*` to the real cluster.
-
-This means flannel/CNI contracts for the pod IP are preserved, and the proxy can intercept both ingress (via TC-ingress BPF on `wan_*`) and egress paths without renaming `eth0`.
-
-The **splice topology** (eth0 renamed `wan_*` and moved into the proxy netns) lives only in git history prior to this change. It never worked reliably on k3s: flannel/kube-router reject source-spoofed pod-to-pod connects, which the splice required for transparent backend binds.
 
 ### Environment flags
 
@@ -209,8 +194,10 @@ The daemon reads these at startup. The daemonset manifest under `deploy/base/` a
 | Env var | Default | Meaning |
 |---|---|---|
 | `INLINE_PROXY_INTERCEPT_PORT` | `80` | TC-ingress destination port to hijack |
-| `INLINE_PROXY_USE_PROXY_SOURCE` | `1` in manifest | Upstream socket binds to the proxy's own IP instead of the original client. Required on k3s because flannel rejects spoofed pod-to-pod sources. Unset to restore original-client-source binds. |
-| `INLINE_PROXY_SKIP_LOCAL_SOURCE` | `1` in manifest | Skips the `/32` client-IP localisation on `wan_*`. Pairs with `USE_PROXY_SOURCE=1`. Leave set in routed mode. |
+| `INLINE_PROXY_USE_PROXY_SOURCE` | `1` in manifest | Upstream socket binds to the proxy's own IP instead of the original client. Required on k3s because flannel rejects spoofed pod-to-pod sources. Unset to restore original-client-source binds (requires `SKIP_LOCAL_SOURCE=0`). |
+| `INLINE_PROXY_SKIP_LOCAL_SOURCE` | `1` in manifest | Skips the `/32` client-IP localisation on `wan_*` (the fallback path in `src/proxy/local_source.{hpp,cpp}`). Pairs with `USE_PROXY_SOURCE=1`. Leave set under the routed topology. |
+
+For the full topology walk-through, the inbound/egress traffic paths, and the note on the `/32` fallback, see [`docs/architecture.md`](docs/architecture.md).
 
 ## Verification snapshot
 

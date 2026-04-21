@@ -1,21 +1,22 @@
-# Inline Proxy PoC — Architecture and Traffic Paths (LEGACY SPLICE TOPOLOGY)
+# Inline Proxy PoC — Architecture and Traffic Paths
 
-> **Note:** This document describes the original *splice* topology —
-> workload `eth0` renamed to `wan_*` and moved into the proxy netns.
-> That design never worked reliably on k3s because flannel/kube-router
-> reject source-spoofed pod-to-pod connects, which the splice required
-> for transparent backend binds.
->
-> The current `main` runs a **routed-ingress** topology — pod `eth0`
-> stays in place, the node routes `podIP/32` through the proxy, and the
-> proxy uses its own source IP on backend connects. See the `Topology`
-> section of the top-level `README.md` for the up-to-date description,
-> and `src/cni/splice_executor.cpp` for the implementation.
+This doc describes the network topology the inline proxy creates for
+annotated pods on k3s, what the custom CNI plugin does during pod
+setup, how an inbound request flows through the proxy, and which
+traffic paths actually work end-to-end.
 
-This doc describes the network topology the inline proxy *used to* create
-for annotated pods on k3s under the splice design.
+The implementation is the **routed-ingress** topology: the pod keeps
+its primary-CNI `eth0` and the cluster pod IP, and the node routes the
+pod's traffic *through* the proxy rather than moving `eth0` anywhere.
+Source: `src/cni/splice_executor.cpp`, `src/proxy/*`.
 
-## 1. Baseline topology (before the custom CNI runs)
+An older **splice topology** (rename `eth0` → `wan_*` and move it into
+the proxy netns) is archived in git history. It relied on transparent
+original-client-source backend binds, which flannel/kube-router reject
+for pod-to-pod traffic on k3s. It never worked reliably and has been
+replaced.
+
+## 1. Baseline (before the custom CNI runs)
 
 k3s ships with flannel as the primary CNI and a Linux bridge `cni0` on
 the node's host netns. Every pod the primary CNI creates gets one veth
@@ -24,262 +25,249 @@ pair — one end on the bridge, the other end in the pod netns named
 
 ```
 host netns                               pod netns
-┌────────────────────┐                   ┌───────────────────────┐
-│ cni0 bridge        │                   │ eth0                  │
-│  10.42.0.1/24      │◄──── veth ───────►│  10.42.0.X/24         │
-│                    │                   │  default via 10.42.0.1│
-└────────────────────┘                   └───────────────────────┘
+┌────────────────────┐                   ┌────────────────────────┐
+│ cni0 bridge        │                   │ eth0                   │
+│  10.42.0.1/24      │◄──── veth ───────►│  10.42.0.X/24          │
+│                    │                   │  default via 10.42.0.1 │
+└────────────────────┘                   └────────────────────────┘
 ```
 
-All pods (proxy pod, caddy pods, coredns, whatever) look like this at
-the end of the primary-CNI step.
+All pods (proxy pod, caddy pods, coredns, etc.) look like this at the
+end of the primary-CNI step.
 
 ## 2. What the chained `inline-proxy-cni` plugin does
 
-Source: `src/cni/main.cpp` → `SpliceExecutor::HandleAdd` in
-`src/cni/splice_executor.cpp`. The plugin runs **after** flannel, so
-the veth above already exists.
-
-For every new pod sandbox the plugin:
+Entry: `src/cni/main.cpp` → `SpliceExecutor::HandleAdd` in
+`src/cni/splice_executor.cpp`. The plugin runs **after** flannel.
 
 ### 2.1 Passes through unless the pod is annotated
 
-`splice_executor.cpp:398-406`. If the pod is the proxy pod itself, or if
-the annotation `inline-proxy.example.com/enabled=true` is not set, the
-plugin emits the primary CNI's prevResult unchanged.
+If the pod is the proxy pod itself, or if the annotation
+`inline-proxy.example.com/enabled=true` is not set, the plugin emits
+the primary CNI's prevResult unchanged. Those pods retain the plain
+bridge topology above and behave identically to any other k3s pod.
 
-### 2.2 Resolves the node-local proxy pod
+### 2.2 Creates a routed upstream link
 
-`src/cni/k8s_client.cpp::FindNodeLocalProxyPod` picks the
-`inline-proxy-daemon` pod on the same node as the workload. Its netns
-path is resolved via CRI / `/var/run/netns/`.
+For annotated pods the plugin creates a veth pair in the **root**
+namespace:
 
-### 2.3 Performs a "splice" of the workload's eth0 into the proxy netns
+- `rwan_<hash>` stays in the root namespace with a link-local /30
+  address (`169.254.X.1/30`).
+- `wan_<hash>` is moved into the **proxy** namespace and given the
+  matching `169.254.X.2/30`.
 
-`SpliceExecutor::ExecuteSplice` runs five staged steps, each with
-rollback. At each stage it enters the appropriate netns via
-`ScopedNetns::Enter`.
-
-1. **In the workload netns:** rename `eth0 → wan_<hash>`, move
-   `wan_<hash>` **into the proxy pod's netns**. The host-side peer (still
-   plugged into `cni0`) is untouched — from the bridge's perspective,
-   packets destined for the workload IP still land on the same bridge
-   port.
-2. **In the proxy netns:** bring `wan_<hash>` up, enable `proxy_arp`,
-   create a fresh veth pair `lan_<hash>` / `peer_<hash>`, flush addresses
-   off `wan_<hash>` (the workload's original pod IP is no longer assigned
-   to this interface), move `peer_<hash>` into the workload netns.
-3. **In the workload netns:** rename `peer_<hash> → eth0` (new eth0),
-   re-assign the original pod IP as `/32`, add a link-local `/30` for the
-   proxy link, set default route via the proxy's link-local IP.
-4. **In the proxy netns:** assign the other `/30` half to `lan_<hash>`,
-   enable `ip_forward=1`, add a `10.42.0.X/32 via <workload-LL> dev lan_`
-   route so the proxy can reach the real pod IP out `lan_`, install
-   per-pod policy-routing rules `from <pod_ip> lookup <route_table>`,
-   and populate `<route_table>` with `default via 10.42.0.1 dev wan_`.
-5. **Persist state** to `/var/run/inline-proxy-cni/container-<id>.json`
-   so `HandleDel` on pod teardown can reverse everything.
-
-### 2.4 Resulting topology for annotated workloads
+It then rewrites the root namespace's route to the pod:
 
 ```
-                           host netns
-          ┌──────────────────────────────────────────────┐
-          │          cni0 bridge (10.42.0.1/24)          │
-          └──▲──────────────────────▲──────────────▲─────┘
-             │(unchanged by splice) │              │
-        host-side veth of           │host-side     │other pods
-        workload's ORIGINAL eth0    │veth to proxy │
-             │                      │pod eth0      │
-             ▼                      ▼              ▼
-   ╔══════════════════════════╗   ┌──────────────────┐
-   ║       proxy netns        ║   │ proxy pod's own  │
-   ║ ┌──────────────────────┐ ║   │   eth0 (pod IP)  │
-   ║ │ wan_<hash>           │ ║   └──────────────────┘
-   ║ │  (addressless, BPF   │ ║
-   ║ │   tc-ingress attached│ ║
-   ║ │   proxy_arp=1)       │ ║
-   ║ └────────┬─────────────┘ ║     workload netns
-   ║          │ ip_forward    ║   ┌────────────────────────────┐
-   ║          ▼               ║   │ NEW eth0 = peer_<hash>     │
-   ║ ┌──────────────────────┐ ║   │  pod IP /32 + link-local/30│
-   ║ │ lan_<hash>           │◄╬───│  default via proxy-side-LL │
-   ║ │  (link-local /30)    │ ║   └────────────────────────────┘
-   ║ └──────────────────────┘ ║
-   ║                          ║
-   ║ ip rule from <pod_ip>    ║
-   ║  lookup <route_table>    ║
-   ║ <route_table>:           ║
-   ║  default via 10.42.0.1   ║
-   ║         dev wan_<hash>   ║
-   ║                          ║
-   ║ ip rule fwmark 0x100     ║
-   ║  lookup 100              ║
-   ║ table 100:               ║
-   ║  local 0/0 dev lo        ║
-   ║                          ║
-   ║ transparent listener:    ║
-   ║  0.0.0.0:15001           ║
-   ║   (IP_TRANSPARENT)       ║
-   ╚══════════════════════════╝
+host netns (routes):
+  10.42.0.Y/32 via 169.254.X.2 dev rwan_<hash>
 ```
 
-Key topological facts:
+Inbound traffic addressed to the pod now goes out `rwan_<hash>` and
+lands on `wan_<hash>` in the proxy namespace — this is the
+interception point.
 
-- **The pod IP stays the same.** From the rest of the cluster's
-  perspective the workload's address doesn't change.
-- Any packet destined for the workload pod reaches `cni0`, gets
-  forwarded to the **original** host-side veth, and now lands on
-  `wan_<hash>` **in the proxy netns** — not in the workload pod. This is
-  the interception point.
-- Proxy ↔ workload uses a fresh private `/30` link (`lan_<hash>` ↔
-  workload's new `eth0`) that's invisible to the rest of the cluster.
-- Per-pod policy-routing tables give return packets a deterministic
-  path back out `wan_` so they reach the real client.
+### 2.3 Creates a routed downstream link
 
-### 2.5 Installer DaemonSet
+Inside the proxy namespace the plugin creates a second veth pair:
 
-Separately, `deploy/base/proxy-installer-daemonset.yaml` runs a
-privileged pod on each node that:
+- `lan_<hash>` stays in the proxy namespace with `169.254.X.5/30`.
+- `peer_<hash>` is moved into the **workload** namespace with
+  `169.254.X.6/30`.
 
-1. Copies `inline_proxy_cni` into the node's CNI bin directory
-   (`/var/lib/rancher/k3s/data/cni/` for k3s).
-2. Rewrites the active CNI conflist to add
-   `{"type": "inline-proxy-cni", ...}` chained after flannel.
-3. Loops every 5 minutes to resist drift.
+### 2.4 Rewrites the workload namespace
 
-## 3. Runtime flow of an inbound connection
+The workload's primary-CNI `eth0` stays put (it is never renamed or
+moved). The plugin:
 
-Example: `coredns (10.42.0.6)` → `caddy (10.42.0.151):80`.
+1. Flushes flannel's `/24` address from `eth0`.
+2. Re-adds the pod's address as a `/32` on `eth0`, so the pod's IP
+   identity is preserved but it no longer claims the `/24`.
+3. Routes the pod's default path through the proxy:
+   `default via 169.254.X.5 dev peer_<hash>`.
 
-1. **Client kernel** sends TCP SYN `10.42.0.6 → 10.42.0.151:80`. The
-   client's default route sends it to `cni0` via its own host-side veth.
-2. `cni0` forwards to the **original** host-side veth for caddy's pod IP.
-   That veth's pod-side is now `wan_<hash>` in the proxy netns.
-3. **TC ingress BPF** on `wan_<hash>` fires
-   (`src/bpf/ingress_redirect.bpf.c`):
-   - checks IPv4 + TCP + `dst_port == cfg->listener_port` (80),
-   - tries `bpf_skc_lookup_tcp` for the 4-tuple (miss for SYN),
-   - falls back to `bpf_map_lookup_elem(&listener_map, &0)` → the proxy
-     daemon's transparent listener fd,
-   - `bpf_sk_assign(skb, listener, 0)` hands the SYN to the listener,
-   - sets `skb->mark = cfg->skb_mark` (`0x100`) so the
-     `fwmark 0x100 → table 100 (local 0/0 dev lo)` rule delivers locally.
-4. The **proxy's transparent listener** (`src/proxy/transparent_listener.cpp`,
-   `0.0.0.0:15001`, `IP_TRANSPARENT`) `accept()`s.
-   `getsockname()` on the accepted fd returns the *original* dst
-   `10.42.0.151:80` — that's the `IP_TRANSPARENT` magic.
-5. **`CreateRelaySession`** (`src/proxy/relay_session.cpp:234`):
-   - `AcquireLocalSourceAddress(10.42.0.6)` adds the client IP as `/32`
-     to every `wan_*` in the netns so the kernel will recognize return
-     packets as locally deliverable. Skipped for already-local /
-     gateway IPs (see §4).
-   - Creates an upstream socket with `IP_TRANSPARENT` + `IP_FREEBIND`,
-     `bind()`s to the client's address, `connect()`s to the original
-     dst. Routed out `lan_<hash>` via the splice's `/32` route.
-6. **Caddy** receives the SYN as if it came straight from
-   `10.42.0.6`, responds normally. The reply is
-   `src=10.42.0.151, dst=10.42.0.6`; caddy's default route sends it back
-   out its (new) `eth0` → `lan_<hash>` in the proxy netns.
-7. In the proxy netns the reply matches
-   `from 10.42.0.151 lookup <route_table>`; the table has
-   `default via 10.42.0.1 dev wan_<hash>`, so it would otherwise egress
-   `wan_`. But the kernel first does a TCP socket lookup, finds the
-   relay's upstream socket (bound to `10.42.0.6`), and delivers the
-   packet locally. Bytes flow.
-8. The proxy relays bytes client-side ↔ upstream-side.
-   `inline_proxy_total_connections` increments on every `accept()`.
+From the cluster's perspective the workload still answers at its pod
+IP, but every packet it sends or receives now traverses the proxy.
 
-## 4. Traffic paths: what works end-to-end
+### 2.5 Installs per-pod source routing in the proxy
 
-Whether a given path works depends on **what source IP the proxy
-actually sees** when `getpeername()` runs on the accepted fd. The BPF
-intercept fires for every path that reaches `wan_<hash>` on the
-configured port — so `inline_proxy_total_connections` increments in
-all the cases below. The question is whether the relay's upstream
-return path completes.
+Inside the proxy namespace the plugin installs a per-pod routing
+table:
 
-`LocalSourceManager::Acquire` skips adding the client IP as `/32` if
-that IP is already locally assigned in the proxy netns or is a
-next-hop gateway in any route. This was the fix for issue #2: assigning
-the cni0 bridge IP (`10.42.0.1`) to a `wan_` interface poisons ARP for
-the entire netns (the kernel suppresses replies whose sender IP is one
-of its own addresses), breaking kubelet probes and cluster
-connectivity.
-
-### Paths that work end-to-end
-
-| Path | Source IP the proxy sees | Why it works |
-|---|---|---|
-| Pod-to-pod on the same node (e.g., `coredns` → `caddy`) | the client pod's IP (e.g., `10.42.0.6`) | Pod IP is not in the proxy netns (`cni0` lives in host netns; individual pod IPs are not locally assigned inside the proxy netns). LocalSourceManager adds `/32` on `wan_*` → return path delivered locally. |
-| Pod-to-pod across nodes | remote pod IP | Same reasoning; flannel VXLAN-encapsulates, the decapsulated inner packet has the source pod IP. |
-| `NodePort` with `externalTrafficPolicy: Local` | real external IP | Node preserves source, `/32` assignment safe. |
-| External LB with source preservation (L2/BGP, PROXY protocol terminated before the proxy) | real external IP | Same as above. |
-| Direct routed access to pod IPs from outside the cluster (e.g., Calico BGP, or a custom route to flannel subnet) | external IP | Same as above. |
-
-### Paths where the BPF counter increments but the response does not complete
-
-| Path | Source IP the proxy sees | Why it fails |
-|---|---|---|
-| Host-originated (`curl http://<podIP>` on the node itself) | `10.42.0.1` (cni0 gateway) | `10.42.0.1` is a next-hop gateway in the proxy netns → LocalSourceManager skips the `/32` (would break ARP). No recognition path for return packets → relay session times out. |
-| `NodePort` / `LoadBalancer` with default `externalTrafficPolicy: Cluster` | `10.42.0.1` after k8s SNATs source to the node | Same reason. |
-| kubelet/probe traffic from the node | `10.42.0.1` | Same reason. |
-
-For these paths the design needs a different return-path mechanism
-(e.g., TC egress BPF on `lan_*` marking return packets so the
-`fwmark 0x100 → table 100 (local 0/0 dev lo)` rule catches them without
-`/32` assignment). That's a separate design change, not a bug; tracked
-only as "future work" until a concrete need arises.
-
-### Paths the splice design rejects
-
-- Traffic to pods **not** annotated with
-  `inline-proxy.example.com/enabled=true`: the chained CNI passes through
-  without splicing. The workload's original veth ↔ eth0 stays intact;
-  traffic flows the normal flannel way.
-- Traffic to the proxy pod's own IP: never spliced; cni0 forwards
-  normally to the proxy pod's own `eth0`.
-
-## 5. Verifying on k3s
-
-```bash
-# Verify pod-to-pod works end-to-end:
-PROXY=$(kubectl get pod -n inline-proxy-system -l app=inline-proxy -o jsonpath='{.items[0].metadata.name}')
-PROXY_IP=$(kubectl get pod -n inline-proxy-system "$PROXY" -o jsonpath='{.status.podIP}')
-CADDY_IP=$(kubectl get pod -n default -l app=inline-proxy-caddy-demo -o jsonpath='{.items[0].status.podIP}')
-COREDNS=$(kubectl get pod -n kube-system -l k8s-app=kube-dns -o jsonpath='{.items[0].metadata.name}')
-COREDNS_NETNS=$(sudo crictl inspectp $(sudo crictl pods --name "$COREDNS" -q) | jq -r '.info.runtimeSpec.linux.namespaces[]|select(.type=="network").path')
-
-# counter before
-curl -fsS http://$PROXY_IP:8080/metrics | grep ^inline_proxy_total
-
-# drive traffic from a real cluster pod
-sudo nsenter --net=$COREDNS_NETNS bash -c "
-  exec 3<>/dev/tcp/$CADDY_IP/80
-  printf 'GET / HTTP/1.0\r\nHost: caddy\r\n\r\n' >&3
-  head -c 80 <&3
-  exec 3<&-
-"
-
-# counter after (should be +1)
-curl -fsS http://$PROXY_IP:8080/metrics | grep ^inline_proxy_total
-
-# proxy log confirms the relay
-kubectl logs -n inline-proxy-system "$PROXY" --tail=3 | grep 'accepted transparent'
+```
+rule:  from 10.42.0.Y/32 lookup <table>
+table: default via 169.254.X.1 dev wan_<hash>
+       10.42.0.Y/32 dev lan_<hash>
 ```
 
-Expected: `inline_proxy_total_connections` goes 0 → 1 and the proxy log
-shows `accepted transparent connection client=<coredns_IP>:N
-original_dst=<caddy_IP>:80`.
+This makes workload egress — packets the proxy forwards on behalf of
+the pod — leave through `wan_<hash>` back toward the node, exactly
+mirroring the ingress path. Return packets to the pod IP end up back
+on `lan_<hash>` and into the workload namespace.
 
-## 6. Related docs
+### 2.6 Attaches the TC-ingress BPF program on `wan_<hash>`
 
-- `docs/plans/2026-04-18-inline-proxy-poc-design.md` — original PoC design
-  rationale.
-- `docs/plans/2026-04-19-inline-proxy-k3s-status.md` — live-deployment
-  status doc from before the skeleton-loader rewrite (historical).
-- `docs/superpowers/specs/2026-04-19-router-style-inline-proxy-design.md` —
-  approved redesign toward a router-style topology that replaces the
-  splice; not yet implemented.
-- `docs/superpowers/specs/2026-04-19-bpf-skeleton-loader-design.md` — the
-  BPF-loader rewrite spec this branch implements.
+The proxy daemon already owns a transparent listener at
+`127.0.0.1:15001`. When it observes the new `wan_*` interface, its
+interface registry attaches the compiled skeleton program
+(`src/bpf/ingress_redirect.bpf.c`) on TC-ingress of that interface.
+The BPF program redirects matching TCP flows to the listener via
+`bpf_sk_assign`, preserving the original dst via SO_ORIGINAL_DST.
+
+## 3. Topology after the routed splice
+
+```
+        ingress from the cluster
+                 │
+                 ▼
+         ┌───────────────┐
+         │ cni0 bridge   │   (root netns)
+         │ 10.42.0.1/24  │
+         └───────┬───────┘
+                 │
+         root-ns route:
+         10.42.0.Y/32 via 169.254.X.2 dev rwan_<hash>
+                 │
+                 ▼
+         ┌───────────────┐
+         │ rwan_<hash>   │   169.254.X.1/30  (root netns)
+         └───────┬───────┘
+                 │        (veth pair)
+         ┌───────▼───────────┐
+         │ wan_<hash>        │   169.254.X.2/30  (PROXY netns)
+         │  TC-ingress BPF   │
+         │  → bpf_sk_assign  │
+         │     to listener   │
+         └───────┬───────────┘
+                 │         (IP_TRANSPARENT listener)
+                 ▼
+         ┌───────────────────┐
+         │ proxy userspace   │   127.0.0.1:15001
+         │ connects upstream │
+         └───────┬───────────┘
+                 │   (egress via per-pod src rule:
+                 │    from 10.42.0.Y lookup <tbl>
+                 │    table: Y/32 dev lan_<hash>)
+                 ▼
+         ┌───────────────────┐
+         │ lan_<hash>        │   169.254.X.5/30  (proxy netns)
+         └───────┬───────────┘
+                 │         (veth pair)
+         ┌───────▼───────────┐
+         │ peer_<hash>       │   169.254.X.6/30  (workload netns)
+         └───────┬───────────┘
+                 │
+         workload-ns route:
+         default via 169.254.X.5 dev peer_<hash>
+                 │
+                 ▼
+         ┌───────────────────┐
+         │ eth0 (unchanged)  │   10.42.0.Y/32   (workload netns)
+         │ the workload      │
+         └───────────────────┘
+```
+
+Key facts:
+
+- **Pod IP is preserved.** From the rest of the cluster's perspective
+  the workload's address doesn't change — it's still `10.42.0.Y`.
+- **`eth0` is never renamed or moved.** The primary CNI keeps full
+  ownership of the pod's layer-2 identity; the plugin only rewrites
+  addresses and routes.
+- All rewritten links use `169.254.X.0/30`s carved out of the RFC
+  5735 link-local block, invisible to the rest of the cluster.
+- Only **annotated** pods go through this path. Unannotated pods
+  retain the plain `cni0` bridge topology and are unaffected.
+
+## 4. Inbound traffic path
+
+1. Cluster sends a SYN to `10.42.0.Y:80`.
+2. Node forwards via `cni0` per the root-ns route and lands on
+   `rwan_<hash>` → `wan_<hash>` in the proxy netns.
+3. TC-ingress BPF on `wan_<hash>` calls `bpf_sk_assign` to direct the
+   flow to the proxy's transparent listener at `127.0.0.1:15001`.
+4. Proxy `accept()` yields a socket with the original src
+   (`10.42.0.X`) and original dst (`10.42.0.Y:80`, recovered via
+   `SO_ORIGINAL_DST`).
+5. Proxy opens an upstream TCP socket bound to `INADDR_ANY:0`
+   (`INLINE_PROXY_USE_PROXY_SOURCE=1`, the default in the deploy
+   manifest) and `connect()`s to `10.42.0.Y:80`.
+6. The upstream SYN egresses the proxy netns. The per-pod source rule
+   doesn't fire here (source is the proxy's IP, not the pod's), so
+   it follows the default route out `wan_<hash>` and eventually back
+   to the pod.
+7. The return path bounces back through `lan_<hash>` →
+   `peer_<hash>` → workload `eth0`.
+
+## 5. Workload egress path
+
+1. Workload sends a packet with source `10.42.0.Y`.
+2. Workload's default route sends it out `peer_<hash>` toward
+   `169.254.X.5` (`lan_<hash>` in proxy netns).
+3. The proxy netns's per-pod source rule
+   `from 10.42.0.Y/32 lookup <table>` steers the packet into the
+   per-pod table, which routes `default via 169.254.X.1 dev
+   wan_<hash>` — i.e. back to root via the upstream link.
+4. If the flow's destination matches the intercept port (80 by
+   default), TC-ingress BPF on `wan_<hash>` captures it when it
+   *arrives* from root, handing it to the proxy just like an inbound
+   flow would.
+
+## 6. Traffic paths that work vs. paths that intentionally don't
+
+Works end-to-end:
+
+- Pod → pod (both on the same node) — the client pod's packet to
+  `10.42.0.Y` follows the root-ns route to the proxy, gets intercepted,
+  and reaches the annotated backend.
+- External client → Service → annotated pod — the kube-proxy DNAT and
+  downstream route all converge on the same node path; the proxy
+  intercepts on `wan_*`.
+
+Does not work (by construction):
+
+- Traffic whose source is the host's bridge gateway IP `10.42.0.1`.
+  The proxy can't safely source packets from that address without
+  breaking ARP resolution for every pod on the node; the TC-ingress
+  intercept still fires but the return path can't complete.
+
+## 7. The `/32` transparent-source fallback still in-tree
+
+`src/proxy/local_source.{hpp,cpp}` holds an off-by-default code path
+for the original transparent-source pattern: the proxy briefly adds
+the client IP as a `/32` to `wan_*` interfaces before the upstream
+connect, so the kernel accepts a `bind()` to that foreign IP and
+delivers return packets back to the proxy.
+
+- On the routed deployment this machinery is completely bypassed.
+  `deploy/base/proxy-daemonset.yaml` sets
+  `INLINE_PROXY_SKIP_LOCAL_SOURCE=1`, which makes
+  `AcquireLocalSourceAddress` a no-op, and
+  `INLINE_PROXY_USE_PROXY_SOURCE=1`, which makes the upstream bind
+  target `INADDR_ANY` rather than the original client address.
+- It is kept in-tree because it's the only way to run the proxy in
+  true transparent-source mode on a kernel that allows source
+  spoofing across the cluster network. The file-level comment in
+  `local_source.hpp` spells out that the whole module can be deleted
+  once that mode stops being a supported configuration.
+
+## 8. Interface contract with the daemon
+
+The proxy daemon watches the proxy netns's `/sys/class/net` via
+`src/proxy/interface_registry.cpp`. Each time a new `wan_<hash>`
+appears it:
+
+1. Attaches the compiled BPF skeleton program on TC-ingress of that
+   interface (via `src/bpf/loader.cpp`).
+2. Populates the BPF maps (`config_map` and `listener_map` — two
+   maps total across the whole system, regardless of how many
+   annotated pods exist) so the program knows which flows to
+   intercept and which socket to hand them to.
+3. On CNI DEL the plugin removes the state file and links; the
+   registry sees the interface vanish and detaches.
+
+The daemon does not otherwise care about the routed vs splice
+distinction — from its perspective it still owns `wan_*`
+interfaces, attaches BPF on each one, and runs a transparent
+listener. The topology rewrite is entirely in the CNI plugin.
