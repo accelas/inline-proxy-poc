@@ -6,6 +6,7 @@
 #include <string>
 #include <sys/socket.h>
 
+#include "proxy/local_source.hpp"
 #include "proxy/transparent_socket.hpp"
 #include "shared/event_loop.hpp"
 #include "shared/scoped_fd.hpp"
@@ -14,8 +15,6 @@ namespace inline_proxy {
 
 using SendHook = ssize_t (*)(int fd, const void* buffer, size_t length, int flags);
 using ShutdownHook = int (*)(int fd, int how);
-using AcquireLocalSourceHook = bool (*)(const sockaddr_storage&);
-using ReleaseLocalSourceHook = void (*)(const sockaddr_storage&);
 using CloseCallback = std::function<void()>;
 
 struct SessionEndpoints {
@@ -25,8 +24,6 @@ struct SessionEndpoints {
 
 void SetSendHookForTesting(SendHook hook);
 void SetShutdownHookForTesting(ShutdownHook hook);
-void SetAcquireLocalSourceHookForTesting(AcquireLocalSourceHook hook);
-void SetReleaseLocalSourceHookForTesting(ReleaseLocalSourceHook hook);
 std::size_t RelaySessionBufferHighWaterMark() noexcept;
 
 class RelaySession : public std::enable_shared_from_this<RelaySession> {
