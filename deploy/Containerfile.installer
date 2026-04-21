@@ -1,0 +1,12 @@
+FROM docker.io/library/debian:13-slim
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends python3 ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+COPY inline_proxy_cni /opt/inline-proxy/bin/inline_proxy_cni
+COPY install-cni.sh /opt/inline-proxy/scripts/install-cni.sh
+COPY reconcile-cni.sh /opt/inline-proxy/scripts/reconcile-cni.sh
+RUN chmod 0755 \
+    /opt/inline-proxy/bin/inline_proxy_cni \
+    /opt/inline-proxy/scripts/install-cni.sh \
+    /opt/inline-proxy/scripts/reconcile-cni.sh
+CMD ["/bin/sh"]

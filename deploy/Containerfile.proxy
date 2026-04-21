@@ -1,0 +1,6 @@
+FROM docker.io/library/debian:13-slim
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends libelf1 ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+COPY proxy_daemon /usr/local/bin/proxy_daemon
+ENTRYPOINT ["/usr/local/bin/proxy_daemon"]
