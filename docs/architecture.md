@@ -1,9 +1,19 @@
-# Inline Proxy PoC — Architecture and Traffic Paths
+# Inline Proxy PoC — Architecture and Traffic Paths (LEGACY SPLICE TOPOLOGY)
 
-This doc describes the network topology the inline proxy creates for
-annotated pods on k3s, what the custom CNI plugin does during pod setup,
-how an inbound request flows through the proxy, and which traffic paths
-actually work end-to-end.
+> **Note:** This document describes the original *splice* topology —
+> workload `eth0` renamed to `wan_*` and moved into the proxy netns.
+> That design never worked reliably on k3s because flannel/kube-router
+> reject source-spoofed pod-to-pod connects, which the splice required
+> for transparent backend binds.
+>
+> The current `main` runs a **routed-ingress** topology — pod `eth0`
+> stays in place, the node routes `podIP/32` through the proxy, and the
+> proxy uses its own source IP on backend connects. See the `Topology`
+> section of the top-level `README.md` for the up-to-date description,
+> and `src/cni/splice_executor.cpp` for the implementation.
+
+This doc describes the network topology the inline proxy *used to* create
+for annotated pods on k3s under the splice design.
 
 ## 1. Baseline topology (before the custom CNI runs)
 
