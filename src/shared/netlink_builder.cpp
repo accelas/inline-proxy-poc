@@ -3,6 +3,7 @@
 #include <array>
 #include <cerrno>
 #include <cstring>
+#include <iostream>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -42,9 +43,13 @@ std::optional<Socket> Socket::Open() {
         return std::nullopt;
     }
 
+    // Let the kernel auto-assign a unique netlink port id on first send.
+    // Explicitly binding to getpid() collides if the same process holds more
+    // than one netlink socket at a time (e.g. dump socket + per-DELADDR
+    // SendSimpleRequest socket during FlushInterfaceAddresses).
     sockaddr_nl local{};
     local.nl_family = AF_NETLINK;
-    local.nl_pid = static_cast<unsigned int>(::getpid());
+    local.nl_pid = 0;
     if (::bind(fd.get(), reinterpret_cast<sockaddr*>(&local), sizeof(local)) != 0) {
         return std::nullopt;
     }
@@ -76,7 +81,14 @@ bool Socket::ReceiveAck() const {
              header = NLMSG_NEXT(header, remaining)) {
             if (header->nlmsg_type == NLMSG_ERROR) {
                 const auto* error = reinterpret_cast<nlmsgerr*>(NLMSG_DATA(header));
-                return error->error == 0;
+                if (error->error != 0) {
+                    std::cerr << "netlink ReceiveAck: kernel returned errno="
+                              << -error->error << " ("
+                              << std::strerror(-error->error) << ") for nlmsg_type="
+                              << error->msg.nlmsg_type << '\n';
+                    return false;
+                }
+                return true;
             }
             if (header->nlmsg_type == NLMSG_DONE) {
                 return true;

@@ -642,7 +642,15 @@ bool FlushInterfaceAddresses(const std::string& ifname) {
                                           addr->ifa_scope);
         AppendAttr(del, IFA_LOCAL, &local->s_addr, sizeof(local->s_addr));
         AppendAttr(del, IFA_ADDRESS, &local->s_addr, sizeof(local->s_addr));
-        if (!SendSimpleRequest(std::move(del))) all_ok = false;
+        if (!SendSimpleRequest(std::move(del))) {
+            char dot[INET_ADDRSTRLEN] = {0};
+            ::inet_ntop(AF_INET, &local->s_addr, dot, sizeof(dot));
+            std::cerr << "netlink FlushInterfaceAddresses: DELADDR failed ifname="
+                      << ifname << " addr=" << dot
+                      << "/" << static_cast<int>(addr->ifa_prefixlen)
+                      << " scope=" << static_cast<int>(addr->ifa_scope) << '\n';
+            all_ok = false;
+        }
     }
     return all_ok;
 }

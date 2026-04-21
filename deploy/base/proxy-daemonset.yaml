@@ -41,6 +41,12 @@ spec:
               value: "127.0.0.1"
             - name: INLINE_PROXY_TRANSPARENT_PORT
               value: "15001"
+            - name: INLINE_PROXY_USE_PROXY_SOURCE
+              value: "1"
+            - name: INLINE_PROXY_SKIP_LOCAL_SOURCE
+              value: "1"
+            - name: INLINE_PROXY_INTERCEPT_PORT
+              value: "80"
           ports:
             - name: admin-http
               containerPort: 8080
