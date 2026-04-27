@@ -68,5 +68,6 @@ cc_binary(
         ":cni_args",
         ":cni_parser",
         ":k8s_client",
+        "//src/bpf:tc_attach",
     ],
 )
