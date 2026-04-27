@@ -437,7 +437,6 @@ bool BpfLoader::LoadAndPin(std::string_view pin_dir) {
         std::cerr << "LoadAndPin: mkdir " << pin_dir << " failed errno=" << errno << '\n';
         return false;
     }
-    pin_dir_ = std::string(pin_dir);
 
     if (!EnsureSkeletonLoaded()) return false;
 
@@ -445,6 +444,8 @@ bool BpfLoader::LoadAndPin(std::string_view pin_dir) {
     auto fresh_tag = ProgTag(fresh_prog_fd);
     if (!fresh_tag) {
         std::cerr << "LoadAndPin: failed to query freshly-loaded prog tag\n";
+        ingress_redirect_skel__destroy(skel_);
+        skel_ = nullptr;
         return false;
     }
 

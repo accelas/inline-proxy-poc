@@ -99,7 +99,6 @@ private:
     struct ingress_redirect_skel* skel_ = nullptr;
     ScopedFd config_map_fd_;
     ScopedFd listener_map_fd_;
-    std::string pin_dir_;
 };
 
 }  // namespace inline_proxy

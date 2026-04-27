@@ -9,7 +9,9 @@
 #include <string>
 #include <sys/socket.h>
 #include <sys/syscall.h>
+#include <system_error>
 #include <unistd.h>
+#include <utility>
 
 #include <bpf/bpf.h>
 #include <linux/bpf.h>
@@ -87,29 +89,48 @@ TEST(BpfLoaderTest, LoadsSkeleton) {
 namespace {
 
 std::string MakeTempPinDir() {
-    std::string dir = "/sys/fs/bpf/bpf-loader-test-" +
-                      std::to_string(::getpid()) + "-" +
-                      std::to_string(std::rand());
-    std::filesystem::create_directories(dir);
-    return dir;
+    char tmpl[] = "/sys/fs/bpf/bpf-loader-test-XXXXXX";
+    if (::mkdtemp(tmpl) == nullptr) {
+        return {};
+    }
+    return tmpl;
 }
+
+class TempPinDir {
+public:
+    explicit TempPinDir(std::string dir) : dir_(std::move(dir)) {}
+    ~TempPinDir() {
+        if (!dir_.empty()) {
+            std::error_code ec;
+            std::filesystem::remove_all(dir_, ec);
+        }
+    }
+    TempPinDir(const TempPinDir&) = delete;
+    TempPinDir& operator=(const TempPinDir&) = delete;
+    const std::string& path() const { return dir_; }
+private:
+    std::string dir_;
+};
 
 }  // namespace
 
 TEST(BpfLoaderTest, LoadAndPinCreatesPins) {
     if (::geteuid() != 0) GTEST_SKIP() << "Requires root / CAP_BPF";
-    const auto dir = MakeTempPinDir();
+    TempPinDir guard{MakeTempPinDir()};
+    ASSERT_FALSE(guard.path().empty());
+    const auto& dir = guard.path();
     inline_proxy::BpfLoader loader;
     EXPECT_TRUE(loader.LoadAndPin(dir));
     EXPECT_TRUE(std::filesystem::exists(dir + "/prog"));
     EXPECT_TRUE(std::filesystem::exists(dir + "/config_map"));
     EXPECT_TRUE(std::filesystem::exists(dir + "/listener_map"));
-    std::filesystem::remove_all(dir);
 }
 
 TEST(BpfLoaderTest, LoadAndPinIsIdempotent) {
     if (::geteuid() != 0) GTEST_SKIP() << "Requires root / CAP_BPF";
-    const auto dir = MakeTempPinDir();
+    TempPinDir guard{MakeTempPinDir()};
+    ASSERT_FALSE(guard.path().empty());
+    const auto& dir = guard.path();
     {
         inline_proxy::BpfLoader loader;
         EXPECT_TRUE(loader.LoadAndPin(dir));
@@ -119,12 +140,13 @@ TEST(BpfLoaderTest, LoadAndPinIsIdempotent) {
         EXPECT_TRUE(loader.LoadAndPin(dir));
         EXPECT_TRUE(std::filesystem::exists(dir + "/prog"));
     }
-    std::filesystem::remove_all(dir);
 }
 
 TEST(BpfLoaderTest, LoadAndPinReusesPinOnTagMatch) {
     if (::geteuid() != 0) GTEST_SKIP() << "Requires root / CAP_BPF";
-    const auto dir = MakeTempPinDir();
+    TempPinDir guard{MakeTempPinDir()};
+    ASSERT_FALSE(guard.path().empty());
+    const auto& dir = guard.path();
     auto read_prog_id = [&](const std::string& prog_path) -> std::uint32_t {
         union bpf_attr a{};
         std::memset(&a, 0, sizeof(a));
@@ -151,12 +173,13 @@ TEST(BpfLoaderTest, LoadAndPinReusesPinOnTagMatch) {
     ASSERT_TRUE(second.LoadAndPin(dir));
     const std::uint32_t second_id = read_prog_id(dir + "/prog");
     EXPECT_EQ(first_id, second_id) << "tag-match reuse should keep prog id stable";
-    std::filesystem::remove_all(dir);
 }
 
 TEST(BpfLoaderTest, WriteConfigPopulatesConfigMap) {
     if (::geteuid() != 0) GTEST_SKIP() << "Requires root / CAP_BPF";
-    const auto dir = MakeTempPinDir();
+    TempPinDir guard{MakeTempPinDir()};
+    ASSERT_FALSE(guard.path().empty());
+    const auto& dir = guard.path();
     inline_proxy::BpfLoader loader;
     ASSERT_TRUE(loader.LoadAndPin(dir));
     EXPECT_TRUE(loader.WriteConfig(15001, 0x100));
@@ -178,12 +201,13 @@ TEST(BpfLoaderTest, WriteConfigPopulatesConfigMap) {
     EXPECT_EQ(cfg.listener_port, 15001u);
     EXPECT_EQ(cfg.skb_mark, 0x100u);
     ::close(map_fd);
-    std::filesystem::remove_all(dir);
 }
 
 TEST(BpfLoaderTest, WriteListenerFdAcceptsListeningSocket) {
     if (::geteuid() != 0) GTEST_SKIP() << "Requires root / CAP_BPF";
-    const auto dir = MakeTempPinDir();
+    TempPinDir guard{MakeTempPinDir()};
+    ASSERT_FALSE(guard.path().empty());
+    const auto& dir = guard.path();
     inline_proxy::BpfLoader loader;
     ASSERT_TRUE(loader.LoadAndPin(dir));
     const int sock = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
@@ -196,5 +220,4 @@ TEST(BpfLoaderTest, WriteListenerFdAcceptsListeningSocket) {
     ASSERT_EQ(::listen(sock, 16), 0);
     EXPECT_TRUE(loader.WriteListenerFd(sock));
     ::close(sock);
-    std::filesystem::remove_all(dir);
 }
