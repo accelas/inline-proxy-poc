@@ -393,107 +393,19 @@ git add tests/bpf_attacher_test.cpp tests/BUILD.bazel
 git commit -m "Test: TcAttacher::WaitForPinnedProg timing"
 ```
 
-### Task 1.5: Integration test — `AttachToInterface` against a dummy interface (CAP_BPF-gated)
+### Task 1.5: Verify Chunk 1 baseline
 
-This test creates a netns + dummy interface, pins a trivial BPF program in the netns's bpffs (`/sys/fs/bpf/<random-dir>/prog`), runs `TcAttacher::AttachToInterface`, then asserts via `tc filter show` that an `ingress_redirect`-named filter is present.
-
-The "trivial BPF program" comes from the existing `ingress_redirect_skel` since this test will be skipped when not running as root anyway. We pin its prog, attach, and verify.
-
-**Files:**
-- Modify: `tests/bpf_attacher_test.cpp`
-- Modify: `tests/BUILD.bazel` (add `:loader` and `:fd_netns_harness` to deps if used)
-
-- [ ] **Step 1.5.1: Append the CAP_BPF test to `tests/bpf_attacher_test.cpp`**
-
-```cpp
-#include "bpf/loader.hpp"
-#include "tests/fd_netns_harness.hpp"  // existing test helper
-
-namespace {
-
-bool TcFilterShowHasIngressRedirect(const std::string& ifname) {
-    const std::string cmd = "tc filter show dev " + ifname + " ingress 2>&1";
-    FILE* p = ::popen(cmd.c_str(), "r");
-    if (!p) return false;
-    std::string out;
-    char buf[256];
-    while (std::fgets(buf, sizeof(buf), p)) out += buf;
-    ::pclose(p);
-    return out.find("ingress_redirect") != std::string::npos;
-}
-
-}  // namespace
-
-TEST(TcAttacherTest, AttachesIngressFilterAgainstDummyInterface) {
-    if (::geteuid() != 0) {
-        GTEST_SKIP() << "Requires root / CAP_BPF / CAP_NET_ADMIN";
-    }
-    inline_proxy::FdNetnsHarness harness;
-    if (!harness.Setup("wan_test_attach")) {
-        GTEST_SKIP() << "harness setup failed (kernel/policy)";
-    }
-
-    // Pin the program inside the harness netns: load via BpfLoader's
-    // existing test helper, then bpf_obj_pin under a fresh test dir.
-    const std::string pin_dir = "/sys/fs/bpf/tc-attach-test-" +
-                                std::to_string(::getpid());
-    ASSERT_EQ(::mkdir(pin_dir.c_str(), 0755), 0) << "mkdir pin_dir failed errno=" << errno;
-
-    inline_proxy::BpfLoader loader;
-    ASSERT_TRUE(loader.LoadProgramForTesting()) << "skeleton load failed";
-    // The harness pins via the existing loader test surface or a small
-    // helper that pins skel_->progs.ingress_redirect at <pin_dir>/prog.
-    // Use the helper exposed in Chunk 2's BpfLoader::PinProgForTesting
-    // once it lands; for Chunk 1, this test is added in skip-state and
-    // wired up at the end of Chunk 2.
-
-    GTEST_SKIP() << "completed in Chunk 2 once BpfLoader::LoadAndPin lands";
-}
-```
-
-- [ ] **Step 1.5.2: Verify the test still compiles**
-
-```bash
-bazel test //tests:bpf_attacher_test --test_output=errors
-```
-
-Expected: PASS, with the new test SKIPPED. The chunk's test surface is intentionally incomplete here; chunk 2 wires `LoadAndPin` and chunk 5 finalizes this integration test.
-
-- [ ] **Step 1.5.3: Update the test target in `tests/BUILD.bazel` to add the new deps**
-
-```python
-cc_test(
-    name = "bpf_attacher_test",
-    srcs = ["bpf_attacher_test.cpp"],
-    size = "medium",
-    local = True,
-    deps = [
-        "@googletest//:gtest_main",
-        "//src/bpf:tc_attach",
-        "//src/bpf:loader",
-        ":fd_netns_harness",
-    ],
-)
-```
-
-- [ ] **Step 1.5.4: Commit**
-
-```bash
-git add tests/bpf_attacher_test.cpp tests/BUILD.bazel
-git commit -m "Test: TcAttacher integration test scaffold (completion in Chunk 2)"
-```
-
-### Task 1.6: Verify Chunk 1 baseline
-
-- [ ] **Step 1.6.1: Run the full test suite**
+- [ ] **Step 1.5.1: Run the full test suite**
 
 ```bash
 bazel test //tests/... 2>&1 | tee /tmp/cni-bpf-attach-chunk1.txt
 ```
 
-Expected: same pass/fail set as `/tmp/cni-bpf-attach-baseline.txt` plus the two new `bpf_attacher_test` cases (one passing, one skipped). No regression in any other test.
+Expected: same pass/fail set as `/tmp/cni-bpf-attach-baseline.txt` plus the two new `bpf_attacher_test` cases (both passing). No regression in any other test.
 
-- [ ] **Step 1.6.2: If any pre-existing test regressed, stop and diagnose. Do not proceed to Chunk 2.**
+End-to-end TC-attach coverage is deferred to the existing `ebpf_intercept_fd_netns_test`, which gets exercised in Chunks 4-5 once the `fd_netns_harness` is rewritten to drive the new `BpfLoader` API.
+
+- [ ] **Step 1.5.2: If any pre-existing test regressed, stop and diagnose. Do not proceed to Chunk 2.**
 
 ---
 
@@ -688,18 +600,6 @@ bool BpfLoader::PinFresh(std::string_view pin_dir) {
 
     // Open the just-pinned maps as raw fds so future writes don't
     // depend on skel staying alive.
-    const std::string config_path = dir + "/config_map";
-    const std::string listener_path = dir + "/listener_map";
-
-    int cfg_fd = static_cast<int>(::syscall(
-        SYS_bpf, BPF_OBJ_GET,
-        []() {
-            union bpf_attr a{};
-            return &a;
-        }(),  // placeholder; see real call below
-        sizeof(union bpf_attr)));
-    (void)cfg_fd;  // avoid unused-warning; real impl below
-
     auto bpf_obj_get_path = [](const std::string& path) -> int {
         union bpf_attr a{};
         std::memset(&a, 0, sizeof(a));
@@ -707,12 +607,12 @@ bool BpfLoader::PinFresh(std::string_view pin_dir) {
         return static_cast<int>(::syscall(SYS_bpf, BPF_OBJ_GET, &a, sizeof(a)));
     };
 
-    int new_cfg_fd = bpf_obj_get_path(config_path);
+    int new_cfg_fd = bpf_obj_get_path(dir + "/config_map");
     if (new_cfg_fd < 0) {
         std::cerr << "bpf_obj_get(config_map) failed errno=" << errno << '\n';
         return false;
     }
-    int new_listener_fd = bpf_obj_get_path(listener_path);
+    int new_listener_fd = bpf_obj_get_path(dir + "/listener_map");
     if (new_listener_fd < 0) {
         std::cerr << "bpf_obj_get(listener_map) failed errno=" << errno << '\n';
         ::close(new_cfg_fd);
@@ -1009,7 +909,7 @@ TEST(BpfLoaderTest, WriteConfigPopulatesConfigMap) {
     get_attr.pathname = reinterpret_cast<__u64>(map_path.c_str());
     int map_fd = static_cast<int>(::syscall(SYS_bpf, BPF_OBJ_GET, &get_attr, sizeof(get_attr)));
     ASSERT_GE(map_fd, 0);
-    inline_proxy::IngressRedirectConfig cfg{};
+    IngressRedirectConfig cfg{};
     union bpf_attr lookup_attr{};
     std::memset(&lookup_attr, 0, sizeof(lookup_attr));
     std::uint32_t key = 0;
@@ -1066,61 +966,9 @@ git add tests/bpf_loader_test.cpp
 git commit -m "Test: BpfLoader::LoadAndPin / WriteConfig / WriteListenerFd"
 ```
 
-### Task 2.5: Wire up the chunk-1 integration test now that `PinProgForTesting` exists
+### Task 2.5: Verify Chunk 2 baseline
 
-**Files:**
-- Modify: `tests/bpf_attacher_test.cpp`
-
-- [ ] **Step 2.5.1: Replace the SKIP in `AttachesIngressFilterAgainstDummyInterface`**
-
-Replace the body of the test with:
-
-```cpp
-TEST(TcAttacherTest, AttachesIngressFilterAgainstDummyInterface) {
-    if (::geteuid() != 0) {
-        GTEST_SKIP() << "Requires root / CAP_BPF / CAP_NET_ADMIN";
-    }
-    inline_proxy::FdNetnsHarness harness;
-    if (!harness.Setup("wan_test_attach")) {
-        GTEST_SKIP() << "harness setup failed (kernel/policy)";
-    }
-
-    const std::string pin_dir = "/sys/fs/bpf/tc-attach-test-" +
-                                std::to_string(::getpid());
-    std::filesystem::create_directories(pin_dir);
-
-    inline_proxy::BpfLoader loader;
-    ASSERT_TRUE(loader.PinProgForTesting(pin_dir));
-
-    inline_proxy::TcAttacher attacher(pin_dir);
-    EXPECT_TRUE(attacher.WaitForPinnedProg(std::chrono::seconds(5)));
-    EXPECT_TRUE(attacher.AttachToInterface("wan_test_attach"));
-    EXPECT_TRUE(TcFilterShowHasIngressRedirect("wan_test_attach"));
-
-    std::filesystem::remove_all(pin_dir);
-}
-```
-
-(Adjust `harness.Setup` signature based on what `tests/fd_netns_harness.hpp` actually provides; if it takes no args or different args, match its API. The harness already exists and is used by `ebpf_intercept_fd_netns_test`.)
-
-- [ ] **Step 2.5.2: Verify**
-
-```bash
-bazel test //tests:bpf_attacher_test --test_output=streamed
-```
-
-Expected as root: all three TcAttacher tests pass. Non-root: integration test skips.
-
-- [ ] **Step 2.5.3: Commit**
-
-```bash
-git add tests/bpf_attacher_test.cpp
-git commit -m "Test: complete TcAttacher integration (uses BpfLoader::PinProgForTesting)"
-```
-
-### Task 2.6: Verify Chunk 2 baseline
-
-- [ ] **Step 2.6.1: Run the full test suite**
+- [ ] **Step 2.5.1: Run the full test suite**
 
 ```bash
 bazel test //tests/... 2>&1 | tee /tmp/cni-bpf-attach-chunk2.txt
@@ -1302,27 +1150,20 @@ git commit -m "CNI: wait for pinned BPF program before invoking the splice"
 **Files:**
 - Modify: tests that construct `CniExecutionOptions` and exercise `ExecuteSplice` without going through the host kernel — most notably any `splice_executor_*_test.cpp` that uses an in-process `splice_runner` stub.
 
-- [ ] **Step 3.4.1: Find affected tests**
+- [ ] **Step 3.4.1: Enumerate affected tests**
+
+Run:
 
 ```bash
-grep -ln "CniExecutionOptions\|splice_runner" tests/*.cpp
+grep -L "splice_runner" tests/splice_executor_*test.cpp tests/*splice*test.cpp 2>/dev/null
+grep -l "splice_runner" tests/splice_executor_*test.cpp tests/*splice*test.cpp 2>/dev/null
 ```
 
-For each test that constructs a `CniExecutionOptions` and exercises `ExecuteSplice` (i.e., not just `HandleAdd` in error paths), provide a stub `tc_attacher`:
+The first command lists splice tests that **do not** use `splice_runner` — those exercise the real `ExecuteSplice` and will hit `TcAttacher::AttachToInterface`. The second lists tests that **do** use `splice_runner` and therefore short-circuit `ExecuteSplice` entirely; they don't need any change.
 
-```cpp
-struct AlwaysOkTcAttacher : inline_proxy::TcAttacher {
-    AlwaysOkTcAttacher() : inline_proxy::TcAttacher("/dev/null") {}
-    // Override: but TcAttacher methods are not virtual. Instead, the
-    // test should pass a real TcAttacher pointed at a writable temp
-    // dir if it doesn't go through the kernel TC path, OR the test
-    // should use `splice_runner` to replace ExecuteSplice entirely.
-};
-```
+In the current tree the splice tests are: `splice_executor_test.cpp` (uses `splice_runner` — no change needed), `splice_executor_netns_test.cpp` (does not use `splice_runner` — needs the update in Step 3.4.2), `splice_plan_test.cpp` (no `CniExecutionOptions` — no change needed). Verify with the greps above; if the inventory has changed, treat the greps as authoritative.
 
-Since `TcAttacher` methods aren't virtual, tests that rely on `splice_runner` already short-circuit `ExecuteSplice` and never reach `AttachToInterface`. Those tests don't need any change.
-
-Tests that don't use `splice_runner` and exercise the real `ExecuteSplice` end-to-end (the netns-fixture tests like `splice_executor_netns_test`) **do** reach `AttachToInterface`. For those, a real `TcAttacher` pointing at a temp dir is needed, plus a pinned prog at that dir before the test runs (use `BpfLoader::PinProgForTesting`).
+`TcAttacher`'s methods are non-virtual, so tests can't substitute a stub by inheritance. Tests that need a no-op attacher must either: (a) use `splice_runner` to replace `ExecuteSplice` entirely, or (b) feed a real `TcAttacher` pointed at a temp dir with a pre-pinned prog (via `BpfLoader::PinProgForTesting`).
 
 - [ ] **Step 3.4.2: Update `splice_executor_netns_test.cpp`**
 
@@ -1742,7 +1583,109 @@ git add src/proxy/config.cpp src/proxy/admin_http.hpp src/proxy/admin_http.cpp t
 git commit -m "Proxy: new boot sequence (LoadAndPin/WriteConfig/WriteListenerFd); drop /interfaces"
 ```
 
-### Task 4.4: Delete `InterfaceRegistry` and `StateReconciler`
+### Task 4.4: Rewrite `tests/fd_netns_harness.cpp` to use the new `BpfLoader` API
+
+The harness builds an in-process proxy (single thread, single transparent listener) for end-to-end tests like `ebpf_intercept_fd_netns_test`. Its proxy thread currently uses `InterfaceRegistry::ConfigureIngressListener` + `RecordInterface(wan_ifname_)` to (a) attach BPF to the harness's wan interface and (b) push the listener fd into `listener_map`. With BPF attach moved out of the proxy, the harness needs to do its own attach + map writes.
+
+**Files:**
+- Modify: `tests/fd_netns_harness.cpp`
+- Modify: `tests/fd_netns_harness.hpp` (drop the `interface_registry.hpp` include)
+- Modify: `tests/BUILD.bazel` (the `fd_netns_harness` cc_library may need `//src/bpf:loader` and `//src/bpf:tc_attach` deps)
+
+- [ ] **Step 4.4.1: Drop the `InterfaceRegistry` include from `fd_netns_harness.hpp`**
+
+Open `tests/fd_netns_harness.hpp`, remove `#include "proxy/interface_registry.hpp"`. The header doesn't expose any registry-typed APIs — the include was an implementation detail leaked through the header.
+
+- [ ] **Step 4.4.2: Replace the proxy-thread setup in `fd_netns_harness.cpp`**
+
+Find the block in the proxy thread (around `fd_netns_harness.cpp:331-338`):
+
+```cpp
+        InterfaceRegistry registry;
+        auto listener = CreateTransparentListener("0.0.0.0", kListenerPort);
+        if (!listener || !registry.ConfigureIngressListener(listener.fd(), kDemoPort) ||
+            !registry.RecordInterface(wan_ifname_)) {
+            proxy_ready.set_value(false);
+            proxy_done.set_value(false);
+            return;
+        }
+```
+
+Replace with:
+
+```cpp
+        // Pin BPF in this proxy netns; CNI side (TcAttacher) drives the
+        // TC attach, which we do inline here since the harness has no
+        // separate CNI process.
+        const std::string pin_dir = "/sys/fs/bpf/fd-netns-harness-" +
+                                    std::to_string(::getpid());
+        std::filesystem::create_directories(pin_dir);
+
+        BpfLoader bpf_loader;
+        auto listener = CreateTransparentListener("0.0.0.0", kListenerPort);
+        if (!listener ||
+            ::listen(listener.fd(), 16) != 0 ||
+            !bpf_loader.LoadAndPin(pin_dir) ||
+            !bpf_loader.WriteConfig(kDemoPort, 0x100) ||
+            !bpf_loader.WriteListenerFd(listener.fd())) {
+            proxy_ready.set_value(false);
+            proxy_done.set_value(false);
+            return;
+        }
+
+        TcAttacher attacher(pin_dir);
+        if (!attacher.WaitForPinnedProg(std::chrono::seconds(5)) ||
+            !attacher.AttachToInterface(wan_ifname_)) {
+            proxy_ready.set_value(false);
+            proxy_done.set_value(false);
+            return;
+        }
+```
+
+Note: `CreateTransparentListener` may already call `listen()` on the fd it returns; check the existing definition. If it does, drop the explicit `::listen(listener.fd(), 16)` from the chain. If it doesn't, keep it — the sockmap insert in `WriteListenerFd` requires LISTEN state.
+
+Add includes near the top of `fd_netns_harness.cpp`:
+
+```cpp
+#include <chrono>
+#include <filesystem>
+#include "bpf/loader.hpp"
+#include "bpf/tc_attach.hpp"
+```
+
+Remove:
+
+```cpp
+#include "proxy/interface_registry.hpp"
+```
+
+- [ ] **Step 4.4.3: Update the `fd_netns_harness` BUILD entry**
+
+In `tests/BUILD.bazel`, find the `fd_netns_harness` cc_library and add to its `deps`:
+
+```python
+        "//src/bpf:loader",
+        "//src/bpf:tc_attach",
+```
+
+The dep on `//src/proxy:proxy` is unchanged (the harness still uses `CreateTransparentListener`, `CreateRelaySession`, `EventLoop` from there).
+
+- [ ] **Step 4.4.4: Build the harness and its consumers**
+
+```bash
+bazel build //tests:fd_netns_harness //tests:ebpf_intercept_fd_netns_test
+```
+
+Expected: success. The harness is a fixture, not a test, so building it is enough; the test will run in Step 4.4.7.
+
+- [ ] **Step 4.4.5: Commit**
+
+```bash
+git add tests/fd_netns_harness.hpp tests/fd_netns_harness.cpp tests/BUILD.bazel
+git commit -m "Test harness: drop InterfaceRegistry; use BpfLoader+TcAttacher directly"
+```
+
+### Task 4.5: Delete `InterfaceRegistry` and `StateReconciler`
 
 **Files:**
 - Delete: `src/proxy/interface_registry.hpp`
@@ -1754,7 +1697,7 @@ git commit -m "Proxy: new boot sequence (LoadAndPin/WriteConfig/WriteListenerFd)
 - Modify: `src/proxy/BUILD.bazel`
 - Modify: `tests/BUILD.bazel`
 
-- [ ] **Step 4.4.1: Confirm there are no remaining references**
+- [ ] **Step 4.5.1: Confirm there are no remaining references**
 
 ```bash
 grep -rln "InterfaceRegistry\|StateReconciler\|interface_registry\|state_reconciler" \
@@ -1763,7 +1706,7 @@ grep -rln "InterfaceRegistry\|StateReconciler\|interface_registry\|state_reconci
 
 Expected: only the four source files, two test files, and BUILD.bazel entries. If any other file references them, fix that first.
 
-- [ ] **Step 4.4.2: Delete the source files**
+- [ ] **Step 4.5.2: Delete the source files**
 
 ```bash
 git rm src/proxy/interface_registry.hpp \
@@ -1774,7 +1717,7 @@ git rm src/proxy/interface_registry.hpp \
        tests/state_reconciler_test.cpp
 ```
 
-- [ ] **Step 4.4.3: Update `src/proxy/BUILD.bazel`**
+- [ ] **Step 4.5.3: Update `src/proxy/BUILD.bazel`**
 
 In the `:proxy` cc_library, remove:
 
@@ -1794,11 +1737,11 @@ from `hdrs`. Also add `//src/bpf:loader` to `deps` if it isn't already there (th
 
 Looking at the current file, `//src/bpf:loader` is already in deps, so no change needed there.
 
-- [ ] **Step 4.4.4: Update `tests/BUILD.bazel`**
+- [ ] **Step 4.5.4: Update `tests/BUILD.bazel`**
 
 Remove the `interface_registry_test` and `state_reconciler_test` `cc_test` blocks.
 
-- [ ] **Step 4.4.5: Build everything**
+- [ ] **Step 4.5.5: Build everything**
 
 ```bash
 bazel build //...
@@ -1806,7 +1749,7 @@ bazel build //...
 
 Expected: success. If something else still references the removed classes, the compiler will say so — fix and retry.
 
-- [ ] **Step 4.4.6: Run the full test suite**
+- [ ] **Step 4.5.6: Run the full test suite**
 
 ```bash
 bazel test //tests/... --test_output=errors
@@ -1814,16 +1757,16 @@ bazel test //tests/... --test_output=errors
 
 Expected: green. The two deleted tests no longer appear.
 
-- [ ] **Step 4.4.7: Commit**
+- [ ] **Step 4.5.7: Commit**
 
 ```bash
 git add src/proxy/BUILD.bazel tests/BUILD.bazel
 git commit -m "Proxy: delete InterfaceRegistry and StateReconciler"
 ```
 
-### Task 4.5: Verify Chunk 4 baseline and smoke test
+### Task 4.6: Verify Chunk 4 baseline and smoke test
 
-- [ ] **Step 4.5.1: Run the full test suite**
+- [ ] **Step 4.6.1: Run the full test suite**
 
 ```bash
 bazel test //tests/... 2>&1 | tee /tmp/cni-bpf-attach-chunk4.txt
@@ -1831,7 +1774,7 @@ bazel test //tests/... 2>&1 | tee /tmp/cni-bpf-attach-chunk4.txt
 
 Expected: green. The pass count is two fewer than the baseline (`interface_registry_test`, `state_reconciler_test` are gone).
 
-- [ ] **Step 4.5.2: Manual smoke test (optional, requires a test cluster)**
+- [ ] **Step 4.6.2: Manual smoke test (optional, requires a test cluster)**
 
 Build the new artifacts and deploy:
 
@@ -1912,7 +1855,7 @@ The `runtime_config_` member is retained because `WriteConfig` records the last-
 Delete:
 
 - The anonymous-namespace netlink helpers (`MakeTcRequest`, `SendNetlinkRequest`, `FinalizeNetlinkMessage`, `EnsureClsactQdisc`, `RemoveIngressFilter`, `AttachIngressFilter`) — these were only ever used by the removed `AttachIngress` / `DetachIngress` methods, and `tc_attach.cpp` carries its own copy for CNI use.
-- All includes that are no longer needed: `<linux/if_ether.h>`, `<linux/pkt_cls.h>`, `<linux/pkt_sched.h>`, `<linux/rtnetlink.h>`, `<netinet/in.h>`, `<sys/socket.h>`, `"shared/netlink.hpp"`, `"shared/netlink_builder.hpp"`. Keep `<sys/syscall.h>`, `<linux/bpf.h>`, `<filesystem>`, `<sys/stat.h>` — those are used by the new pin/map-write paths.
+- All includes that are no longer needed: `<linux/if_ether.h>`, `<linux/pkt_cls.h>`, `<linux/pkt_sched.h>`, `<linux/rtnetlink.h>`, `<netinet/in.h>`, `<sys/socket.h>`, `"shared/netlink.hpp"`, `"shared/netlink_builder.hpp"`. Keep `<sys/syscall.h>`, `<linux/bpf.h>`, `<bpf/bpf.h>` (for `bpf_obj_pin`, `bpf_obj_get_info_by_fd`, `bpf_program__fd`, `bpf_map__fd`), `<bpf/libbpf.h>` (for skeleton API), `<filesystem>`, `<sys/stat.h>` — all used by the new pin/map-write paths.
 - The function bodies of `AttachIngress`, `DetachIngress`, `ConfigureListenerSocket`, `listener_socket_fd`, `listener_port`, `IsIngressAttached`.
 
 Keep:
