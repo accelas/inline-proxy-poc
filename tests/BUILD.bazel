@@ -191,6 +191,8 @@ cc_library(
     srcs = ["netns_fixture.cpp"],
     hdrs = ["netns_fixture.hpp"],
     deps = [
+        "//src/bpf:loader",
+        "//src/bpf:tc_attach",
         "//src/cni:cni_parser",
         "//src/cni:cni_splice",
         "//src/proxy:proxy",
