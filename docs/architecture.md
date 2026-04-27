@@ -108,10 +108,16 @@ on `lan_<hash>` and into the workload namespace.
 
 ### 2.6 Attaches the TC-ingress BPF program on `wan_<hash>`
 
-The proxy daemon already owns a transparent listener at
-`127.0.0.1:15001`. When it observes the new `wan_*` interface, its
-interface registry attaches the compiled skeleton program
-(`src/bpf/ingress_redirect.bpf.c`) on TC-ingress of that interface.
+The BPF program is loaded once per node by the proxy daemon at
+startup and pinned at `/sys/fs/bpf/inline-proxy/{prog,config_map,listener_map}`.
+
+When the CNI plugin creates the `wan_<hash>` interface and moves it
+into the proxy netns, it then enters the proxy netns and attaches the
+pinned program as a TC ingress filter on `wan_<hash>` before
+returning. The proxy daemon never watches interfaces and never runs
+TC netlink calls; it only writes `config_map[0]` (port, mark) and
+`listener_map[0]` (its listener fd) once at startup.
+
 The BPF program redirects matching TCP flows to the listener via
 `bpf_sk_assign`, preserving the original dst via SO_ORIGINAL_DST.
 
@@ -254,20 +260,38 @@ delivers return packets back to the proxy.
 
 ## 8. Interface contract with the daemon
 
-The proxy daemon watches the proxy netns's `/sys/class/net` via
-`src/proxy/interface_registry.cpp`. Each time a new `wan_<hash>`
-appears it:
+The proxy daemon does not watch interfaces. At startup it:
 
-1. Attaches the compiled BPF skeleton program on TC-ingress of that
-   interface (via `src/bpf/loader.cpp`).
-2. Populates the BPF maps (`config_map` and `listener_map` — two
-   maps total across the whole system, regardless of how many
-   annotated pods exist) so the program knows which flows to
-   intercept and which socket to hand them to.
-3. On CNI DEL the plugin removes the state file and links; the
-   registry sees the interface vanish and detaches.
+1. Binds and listens on the transparent listener.
+2. Loads the embedded BPF skeleton and pins prog/config_map/
+   listener_map under `/sys/fs/bpf/inline-proxy/` (replacing any
+   existing pins from a prior process).
+3. Writes `config_map[0] = {enabled, listener_port, skb_mark}`.
+4. Writes `listener_map[0] = listener_fd`.
+5. Marks `/readyz` green.
 
-The daemon does not otherwise care about the routed vs splice
-distinction — from its perspective it still owns `wan_*`
-interfaces, attaches BPF on each one, and runs a transparent
-listener. The topology rewrite is entirely in the CNI plugin.
+The CNI plugin attaches the program. On every ADD it polls the
+pinned `prog` file (up to 30s) before invoking the splice, then —
+inside the splice's proxy-netns scope, after `wan_<hash>` has been
+addressed and brought up — opens the pin via `bpf_obj_get` and runs
+the TC ingress attach via netlink.
+
+CNI DEL is a no-op for BPF: removing `wan_<hash>` drops its qdisc
+and filter automatically.
+
+If the proxy restarts:
+
+- Existing pins keep the program/maps alive in the kernel.
+- The new proxy loads the embedded skeleton, queries the pinned
+  program's tag, and — when the tags match (the common case for
+  crash-restart of the same binary) — reuses the existing pinned
+  program and maps. Already-attached TC filters on `wan_*` interfaces
+  continue to read from and write to the same maps the new proxy now
+  writes to, so existing pods keep being intercepted.
+- On a binary upgrade the tag differs, the old pins are replaced,
+  and new TC attaches reference the new program; existing filters
+  keep running the old program until their interfaces are deleted.
+
+The pin path `/sys/fs/bpf/inline-proxy/` is on host bpffs (mounted
+into the proxy pod via hostPath with bidirectional propagation). CNI
+runs on the host directly and reaches the same bpffs natively.
