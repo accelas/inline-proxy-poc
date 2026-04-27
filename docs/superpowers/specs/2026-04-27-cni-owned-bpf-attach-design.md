@@ -28,7 +28,7 @@ In scope:
 - Adding a bounded poll on the CNI side so that workload pod CNI ADDs landing before proxy startup wait for the pinned program to appear (timeout 30s).
 - Deleting `src/proxy/interface_registry.{hpp,cpp}` and `src/proxy/state_reconciler.{hpp,cpp}` and their tests.
 - Rewriting the boot sequence in `src/proxy/main.cpp` / `config.cpp` to load+pin+write maps once, then run the listener.
-- Updating `src/cni/main.cpp` to call the new attacher after the splice succeeds.
+- Updating `src/cni/main.cpp` to wait for the pinned program before invoking the splice, and `src/cni/splice_executor.cpp` to call the new attacher inside its existing proxy-netns scope.
 - Updating the architecture doc (sections 2.6 and 8) and the test surface.
 
 Out of scope:
@@ -59,7 +59,7 @@ The CNI plugin **never** loads the program and never writes either map. On each 
 
 Step 3 is mandatory: the splice (`src/cni/splice_executor.cpp:534`) calls `MoveLinkToNetns(plan.wan_name, proxy_netns_fd)` before returning, so by the time the attach runs `wan_<hash>` lives in the proxy netns and is invisible to a netlink call from the host root netns. The pin path itself is on the host filesystem and is reachable from any netns, so `bpf_obj_get` happens before the netns entry; the program fd, once obtained, remains valid across the netns switch.
 
-The cleanest place to run the attach is **inside the splice itself**: `SpliceExecutor::ExecuteSplice` already opens a `ScopedNetns::Enter(netns_paths.proxy)` block (`splice_executor.cpp:545`+) for proxy-side address and link-up work; the TC attach is added as the final step in that block, immediately after `SetLinkUp(plan.wan_name)`. This avoids re-entering the proxy netns from `cni/main.cpp` and keeps "create interface, attach BPF" atomic in one process.
+The cleanest place to run the attach is **inside the splice itself**: `SpliceExecutor::ExecuteSplice` already opens a `ScopedNetns::Enter(netns_paths.proxy)` block (`splice_executor.cpp:545`+) for proxy-side address and link-up work. The TC attach is added inside that block, after the wan-side address/up has succeeded. Today the wan address, wan link-up, and the lan/peer veth creation are chained into one `if (!A || !B || !C)` (`splice_executor.cpp:552-558`); implementing this design requires splitting that compound condition so the attach can run between "wan link is up" and the lan/peer work. This avoids re-entering the proxy netns from `cni/main.cpp` and keeps "create interface, attach BPF" atomic in one process.
 
 The CNI binary therefore needs nothing of the BPF skeleton, the embedded `.bpf.o`, or libbpf. A raw `syscall(SYS_bpf, BPF_OBJ_GET, …)` plus the existing netlink TC machinery is sufficient.
 
@@ -78,7 +78,7 @@ Rejected alternatives:
 
 ### 4. Aggressive removal of `InterfaceRegistry` and `StateReconciler`
 
-Both files exist to drive BPF attach/detach from observed interface state. With BPF attach moved to CNI, neither has a job. Both are deleted, along with their tests. The proxy stops watching `/var/run/inline-proxy-cni/*` entirely; it boots, sets up BPF state once, and then runs only the listener. The `/admin/state` endpoint loses its wan/lan name list. (If a future need for that listing arises, the state files are still there and can be read directly.)
+Both files exist to drive BPF attach/detach from observed interface state. With BPF attach moved to CNI, neither has a job. Both are deleted, along with their tests. The proxy stops watching `/var/run/inline-proxy-cni/*` entirely; it boots, sets up BPF state once, and then runs only the listener. The `/interfaces` admin endpoint, whose body is currently `InterfaceRegistry::SummaryText()`, is removed entirely. (If a future need for that listing arises, the state files under `/var/run/inline-proxy-cni/*` are still there and can be read directly.) The remaining admin endpoints (`/healthz`, `/readyz`, `/metrics`, `/sessions`) are unchanged.
 
 The session counter is already held by `ProxyState` (`active_sessions_`, with `increment_sessions()` / `decrement_sessions()`). Today it is double-bookkept: `InterfaceRegistry::IncrementSessions()` and `ProxyState::increment_sessions()` are called together at the same call site. The work is to delete the `InterfaceRegistry` copy and its call sites, leaving the existing `ProxyState` counter as the sole source of truth.
 
@@ -111,17 +111,17 @@ The listener_map is a `BPF_MAP_TYPE_SOCKMAP`. Inserting an fd into a sockmap req
 │  netns: inline-proxy-system   │         │   runs on host, root netns │
 ├───────────────────────────────┤         ├────────────────────────────┤
 │ Startup:                      │         │ ADD (per pod):             │
-│   1. bind listener            │         │   1. existing splice work  │
-│   2. skel.open + skel.load    │         │   2. wait≤30s for pinned   │
-│   3. mkdir pin dir            │         │      prog                  │
-│   4. pin prog + config_map    │         │   3. bpf_obj_get(prog)     │
-│      + listener_map           │         │   4. ensure clsact qdisc   │
-│      (or open existing pin    │         │   5. tc filter add ingress │
-│      if tag matches)          │         │      with prog fd          │
-│   5. write config_map[0]      │         │ DEL: nothing BPF-related   │
-│   6. write listener_map[0]    │         │      (interface delete     │
-│   7. mark /readyz             │         │      drops qdisc/filter)   │
-│ Run: accept loop              │         │                            │
+│   1. bind+listen on listener  │         │   1. wait≤30s for pinned   │
+│   2. skel.open + skel.load    │         │      prog                  │
+│   3. mkdir pin dir            │         │   2. bpf_obj_get(prog)     │
+│   4. pin prog + config_map    │         │   3. run splice; inside    │
+│      + listener_map           │         │      its proxy-netns scope:│
+│      (or open existing pin    │         │      ensure clsact + tc    │
+│      if tag matches)          │         │      filter add on         │
+│   5. write config_map[0]      │         │      wan_<hash>            │
+│   6. write listener_map[0]    │         │ DEL: nothing BPF-related   │
+│   7. mark /readyz             │         │      (interface delete     │
+│ Run: accept loop              │         │      drops qdisc/filter)   │
 │ Shutdown: leave pins alone    │         │                            │
 └───────────────────────────────┘         └────────────────────────────┘
               │                                          │
@@ -197,8 +197,8 @@ The TC netlink helpers (`MakeTcRequest`, `EnsureClsactQdisc`, `AttachIngressFilt
 ### Files modified
 
 - `src/proxy/main.cpp`, `src/proxy/config.cpp`: new boot sequence (bind+listen → load+pin → write maps → accept loop). No interface watcher. Drop `registry.IncrementSessions()` / `registry.DecrementSessions()` call sites; the parallel `proxy_state.increment_sessions()` / `decrement_sessions()` calls already cover the bookkeeping.
-- `src/proxy/admin_http.{hpp,cpp}`: drop the `InterfaceRegistry&` constructor parameter and the `interface_registry.hpp` include. Drop the wan/lan name list from `/admin/state`; the session counter from `proxy_state` is unchanged.
-- `src/cni/splice_executor.{hpp,cpp}`: in `ExecuteSplice`, inside the existing proxy-netns scope, add the TC attach call after `SetLinkUp(plan.wan_name)`. Add a `TcAttacher` collaborator (constructed with the pin dir) — either as a member, a constructor argument, or `CniExecutionOptions` field for test injection.
+- `src/proxy/admin_http.{hpp,cpp}`: drop the `InterfaceRegistry&` constructor parameter and the `interface_registry.hpp` include. Remove the `/interfaces` endpoint handler (the only consumer of the registry). The remaining endpoints (`/healthz`, `/readyz`, `/metrics`, `/sessions`) are unchanged.
+- `src/cni/splice_executor.{hpp,cpp}`: in `ExecuteSplice`, inside the existing proxy-netns scope, split the compound `if (AddInterfaceAddress(wan) || SetLinkUp(wan) || CreateVethPair(lan,peer))` so a TC attach call can run between wan link-up and the lan/peer veth creation. Add a `TcAttacher` collaborator as a `CniExecutionOptions` field — matching the existing `splice_runner` injection-seam pattern, so tests can substitute a stub.
 - `src/cni/main.cpp`: before invoking the splice, call `TcAttacher::WaitForPinnedProg` so we fail early if the proxy isn't up. Splice itself runs the attach.
 - `src/bpf/BUILD.bazel`: split `:loader` into `:loader` (proxy, depends on skeleton) and `:tc_attach` (CNI, no skeleton dep).
 - `src/cni/BUILD.bazel`: `:cni_splice` adds a dep on `//src/bpf:tc_attach`.
@@ -337,7 +337,7 @@ There is no explicit BPF rollback step: if `tc filter add` failed, nothing is at
 
 - Existing `attach-ingress ok` / `attach-ingress failed` log lines move from the proxy to the CNI binary (visible in kubelet/CNI debug logs).
 - Proxy gains startup logs: `bpf-pin loaded`, `bpf-pin reused (tag match)`, `bpf-pin replaced (tag mismatch)`, `listener_fd written = N`.
-- `/admin/state` returns: pin existence, `config_map[0]` contents, `listener_map[0]` value (or "unset"), and the session counter.
+- No new admin endpoints. (`/interfaces` is removed; if a future need arises to expose BPF state via HTTP, that's a separate change.)
 
 ## Testing
 
