@@ -4,6 +4,8 @@
 #include <string>
 #include <string_view>
 
+#include "shared/scoped_fd.hpp"
+
 namespace inline_proxy {
 
 // CNI-side helper for attaching the inline-proxy TC ingress program to a
@@ -31,7 +33,7 @@ public:
     const std::string& pin_dir() const noexcept { return pin_dir_; }
 
 private:
-    int OpenPinnedProg() const;            // returns fd or -1
+    ScopedFd OpenPinnedProg() const;       // valid() false on failure
     bool EnsureClsact(unsigned int ifindex) const;
     bool AttachIngressFilter(unsigned int ifindex, int prog_fd) const;
 

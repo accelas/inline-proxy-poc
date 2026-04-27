@@ -89,14 +89,14 @@ bool TcAttacher::WaitForPinnedProg(std::chrono::seconds timeout) {
     }
 }
 
-int TcAttacher::OpenPinnedProg() const {
+ScopedFd TcAttacher::OpenPinnedProg() const {
     const std::string prog_path = pin_dir_ + "/prog";
     const int fd = BpfObjGet(prog_path);
     if (fd < 0) {
         std::cerr << "tc_attach: bpf_obj_get failed path=" << prog_path
                   << " errno=" << errno << '\n';
     }
-    return fd;
+    return ScopedFd(fd);
 }
 
 bool TcAttacher::EnsureClsact(unsigned int ifindex) const {
@@ -142,12 +142,11 @@ bool TcAttacher::AttachToInterface(std::string_view ifname) {
         return false;
     }
 
-    const int prog_fd = OpenPinnedProg();
-    if (prog_fd < 0) return false;
+    auto prog_fd = OpenPinnedProg();
+    if (prog_fd.get() < 0) return false;
 
     const bool ok = EnsureClsact(*ifindex) &&
-                    AttachIngressFilter(*ifindex, prog_fd);
-    ::close(prog_fd);
+                    AttachIngressFilter(*ifindex, prog_fd.get());
 
     if (ok) {
         std::cerr << "tc_attach ok iface=" << name << " ifindex=" << *ifindex << '\n';
