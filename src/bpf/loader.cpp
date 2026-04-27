@@ -1,5 +1,6 @@
 #include "bpf/loader.hpp"
 
+#include "bpf/ingress_redirect_common.h"
 #include "bpf/ingress_redirect_skel.skel.h"
 #include "shared/scoped_fd.hpp"
 
@@ -221,7 +222,6 @@ bool BpfLoader::WriteConfig(std::uint32_t listener_port, std::uint32_t skb_mark)
     cfg.enabled = 1;
     cfg.listener_port = listener_port;
     cfg.skb_mark = skb_mark;
-    runtime_config_ = cfg;
 
     const std::uint32_t key = 0;
     union bpf_attr a{};

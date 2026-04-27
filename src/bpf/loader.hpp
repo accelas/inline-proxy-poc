@@ -6,7 +6,6 @@
 #include <string>
 #include <string_view>
 
-#include "bpf/ingress_redirect_common.h"
 #include "shared/scoped_fd.hpp"
 
 // Forward declaration of the bpftool-generated skeleton struct; the
@@ -80,7 +79,6 @@ private:
 
     ScopedFd config_map_fd_;
     ScopedFd listener_map_fd_;
-    IngressRedirectConfig runtime_config_{};
     struct ingress_redirect_skel* skel_ = nullptr;
 };
 
