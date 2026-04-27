@@ -1,0 +1,41 @@
+#pragma once
+
+#include <chrono>
+#include <string>
+#include <string_view>
+
+namespace inline_proxy {
+
+// CNI-side helper for attaching the inline-proxy TC ingress program to a
+// named network interface. The program is expected to be pinned at
+// `<pin_dir>/prog` by the proxy daemon at startup; this class only opens
+// the existing pin and runs the netlink TC dance.
+//
+// Caller threading: AttachToInterface uses the *current* thread's netns
+// to resolve the interface and attach. Wan_<hash> lives in the proxy
+// netns by the time the splice's ScopedNetns::Enter block reaches us.
+class TcAttacher {
+public:
+    explicit TcAttacher(std::string pin_dir);
+
+    // Polls <pin_dir>/prog every 200 ms (CLOCK_MONOTONIC) until it
+    // exists or `timeout` elapses. Returns true on success.
+    bool WaitForPinnedProg(std::chrono::seconds timeout);
+
+    // Opens the pinned prog, ensures clsact qdisc on `ifname`, attaches
+    // a TC ingress filter referencing the prog. Idempotent — uses
+    // NLM_F_REPLACE so a re-run on an already-attached interface is
+    // safe.
+    bool AttachToInterface(std::string_view ifname);
+
+    const std::string& pin_dir() const noexcept { return pin_dir_; }
+
+private:
+    int OpenPinnedProg() const;            // returns fd or -1
+    bool EnsureClsact(unsigned int ifindex) const;
+    bool AttachIngressFilter(unsigned int ifindex, int prog_fd) const;
+
+    std::string pin_dir_;
+};
+
+}  // namespace inline_proxy
