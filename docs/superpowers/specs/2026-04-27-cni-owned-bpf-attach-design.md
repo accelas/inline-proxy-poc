@@ -53,8 +53,13 @@ The CNI plugin **never** loads the program and never writes either map. On each 
 
 1. Polls `/sys/fs/bpf/inline-proxy/prog` for up to 30s (200 ms interval) until the file exists.
 2. Calls `bpf(BPF_OBJ_GET, …)` to get a program fd from the pin.
-3. Builds a clsact qdisc on `wan_<hash>` if not already present.
-4. Adds a TC ingress filter pointing at the program fd.
+3. Enters the proxy netns (`ScopedNetns::Enter(netns_paths.proxy)`).
+4. Builds a clsact qdisc on `wan_<hash>` if not already present.
+5. Adds a TC ingress filter pointing at the program fd.
+
+Step 3 is mandatory: the splice (`src/cni/splice_executor.cpp:534`) calls `MoveLinkToNetns(plan.wan_name, proxy_netns_fd)` before returning, so by the time the attach runs `wan_<hash>` lives in the proxy netns and is invisible to a netlink call from the host root netns. The pin path itself is on the host filesystem and is reachable from any netns, so `bpf_obj_get` happens before the netns entry; the program fd, once obtained, remains valid across the netns switch.
+
+The cleanest place to run the attach is **inside the splice itself**: `SpliceExecutor::ExecuteSplice` already opens a `ScopedNetns::Enter(netns_paths.proxy)` block (`splice_executor.cpp:545`+) for proxy-side address and link-up work; the TC attach is added as the final step in that block, immediately after `SetLinkUp(plan.wan_name)`. This avoids re-entering the proxy netns from `cni/main.cpp` and keeps "create interface, attach BPF" atomic in one process.
 
 The CNI binary therefore needs nothing of the BPF skeleton, the embedded `.bpf.o`, or libbpf. A raw `syscall(SYS_bpf, BPF_OBJ_GET, …)` plus the existing netlink TC machinery is sufficient.
 
@@ -64,7 +69,7 @@ The proxy daemonset already mounts `hostPath: /sys/fs/bpf` with `mountPropagatio
 
 ### 3. Bounded poll on CNI startup race
 
-There is no kubelet guarantee that the proxy daemon is `Ready` before another pod's CNI ADD fires on a fresh node. The CNI-side resolution is a bounded poll: 30 seconds, 200 ms cadence, on the existence of `/sys/fs/bpf/inline-proxy/prog`. If the pin never appears, CNI ADD returns an error and kubelet retries on its own schedule.
+There is no kubelet guarantee that the proxy daemon is `Ready` before another pod's CNI ADD fires on a fresh node. The CNI-side resolution is a bounded poll: 30 seconds total elapsed (measured against `CLOCK_MONOTONIC`), 200 ms cadence, on the existence of `/sys/fs/bpf/inline-proxy/prog`. If the pin never appears, CNI ADD returns an error and kubelet retries on its own schedule.
 
 Rejected alternatives:
 - *Fail-fast.* Cleaner code but emits a stream of "failed to setup network" events on every fresh node bringup until the proxy is ready.
@@ -75,7 +80,9 @@ Rejected alternatives:
 
 Both files exist to drive BPF attach/detach from observed interface state. With BPF attach moved to CNI, neither has a job. Both are deleted, along with their tests. The proxy stops watching `/var/run/inline-proxy-cni/*` entirely; it boots, sets up BPF state once, and then runs only the listener. The `/admin/state` endpoint loses its wan/lan name list. (If a future need for that listing arises, the state files are still there and can be read directly.)
 
-The session counter currently held by `InterfaceRegistry` moves to `proxy_state.{hpp,cpp}`.
+The session counter is already held by `ProxyState` (`active_sessions_`, with `increment_sessions()` / `decrement_sessions()`). Today it is double-bookkept: `InterfaceRegistry::IncrementSessions()` and `ProxyState::increment_sessions()` are called together at the same call site. The work is to delete the `InterfaceRegistry` copy and its call sites, leaving the existing `ProxyState` counter as the sole source of truth.
+
+`AdminHttp`'s constructor currently takes `InterfaceRegistry&`. Its signature loses that parameter; `src/proxy/admin_http.{hpp,cpp}` and `tests/admin_http_test.cpp` drop their `interface_registry.hpp` includes.
 
 ### 5. Restart reuses existing pins when the program tag matches
 
@@ -93,6 +100,8 @@ Tag match is the common path for crash-restart and deploy-without-image-change. 
 `listener_map[0]` is similar. Until written, `bpf_map_lookup_elem` returns NULL, the program does not call `bpf_sk_assign`, and packets fall through.
 
 This means the proxy can write the maps whenever it likes during startup as long as both writes complete before it advertises readiness. Order between map writes and pin creation also does not matter, because TC filters created via `bpf_obj_get` only need the program to exist — they do not require map contents.
+
+The listener_map is a `BPF_MAP_TYPE_SOCKMAP`. Inserting an fd into a sockmap requires that the fd be a TCP socket in the `LISTEN` state at the moment of `bpf_map_update_elem`; the kernel rejects non-listening fds. The proxy boot sequence therefore must `bind()` and `listen()` on the transparent listener *before* the `WriteListenerFd` call.
 
 ## Architecture
 
@@ -154,7 +163,13 @@ class TcAttacher {
 public:
     explicit TcAttacher(std::string pin_dir);
 
+    // Polls /<pin_dir>/prog for up to `timeout` (CLOCK_MONOTONIC).
+    // Called from cni/main.cpp at the top of ADD, before the splice runs.
     bool WaitForPinnedProg(std::chrono::seconds timeout);
+
+    // Resolves ifindex by name in the *current* netns, ensures clsact,
+    // attaches a TC ingress filter referencing the pinned prog. Caller
+    // must already be inside the netns containing `ifname`.
     bool AttachToInterface(std::string_view ifname);
 
 private:
@@ -168,6 +183,8 @@ private:
 
 The TC netlink helpers (`MakeTcRequest`, `EnsureClsactQdisc`, `AttachIngressFilter`, `RemoveIngressFilter`) move from `loader.cpp` to `tc_attach.cpp` essentially unchanged.
 
+`AttachToInterface` is called by `SpliceExecutor::ExecuteSplice` from inside the existing `ScopedNetns::Enter(netns_paths.proxy)` block, immediately after `SetLinkUp(plan.wan_name)`. `WaitForPinnedProg` is called once per CNI ADD by `cni/main.cpp` before invoking the splice — failing fast if the proxy is not yet ready, before any veths or routes have been created.
+
 ### Files deleted
 
 - `src/proxy/interface_registry.hpp`
@@ -175,18 +192,18 @@ The TC netlink helpers (`MakeTcRequest`, `EnsureClsactQdisc`, `AttachIngressFilt
 - `src/proxy/state_reconciler.hpp`
 - `src/proxy/state_reconciler.cpp`
 - `tests/interface_registry_test.cpp`
-- (the StateReconciler-specific tests, if any, are folded into the deletion)
+- `tests/state_reconciler_test.cpp`
 
 ### Files modified
 
-- `src/proxy/main.cpp`, `src/proxy/config.cpp`: new boot sequence (bind → load+pin → write maps → accept loop). No interface watcher.
-- `src/proxy/admin_http.cpp`: drop the wan/lan name list from `/admin/state`. Keep the session counter (now held in `proxy_state`).
-- `src/proxy/proxy_state.{hpp,cpp}`: take ownership of `active_sessions_`.
-- `src/cni/splice_executor.{hpp,cpp}`: surface the resolved `wan_<hash>` name in `CniExecutionResult` so `main.cpp` can hand it to the attacher.
-- `src/cni/main.cpp`: after a successful ADD, call `TcAttacher::WaitForPinnedProg` then `AttachToInterface`.
-- `src/bpf/BUILD.bazel`: split `:loader` into `:loader` (proxy) and `:tc_attach` (CNI); only `:loader` depends on the skeleton.
+- `src/proxy/main.cpp`, `src/proxy/config.cpp`: new boot sequence (bind+listen → load+pin → write maps → accept loop). No interface watcher. Drop `registry.IncrementSessions()` / `registry.DecrementSessions()` call sites; the parallel `proxy_state.increment_sessions()` / `decrement_sessions()` calls already cover the bookkeeping.
+- `src/proxy/admin_http.{hpp,cpp}`: drop the `InterfaceRegistry&` constructor parameter and the `interface_registry.hpp` include. Drop the wan/lan name list from `/admin/state`; the session counter from `proxy_state` is unchanged.
+- `src/cni/splice_executor.{hpp,cpp}`: in `ExecuteSplice`, inside the existing proxy-netns scope, add the TC attach call after `SetLinkUp(plan.wan_name)`. Add a `TcAttacher` collaborator (constructed with the pin dir) — either as a member, a constructor argument, or `CniExecutionOptions` field for test injection.
+- `src/cni/main.cpp`: before invoking the splice, call `TcAttacher::WaitForPinnedProg` so we fail early if the proxy isn't up. Splice itself runs the attach.
+- `src/bpf/BUILD.bazel`: split `:loader` into `:loader` (proxy, depends on skeleton) and `:tc_attach` (CNI, no skeleton dep).
 - `src/cni/BUILD.bazel`: `:cni_splice` adds a dep on `//src/bpf:tc_attach`.
-- `src/proxy/BUILD.bazel`: drop `interface_registry.cpp` and `state_reconciler.cpp`.
+- `src/proxy/BUILD.bazel`: drop `interface_registry.{hpp,cpp}` and `state_reconciler.{hpp,cpp}` from `srcs`/`hdrs`.
+- `tests/BUILD.bazel`: drop the `interface_registry_test` and `state_reconciler_test` targets; add `bpf_attacher_test`; rewrite `bpf_loader_test` accordingly. Remove the `interface_registry.hpp` include from `admin_http_test`.
 - `docs/architecture.md`: rewrite section 2.6 and section 8 to describe the new split.
 
 ## Data flow
@@ -207,10 +224,15 @@ t=1   proxy starts:
         - /readyz green
 t=5   first annotated workload pod scheduled
 t=5.1 kubelet invokes inline_proxy_cni ADD
-        - splice work completes
         - WaitForPinnedProg returns immediately
         - bpf_obj_get(prog) -> prog_fd
-        - clsact + tc filter add on wan_<hash>
+        - splice runs:
+            * create root_wan + wan_<hash> veth pair in root netns
+            * MoveLinkToNetns(wan_<hash>, proxy_netns)
+            * ScopedNetns::Enter(proxy_netns):
+                - addr/up wan_<hash>
+                - clsact + tc filter add ingress on wan_<hash>
+                - rest of proxy-side splice work
         - return success
 t=5.2 first packet on wan_<hash>:
         - TC program reads config_map[0]; enabled=1
@@ -236,8 +258,13 @@ If 30 s elapses with no pin, CNI returns error; kubelet retries CNI ADD on its o
 - old proxy SIGTERM, exits
 - pinned prog/maps survive (refcount held by pin + by attached TC filters)
 - existing TC filters on wan_* keep firing the program
-- listener_map[0] now references closed fd; bpf_sk_assign fails;
-  packets fall to TC_ACT_OK; transient drop window for *new* connections
+- listener_map[0] now references closed fd; bpf_sk_assign returns
+  non-zero and the program returns that non-zero verdict (per
+  ingress_redirect.bpf.c: "return assign_rc == 0 ? TC_ACT_OK : assign_rc").
+  This causes the kernel to drop or shoot the SYN, producing a brief
+  drop window for *new* connections. Established connections continue
+  to flow because the program's primary path (skc_lookup) still finds
+  their established sockets, so it never reaches the listener_map.
 - new proxy starts:
     - bind listener (new fd)
     - skel.open + skel.load -> fresh in-process program
@@ -357,6 +384,5 @@ Both binaries ship together. The daemonset image and the CNI installer image are
 
 None at design time. Implementation choices that may surface during planning:
 
-- Whether the tag query uses `BPF_OBJ_GET_INFO_BY_FD` directly or a libbpf wrapper.
 - Whether `WaitForPinnedProg` should also probe `inotify` for faster wakeup; 200 ms polling is fine but trivially upgradeable later.
 - Whether to compute the embedded program tag once at proxy startup or on every `LoadAndPin` call. Once is sufficient.
