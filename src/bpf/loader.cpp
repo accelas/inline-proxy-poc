@@ -432,4 +432,91 @@ bool BpfLoader::TryReuseExistingPin(
     return true;
 }
 
+bool BpfLoader::LoadAndPin(std::string_view pin_dir) {
+    if (!MakeDirRecursive(pin_dir)) {
+        std::cerr << "LoadAndPin: mkdir " << pin_dir << " failed errno=" << errno << '\n';
+        return false;
+    }
+    pin_dir_ = std::string(pin_dir);
+
+    if (!EnsureSkeletonLoaded()) return false;
+
+    const int fresh_prog_fd = bpf_program__fd(skel_->progs.ingress_redirect);
+    auto fresh_tag = ProgTag(fresh_prog_fd);
+    if (!fresh_tag) {
+        std::cerr << "LoadAndPin: failed to query freshly-loaded prog tag\n";
+        return false;
+    }
+
+    if (TryReuseExistingPin(pin_dir, *fresh_tag)) {
+        ingress_redirect_skel__destroy(skel_);
+        skel_ = nullptr;
+        return true;
+    }
+
+    if (!PinFresh(pin_dir)) {
+        ingress_redirect_skel__destroy(skel_);
+        skel_ = nullptr;
+        return false;
+    }
+    ingress_redirect_skel__destroy(skel_);
+    skel_ = nullptr;
+    return true;
+}
+
+bool BpfLoader::WriteConfig(std::uint32_t listener_port, std::uint32_t skb_mark) {
+    if (config_map_fd_.get() < 0) {
+        std::cerr << "WriteConfig: config_map_fd_ not initialised\n";
+        return false;
+    }
+    IngressRedirectConfig cfg{};
+    cfg.enabled = 1;
+    cfg.listener_port = listener_port;
+    cfg.skb_mark = skb_mark;
+    runtime_config_ = cfg;
+
+    const std::uint32_t key = 0;
+    union bpf_attr a{};
+    std::memset(&a, 0, sizeof(a));
+    a.map_fd = static_cast<__u32>(config_map_fd_.get());
+    a.key = reinterpret_cast<std::uint64_t>(&key);
+    a.value = reinterpret_cast<std::uint64_t>(&cfg);
+    a.flags = BPF_ANY;
+    if (::syscall(SYS_bpf, BPF_MAP_UPDATE_ELEM, &a, sizeof(a)) != 0) {
+        std::cerr << "WriteConfig: BPF_MAP_UPDATE_ELEM failed errno=" << errno << '\n';
+        return false;
+    }
+    return true;
+}
+
+bool BpfLoader::WriteListenerFd(int listener_fd) {
+    if (listener_map_fd_.get() < 0 || listener_fd < 0) {
+        std::cerr << "WriteListenerFd: invalid map fd or listener fd\n";
+        return false;
+    }
+    const std::uint32_t key = 0;
+    const std::uint32_t fd_value = static_cast<std::uint32_t>(listener_fd);
+    union bpf_attr a{};
+    std::memset(&a, 0, sizeof(a));
+    a.map_fd = static_cast<__u32>(listener_map_fd_.get());
+    a.key = reinterpret_cast<std::uint64_t>(&key);
+    a.value = reinterpret_cast<std::uint64_t>(&fd_value);
+    a.flags = BPF_ANY;
+    if (::syscall(SYS_bpf, BPF_MAP_UPDATE_ELEM, &a, sizeof(a)) != 0) {
+        std::cerr << "WriteListenerFd: BPF_MAP_UPDATE_ELEM failed errno=" << errno << '\n';
+        return false;
+    }
+    listener_socket_fd_ = listener_fd;
+    return true;
+}
+
+bool BpfLoader::PinProgForTesting(std::string_view pin_dir) {
+    if (!EnsureSkeletonLoaded()) return false;
+    if (!MakeDirRecursive(pin_dir)) return false;
+    const std::string path = std::string(pin_dir) + "/prog";
+    ::unlink(path.c_str());
+    return bpf_obj_pin(bpf_program__fd(skel_->progs.ingress_redirect),
+                       path.c_str()) == 0;
+}
+
 }  // namespace inline_proxy
