@@ -106,17 +106,25 @@ the pod — leave through `wan_<hash>` back toward the node, exactly
 mirroring the ingress path. Return packets to the pod IP end up back
 on `lan_<hash>` and into the workload namespace.
 
-### 2.6 Attaches the TC-ingress BPF program on `wan_<hash>`
+### 2.6 Loads and pins the BPF program (proxy DS pod CNI), attaches it (service pod CNI)
 
-The BPF program is loaded once per node by the proxy daemon at
-startup and pinned at `/sys/fs/bpf/inline-proxy/{prog,config_map,listener_map}`.
+The BPF program is loaded and pinned by the CNI plugin during the
+proxy DS pod's CNI ADD. Pins live at
+`/sys/fs/bpf/inline-proxy/{prog,config_map,listener_map}`.
 
-When the CNI plugin creates the `wan_<hash>` interface and moves it
-into the proxy netns, it then enters the proxy netns and attaches the
-pinned program as a TC ingress filter on `wan_<hash>` before
-returning. The proxy daemon never watches interfaces and never runs
-TC netlink calls; it only writes `config_map[0]` (port, mark) and
-`listener_map[0]` (its listener fd) once at startup.
+When the proxy daemon container subsequently boots inside that pod,
+it opens the already-pinned `config_map` and `listener_map` and
+writes `config_map[0]` (port, mark) and `listener_map[0]` (its
+listener fd). The proxy daemon never loads the skeleton, never pins,
+and never runs TC netlink calls.
+
+When a service pod is admitted, the same CNI plugin (running for that
+pod's ADD) creates the `wan_<hash>` interface, moves it into the
+proxy netns, and inside that netns attaches the pinned program as a
+TC ingress filter. The pin is guaranteed to exist because kubelet
+admits the proxy DS pod first (system-node-critical priority) and
+serialises CNI invocations per node, so the proxy DS pod's CNI ADD
+always completes before any service pod's CNI ADD begins.
 
 The BPF program redirects matching TCP flows to the listener via
 `bpf_sk_assign`, preserving the original dst via SO_ORIGINAL_DST.
@@ -260,37 +268,35 @@ delivers return packets back to the proxy.
 
 ## 8. Interface contract with the daemon
 
-The proxy daemon does not watch interfaces. At startup it:
+The proxy daemon does not load BPF, pin maps, or watch interfaces.
+At startup it:
 
 1. Binds and listens on the transparent listener.
-2. Loads the embedded BPF skeleton and pins prog/config_map/
-   listener_map under `/sys/fs/bpf/inline-proxy/` (replacing any
-   existing pins from a prior process).
+2. Opens the existing pinned `config_map` and `listener_map` at
+   `/sys/fs/bpf/inline-proxy/` (created by its own pod's CNI ADD).
 3. Writes `config_map[0] = {enabled, listener_port, skb_mark}`.
 4. Writes `listener_map[0] = listener_fd`.
 5. Marks `/readyz` green.
 
-The CNI plugin attaches the program. On every ADD it polls the
-pinned `prog` file (up to 30s) before invoking the splice, then —
-inside the splice's proxy-netns scope, after `wan_<hash>` has been
-addressed and brought up — opens the pin via `bpf_obj_get` and runs
-the TC ingress attach via netlink.
+The CNI plugin owns the BPF lifecycle:
 
-CNI DEL is a no-op for BPF: removing `wan_<hash>` drops its qdisc
-and filter automatically.
+- **Proxy DS pod ADD:** loads the embedded BPF skeleton and pins
+  prog/config_map/listener_map. On a binary upgrade (tag mismatch)
+  the existing pins are replaced; on a same-binary restart the
+  existing pins are reused so already-attached TC filters keep
+  reading from the same kernel maps the new proxy daemon will write
+  to.
+- **Service pod ADD:** opens the prog pin (guaranteed to exist),
+  creates `wan_<hash>`, moves it into the proxy netns, and runs
+  `tc filter add ingress` referencing the prog.
+- **CNI DEL:** no-op for BPF — removing `wan_<hash>` drops its
+  qdisc and filter automatically.
 
-If the proxy restarts:
-
-- Existing pins keep the program/maps alive in the kernel.
-- The new proxy loads the embedded skeleton, queries the pinned
-  program's tag, and — when the tags match (the common case for
-  crash-restart of the same binary) — reuses the existing pinned
-  program and maps. Already-attached TC filters on `wan_*` interfaces
-  continue to read from and write to the same maps the new proxy now
-  writes to, so existing pods keep being intercepted.
-- On a binary upgrade the tag differs, the old pins are replaced,
-  and new TC attaches reference the new program; existing filters
-  keep running the old program until their interfaces are deleted.
+If the proxy daemon container restarts inside an existing pod (no
+new CNI ADD), the pinned maps persist; the new container opens them
+and overwrites `listener_map[0]` with its new listener fd. Already-
+attached TC filters continue reading from the same maps, so existing
+pods see no interception gap.
 
 The pin path `/sys/fs/bpf/inline-proxy/` is on host bpffs (mounted
 into the proxy pod via hostPath with bidirectional propagation). CNI

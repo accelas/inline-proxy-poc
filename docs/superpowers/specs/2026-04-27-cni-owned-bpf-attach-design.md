@@ -3,6 +3,24 @@
 Date: 2026-04-27
 Status: approved design, ready for implementation planning
 
+## Revision: 2026-04-27 (post-review)
+
+Decisions §1 and §3 below were superseded after implementation review.
+The implemented design moves `LoadAndPin` from the proxy daemon's
+startup into the CNI plugin's invocation for the proxy DS pod
+(detected via `IsProxyPod()`). This eliminates the cold-node race
+and the `WaitForPinnedProg` poll entirely, because kubelet admits
+the proxy DS pod first (system-node-critical) and serialises CNI
+calls. The proxy daemon now opens the already-pinned maps via
+`BpfLoader::OpenExistingPin` and writes config + listener fd.
+
+Trade-off accepted: the CNI binary picks up the libbpf dependency and
+the embedded skeleton, growing it from "tiny" to "moderate." The
+"CNI is libbpf-free" property is no longer maintained.
+
+`docs/architecture.md` sections 2.6 and 8 reflect the implemented
+design.
+
 ## Goal
 
 Move the TC-ingress BPF program's **load and attach** out of the proxy daemon and into the CNI plugin. The proxy keeps responsibility for **loading the program once at startup, pinning it, and writing the maps** — but stops owning per-interface attach state. The CNI plugin opens the pinned program by path and calls `tc filter add` itself when it creates each `wan_<hash>` interface.
