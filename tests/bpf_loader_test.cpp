@@ -1,10 +1,20 @@
 #include <gtest/gtest.h>
 
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <netinet/in.h>
+#include <string>
 #include <sys/socket.h>
+#include <sys/syscall.h>
 #include <unistd.h>
 
+#include <bpf/bpf.h>
+#include <linux/bpf.h>
+
+#include "bpf/ingress_redirect_common.h"
 #include "bpf/loader.hpp"
 
 TEST(BpfLoaderTest, RejectsMissingInterfaceName) {
@@ -72,4 +82,119 @@ TEST(BpfLoaderTest, LoadsSkeleton) {
     }
     inline_proxy::BpfLoader loader;
     EXPECT_TRUE(loader.LoadProgramForTesting());
+}
+
+namespace {
+
+std::string MakeTempPinDir() {
+    std::string dir = "/sys/fs/bpf/bpf-loader-test-" +
+                      std::to_string(::getpid()) + "-" +
+                      std::to_string(std::rand());
+    std::filesystem::create_directories(dir);
+    return dir;
+}
+
+}  // namespace
+
+TEST(BpfLoaderTest, LoadAndPinCreatesPins) {
+    if (::geteuid() != 0) GTEST_SKIP() << "Requires root / CAP_BPF";
+    const auto dir = MakeTempPinDir();
+    inline_proxy::BpfLoader loader;
+    EXPECT_TRUE(loader.LoadAndPin(dir));
+    EXPECT_TRUE(std::filesystem::exists(dir + "/prog"));
+    EXPECT_TRUE(std::filesystem::exists(dir + "/config_map"));
+    EXPECT_TRUE(std::filesystem::exists(dir + "/listener_map"));
+    std::filesystem::remove_all(dir);
+}
+
+TEST(BpfLoaderTest, LoadAndPinIsIdempotent) {
+    if (::geteuid() != 0) GTEST_SKIP() << "Requires root / CAP_BPF";
+    const auto dir = MakeTempPinDir();
+    {
+        inline_proxy::BpfLoader loader;
+        EXPECT_TRUE(loader.LoadAndPin(dir));
+    }
+    {
+        inline_proxy::BpfLoader loader;
+        EXPECT_TRUE(loader.LoadAndPin(dir));
+        EXPECT_TRUE(std::filesystem::exists(dir + "/prog"));
+    }
+    std::filesystem::remove_all(dir);
+}
+
+TEST(BpfLoaderTest, LoadAndPinReusesPinOnTagMatch) {
+    if (::geteuid() != 0) GTEST_SKIP() << "Requires root / CAP_BPF";
+    const auto dir = MakeTempPinDir();
+    auto read_prog_id = [&](const std::string& prog_path) -> std::uint32_t {
+        union bpf_attr a{};
+        std::memset(&a, 0, sizeof(a));
+        a.pathname = reinterpret_cast<__u64>(prog_path.c_str());
+        int fd = static_cast<int>(::syscall(SYS_bpf, BPF_OBJ_GET, &a, sizeof(a)));
+        if (fd < 0) return 0;
+        struct bpf_prog_info info{};
+        std::memset(&info, 0, sizeof(info));
+        std::uint32_t info_len = sizeof(info);
+        if (bpf_obj_get_info_by_fd(fd, &info, &info_len) != 0) {
+            ::close(fd);
+            return 0;
+        }
+        ::close(fd);
+        return info.id;
+    };
+
+    inline_proxy::BpfLoader first;
+    ASSERT_TRUE(first.LoadAndPin(dir));
+    const std::uint32_t first_id = read_prog_id(dir + "/prog");
+    ASSERT_NE(first_id, 0u);
+
+    inline_proxy::BpfLoader second;
+    ASSERT_TRUE(second.LoadAndPin(dir));
+    const std::uint32_t second_id = read_prog_id(dir + "/prog");
+    EXPECT_EQ(first_id, second_id) << "tag-match reuse should keep prog id stable";
+    std::filesystem::remove_all(dir);
+}
+
+TEST(BpfLoaderTest, WriteConfigPopulatesConfigMap) {
+    if (::geteuid() != 0) GTEST_SKIP() << "Requires root / CAP_BPF";
+    const auto dir = MakeTempPinDir();
+    inline_proxy::BpfLoader loader;
+    ASSERT_TRUE(loader.LoadAndPin(dir));
+    EXPECT_TRUE(loader.WriteConfig(15001, 0x100));
+    union bpf_attr get_attr{};
+    std::memset(&get_attr, 0, sizeof(get_attr));
+    const std::string map_path = dir + "/config_map";
+    get_attr.pathname = reinterpret_cast<__u64>(map_path.c_str());
+    int map_fd = static_cast<int>(::syscall(SYS_bpf, BPF_OBJ_GET, &get_attr, sizeof(get_attr)));
+    ASSERT_GE(map_fd, 0);
+    IngressRedirectConfig cfg{};
+    union bpf_attr lookup_attr{};
+    std::memset(&lookup_attr, 0, sizeof(lookup_attr));
+    std::uint32_t key = 0;
+    lookup_attr.map_fd = static_cast<__u32>(map_fd);
+    lookup_attr.key = reinterpret_cast<__u64>(&key);
+    lookup_attr.value = reinterpret_cast<__u64>(&cfg);
+    ASSERT_EQ(::syscall(SYS_bpf, BPF_MAP_LOOKUP_ELEM, &lookup_attr, sizeof(lookup_attr)), 0);
+    EXPECT_EQ(cfg.enabled, 1);
+    EXPECT_EQ(cfg.listener_port, 15001u);
+    EXPECT_EQ(cfg.skb_mark, 0x100u);
+    ::close(map_fd);
+    std::filesystem::remove_all(dir);
+}
+
+TEST(BpfLoaderTest, WriteListenerFdAcceptsListeningSocket) {
+    if (::geteuid() != 0) GTEST_SKIP() << "Requires root / CAP_BPF";
+    const auto dir = MakeTempPinDir();
+    inline_proxy::BpfLoader loader;
+    ASSERT_TRUE(loader.LoadAndPin(dir));
+    const int sock = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    ASSERT_GE(sock, 0);
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = 0;
+    ASSERT_EQ(::bind(sock, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)), 0);
+    ASSERT_EQ(::listen(sock, 16), 0);
+    EXPECT_TRUE(loader.WriteListenerFd(sock));
+    ::close(sock);
+    std::filesystem::remove_all(dir);
 }
