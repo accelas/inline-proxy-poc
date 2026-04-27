@@ -6,7 +6,6 @@
 #include <string>
 
 #include "bpf/loader.hpp"
-#include "proxy/interface_registry.hpp"
 #include "shared/netns.hpp"
 
 namespace inline_proxy {

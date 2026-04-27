@@ -206,6 +206,7 @@ cc_library(
     hdrs = ["fd_netns_harness.hpp"],
     deps = [
         "//src/bpf:loader",
+        "//src/bpf:tc_attach",
         "//src/proxy:proxy",
         "//src/shared:shared",
     ],
