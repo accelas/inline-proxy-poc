@@ -1,4 +1,3 @@
-#include <chrono>
 #include <cstdlib>
 #include <iostream>
 #include <optional>
@@ -6,7 +5,6 @@
 #include <string>
 #include <string_view>
 
-#include "bpf/tc_attach.hpp"
 #include "cni/cni_args.hpp"
 #include "cni/k8s_client.hpp"
 #include "cni/splice_executor.hpp"
@@ -105,13 +103,6 @@ int main() {
         invocation.request = *request;
 
         const auto proxy_pod = inline_proxy::FindNodeLocalProxyPod(workload_pod.node_name);
-
-        inline_proxy::TcAttacher pin_waiter("/sys/fs/bpf/inline-proxy");
-        if (!pin_waiter.WaitForPinnedProg(std::chrono::seconds(30))) {
-            std::cerr << "inline-proxy CNI: timed out waiting for pinned BPF program; "
-                         "is the proxy daemon running?\n";
-            return 1;
-        }
 
         const auto result = executor.HandleAdd(invocation, workload_pod, proxy_pod);
         if (!result.success) {
