@@ -54,6 +54,7 @@ cc_library(
         ":cni_parser",
         ":cni_types",
         ":k8s_client",
+        "//src/bpf:tc_attach",
         "//src/shared:shared",
     ],
     include_prefix = "cni",

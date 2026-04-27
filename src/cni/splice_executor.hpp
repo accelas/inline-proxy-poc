@@ -2,10 +2,12 @@
 
 #include <filesystem>
 #include <functional>
+#include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
 
+#include "bpf/tc_attach.hpp"
 #include "cni/cni_types.hpp"
 #include "cni/splice_plan.hpp"
 
@@ -26,6 +28,10 @@ struct CniExecutionOptions {
                        const std::filesystem::path&,
                        const std::filesystem::path&)>
         splice_runner;
+    // Injected so tests can substitute a stub. Default-constructed by
+    // SpliceExecutor's constructor when the caller doesn't provide one,
+    // pointing at /sys/fs/bpf/inline-proxy.
+    std::shared_ptr<TcAttacher> tc_attacher;
 };
 
 struct CniExecutionResult {

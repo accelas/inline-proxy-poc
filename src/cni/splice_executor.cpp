@@ -316,7 +316,13 @@ StateFields BuildStateFields(const SplicePlan& plan,
 
 }  // namespace
 
-SpliceExecutor::SpliceExecutor(CniExecutionOptions options) : options_(std::move(options)) {}
+SpliceExecutor::SpliceExecutor(CniExecutionOptions options)
+    : options_(std::move(options)) {
+    if (!options_.tc_attacher) {
+        options_.tc_attacher =
+            std::make_shared<TcAttacher>("/sys/fs/bpf/inline-proxy");
+    }
+}
 
 std::filesystem::path SpliceExecutor::StatePathForContainerId(std::string_view container_id) const {
     return BuildSplicePlan(container_id, "eth0", options_.state_root).state_path;
