@@ -32,6 +32,16 @@ struct CniExecutionOptions {
     // SpliceExecutor's constructor when the caller doesn't provide one,
     // pointing at /sys/fs/bpf/inline-proxy.
     std::shared_ptr<TcAttacher> tc_attacher;
+
+    // Invoked when the workload being admitted IS the proxy DS pod
+    // (IsProxyPod() matches). Default-initialised by SpliceExecutor's
+    // ctor to a callable that drives BpfLoader::LoadAndPin against the
+    // pin dir; tests can substitute a stub.
+    std::function<bool(std::string_view pin_dir)> proxy_pod_pinner;
+
+    // Pin dir used by the default proxy_pod_pinner. Tests typically
+    // override this to a temp dir.
+    std::string pin_dir = "/sys/fs/bpf/inline-proxy";
 };
 
 struct CniExecutionResult {

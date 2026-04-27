@@ -14,6 +14,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include "bpf/loader.hpp"
 #include "cni/netns_resolver.hpp"
 #include "cni/yajl_parser.hpp"
 #include "shared/netlink.hpp"
@@ -319,8 +320,13 @@ StateFields BuildStateFields(const SplicePlan& plan,
 SpliceExecutor::SpliceExecutor(CniExecutionOptions options)
     : options_(std::move(options)) {
     if (!options_.tc_attacher) {
-        options_.tc_attacher =
-            std::make_shared<TcAttacher>("/sys/fs/bpf/inline-proxy");
+        options_.tc_attacher = std::make_shared<TcAttacher>(options_.pin_dir);
+    }
+    if (!options_.proxy_pod_pinner) {
+        options_.proxy_pod_pinner = [](std::string_view pin_dir) {
+            BpfLoader loader;
+            return loader.LoadAndPin(pin_dir);
+        };
     }
 }
 
@@ -335,6 +341,10 @@ CniExecutionResult SpliceExecutor::HandleAdd(const CniInvocation& invocation,
     result.stdout_json = RenderPrevResultJson(invocation.request);
 
     if (IsProxyPod(workload_pod)) {
+        if (!options_.proxy_pod_pinner(options_.pin_dir)) {
+            result.stderr_text = "failed to LoadAndPin BPF program for proxy DS pod";
+            return result;
+        }
         result.success = true;
         return result;
     }
