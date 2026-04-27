@@ -5,16 +5,19 @@
 #include "shared/netlink_builder.hpp"
 #include "shared/scoped_fd.hpp"
 
+#include <array>
 #include <cerrno>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <iostream>
 #include <optional>
 #include <set>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <utility>
 #include <vector>
 
@@ -28,6 +31,8 @@
 #include <linux/rtnetlink.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/syscall.h>
 #include <unistd.h>
 
 namespace inline_proxy {
@@ -304,6 +309,127 @@ bool BpfLoader::IsIngressAttached(std::string_view interface_name) const {
 
 bool BpfLoader::LoadProgramForTesting() {
     return EnsureSkeletonLoaded();
+}
+
+namespace {
+
+bool MakeDirRecursive(std::string_view path) {
+    std::error_code ec;
+    std::filesystem::create_directories(std::string(path), ec);
+    return !ec;
+}
+
+}  // namespace
+
+void BpfLoader::UnlinkAllPins(std::string_view pin_dir) {
+    const std::string dir(pin_dir);
+    for (const char* name : {"prog", "config_map", "listener_map"}) {
+        const std::string path = dir + "/" + name;
+        if (::unlink(path.c_str()) != 0 && errno != ENOENT) {
+            std::cerr << "BpfLoader::UnlinkAllPins unlink failed path=" << path
+                      << " errno=" << errno << '\n';
+        }
+    }
+}
+
+std::optional<std::array<std::uint8_t, 8>> BpfLoader::ProgTag(int prog_fd) {
+    struct bpf_prog_info info{};
+    std::memset(&info, 0, sizeof(info));
+    std::uint32_t info_len = sizeof(info);
+    if (bpf_obj_get_info_by_fd(prog_fd, &info, &info_len) != 0) {
+        std::cerr << "bpf_obj_get_info_by_fd failed errno=" << errno << '\n';
+        return std::nullopt;
+    }
+    std::array<std::uint8_t, 8> tag{};
+    static_assert(sizeof(info.tag) == tag.size(),
+                  "bpf_prog_info::tag size mismatch");
+    std::memcpy(tag.data(), info.tag, tag.size());
+    return tag;
+}
+
+bool BpfLoader::PinFresh(std::string_view pin_dir) {
+    if (skel_ == nullptr) return false;
+    const std::string dir(pin_dir);
+
+    UnlinkAllPins(pin_dir);
+
+    auto pin_one = [&](const std::string& name, int fd) -> bool {
+        const std::string path = dir + "/" + name;
+        if (bpf_obj_pin(fd, path.c_str()) != 0) {
+            std::cerr << "bpf_obj_pin failed path=" << path
+                      << " errno=" << errno << '\n';
+            return false;
+        }
+        return true;
+    };
+
+    if (!pin_one("prog", bpf_program__fd(skel_->progs.ingress_redirect))) return false;
+    if (!pin_one("config_map", bpf_map__fd(skel_->maps.config_map))) return false;
+    if (!pin_one("listener_map", bpf_map__fd(skel_->maps.listener_map))) return false;
+
+    auto bpf_obj_get_path = [](const std::string& path) -> int {
+        union bpf_attr a{};
+        std::memset(&a, 0, sizeof(a));
+        a.pathname = reinterpret_cast<std::uint64_t>(path.c_str());
+        return static_cast<int>(::syscall(SYS_bpf, BPF_OBJ_GET, &a, sizeof(a)));
+    };
+
+    int new_cfg_fd = bpf_obj_get_path(dir + "/config_map");
+    if (new_cfg_fd < 0) {
+        std::cerr << "bpf_obj_get(config_map) failed errno=" << errno << '\n';
+        return false;
+    }
+    int new_listener_fd = bpf_obj_get_path(dir + "/listener_map");
+    if (new_listener_fd < 0) {
+        std::cerr << "bpf_obj_get(listener_map) failed errno=" << errno << '\n';
+        ::close(new_cfg_fd);
+        return false;
+    }
+
+    config_map_fd_ = ScopedFd(new_cfg_fd);
+    listener_map_fd_ = ScopedFd(new_listener_fd);
+    return true;
+}
+
+bool BpfLoader::TryReuseExistingPin(
+    std::string_view pin_dir,
+    const std::array<std::uint8_t, 8>& fresh_tag) {
+    const std::string dir(pin_dir);
+    const std::string prog_path = dir + "/prog";
+    const std::string config_path = dir + "/config_map";
+    const std::string listener_path = dir + "/listener_map";
+
+    auto bpf_obj_get_path = [](const std::string& path) -> int {
+        union bpf_attr a{};
+        std::memset(&a, 0, sizeof(a));
+        a.pathname = reinterpret_cast<std::uint64_t>(path.c_str());
+        return static_cast<int>(::syscall(SYS_bpf, BPF_OBJ_GET, &a, sizeof(a)));
+    };
+
+    const int existing_prog_fd = bpf_obj_get_path(prog_path);
+    if (existing_prog_fd < 0) {
+        return false;
+    }
+    auto existing_tag = ProgTag(existing_prog_fd);
+    ::close(existing_prog_fd);
+    if (!existing_tag) return false;
+    if (*existing_tag != fresh_tag) {
+        std::cerr << "BpfLoader: tag mismatch on existing pin; will replace\n";
+        return false;
+    }
+
+    int cfg_fd = bpf_obj_get_path(config_path);
+    if (cfg_fd < 0) return false;
+    int listener_fd = bpf_obj_get_path(listener_path);
+    if (listener_fd < 0) {
+        ::close(cfg_fd);
+        return false;
+    }
+
+    config_map_fd_ = ScopedFd(cfg_fd);
+    listener_map_fd_ = ScopedFd(listener_fd);
+    std::cerr << "BpfLoader: tag match; reusing existing pin at " << dir << '\n';
+    return true;
 }
 
 }  // namespace inline_proxy
