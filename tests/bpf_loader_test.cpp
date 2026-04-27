@@ -144,6 +144,29 @@ TEST(BpfLoaderTest, WriteConfigPopulatesConfigMap) {
     ::close(map_fd);
 }
 
+TEST(BpfLoaderTest, OpenExistingPinSucceedsWhenPinsExist) {
+    if (::geteuid() != 0) GTEST_SKIP() << "Requires root / CAP_BPF";
+    TempPinDir guard{MakeTempPinDir()};
+    ASSERT_FALSE(guard.path().empty());
+    const auto& dir = guard.path();
+
+    inline_proxy::BpfLoader pinner;
+    ASSERT_TRUE(pinner.LoadAndPin(dir));
+
+    inline_proxy::BpfLoader opener;
+    EXPECT_TRUE(opener.OpenExistingPin(dir));
+    EXPECT_TRUE(opener.WriteConfig(15001, 0x100));
+    EXPECT_TRUE(opener.WriteConfig(15001, 0x100));  // idempotent
+}
+
+TEST(BpfLoaderTest, OpenExistingPinFailsWhenPinsAbsent) {
+    if (::geteuid() != 0) GTEST_SKIP() << "Requires root / CAP_BPF";
+    TempPinDir guard{MakeTempPinDir()};
+    ASSERT_FALSE(guard.path().empty());
+    inline_proxy::BpfLoader opener;
+    EXPECT_FALSE(opener.OpenExistingPin(guard.path()));
+}
+
 TEST(BpfLoaderTest, WriteListenerFdAcceptsListeningSocket) {
     if (::geteuid() != 0) GTEST_SKIP() << "Requires root / CAP_BPF";
     TempPinDir guard{MakeTempPinDir()};
