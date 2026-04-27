@@ -213,6 +213,33 @@ bool BpfLoader::LoadAndPin(std::string_view pin_dir) {
     return true;
 }
 
+bool BpfLoader::OpenExistingPin(std::string_view pin_dir) {
+    const std::string dir(pin_dir);
+    auto bpf_obj_get_path = [](const std::string& path) -> int {
+        union bpf_attr a{};
+        std::memset(&a, 0, sizeof(a));
+        a.pathname = reinterpret_cast<std::uint64_t>(path.c_str());
+        return static_cast<int>(::syscall(SYS_bpf, BPF_OBJ_GET, &a, sizeof(a)));
+    };
+
+    int cfg_fd = bpf_obj_get_path(dir + "/config_map");
+    if (cfg_fd < 0) {
+        std::cerr << "OpenExistingPin: bpf_obj_get(config_map) failed errno=" << errno
+                  << " pin_dir=" << dir << '\n';
+        return false;
+    }
+    int listener_fd = bpf_obj_get_path(dir + "/listener_map");
+    if (listener_fd < 0) {
+        std::cerr << "OpenExistingPin: bpf_obj_get(listener_map) failed errno=" << errno
+                  << " pin_dir=" << dir << '\n';
+        ::close(cfg_fd);
+        return false;
+    }
+    config_map_fd_ = ScopedFd(cfg_fd);
+    listener_map_fd_ = ScopedFd(listener_fd);
+    return true;
+}
+
 bool BpfLoader::WriteConfig(std::uint32_t listener_port, std::uint32_t skb_mark) {
     if (config_map_fd_.get() < 0) {
         std::cerr << "WriteConfig: config_map_fd_ not initialised\n";

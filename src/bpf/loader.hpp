@@ -35,6 +35,13 @@ public:
     // this->listener_map_fd_ hold raw fds usable for map writes.
     bool LoadAndPin(std::string_view pin_dir);
 
+    // Opens existing pinned config_map and listener_map at <pin_dir>.
+    // Both pins must already exist (created by CNI's LoadAndPin during
+    // the proxy DS pod's CNI ADD). On success, populates
+    // config_map_fd_ / listener_map_fd_ for subsequent WriteConfig /
+    // WriteListenerFd calls. Does NOT load the skeleton.
+    bool OpenExistingPin(std::string_view pin_dir);
+
     // Writes config_map[0] = {enabled=1, listener_port, skb_mark}
     // via raw bpf_map_update_elem on config_map_fd_. Safe to call
     // repeatedly. Requires LoadAndPin to have succeeded.
