@@ -499,7 +499,9 @@ Expected: same pass/fail set as `/tmp/cni-bpf-attach-baseline.txt` plus the two 
 
 ## Chunk 2: New `BpfLoader` API alongside the old
 
-**Objective:** Add `LoadAndPin / WriteConfig / WriteListenerFd` to `BpfLoader` without removing `AttachIngress / DetachIngress / IsIngressAttached / ConfigureListenerSocket`. Implement tag-match reuse on existing pins. Add a small `PinProgForTesting` helper used by the chunk-1 integration test. Tests cover the new API; the old API and its tests stay green.
+**Objective:** Add `LoadAndPin / WriteConfig / WriteListenerFd` to `BpfLoader` without removing `AttachIngress / DetachIngress / IsIngressAttached / ConfigureListenerSocket`. Implement tag-match reuse on existing pins (required for correctness — see Decisions §5 in the spec). Add a small `PinProgForTesting` helper used by the chunk-1 integration test. Tests cover the new API; the old API and its tests stay green.
+
+**Why tag-match reuse is correctness-critical, not optimization:** On a proxy restart, already-attached TC filters on `wan_*` interfaces still reference the *old* program by kernel id. The old program reads the *old* config_map and listener_map (kernel-side references baked in at load time). If we replace pins with new maps, the new proxy writes its new listener fd into the *new* listener_map — but the old TC filters read the *old* listener_map, which holds the dead-fd entry. Sockmap auto-removes closed fds, so the old listener_map[0] is empty; lookups return NULL; existing pods stop being intercepted, indefinitely. Reusing the existing pinned maps when tags match means the new proxy writes into the same map the old filters read, restoring interception.
 
 End-of-chunk state: `bazel test //tests:bpf_loader_test //tests:bpf_attacher_test //tests/...` passes; both old and new BpfLoader methods are callable; the chunk-1 `AttachesIngressFilterAgainstDummyInterface` test now passes (no longer skips on root).
 
@@ -508,6 +510,14 @@ End-of-chunk state: `bazel test //tests:bpf_loader_test //tests:bpf_attacher_tes
 **Files:**
 - Modify: `src/bpf/loader.hpp`
 
+The post-Chunk-2 internal model:
+
+- `LoadAndPin` ends with `config_map_fd_` and `listener_map_fd_` populated as raw fds (whether opened from existing pins on tag-match, or freshly loaded+pinned on first-time / tag-mismatch).
+- The libbpf skeleton (`skel_`) is destroyed at the end of `LoadAndPin` regardless of path, because the pins keep the prog/maps alive in the kernel and the raw map fds are independent refs.
+- `WriteConfig` and `WriteListenerFd` use raw `bpf(BPF_MAP_UPDATE_ELEM, ...)` syscalls (or libbpf's thin `bpf_map_update_elem` wrapper) on the stored map fds — never go through `skel_->maps.*`.
+
+This shape is uniform across all three paths (no-existing-pin, tag-match, tag-mismatch) and lets us keep `BpfLoader`'s lifetime simple.
+
 - [ ] **Step 2.1.1: Add the new public methods**
 
 Insert into the public section of `BpfLoader` (between `LoadProgramForTesting` and the `private:` line):
@@ -515,45 +525,75 @@ Insert into the public section of `BpfLoader` (between `LoadProgramForTesting` a
 ```cpp
     // New API (replaces AttachIngress + ConfigureListenerSocket).
     //
-    // Idempotent. Loads the embedded skeleton, then either pins prog/
-    // config_map/listener_map under `pin_dir` or — if pins already
-    // exist and the existing prog's tag matches the embedded one —
-    // re-uses them without re-loading. On tag mismatch the existing
-    // pins are removed and replaced with the new prog/maps.
+    // Idempotent. If pins already exist at <pin_dir> and the pinned
+    // program's tag matches the embedded program's tag, reuses the
+    // existing pinned objects without relinking (so already-attached
+    // TC filters keep firing the same program and reading the same
+    // maps we now write to). Otherwise loads the embedded skeleton,
+    // unlinks any stale pins, and pins the fresh program/maps.
     //
-    // After a successful return: `pin_dir/prog`, `pin_dir/config_map`,
-    // and `pin_dir/listener_map` exist and reference the running
-    // skeleton's objects.
+    // After a successful return: <pin_dir>/prog, <pin_dir>/config_map,
+    // and <pin_dir>/listener_map exist; this->config_map_fd_ and
+    // this->listener_map_fd_ hold raw fds usable for map writes.
     bool LoadAndPin(std::string_view pin_dir);
 
-    // Writes config_map[0] = {enabled=1, listener_port, skb_mark}.
-    // Requires LoadAndPin has succeeded. Safe to call repeatedly.
+    // Writes config_map[0] = {enabled=1, listener_port, skb_mark}
+    // via raw bpf_map_update_elem on config_map_fd_. Safe to call
+    // repeatedly. Requires LoadAndPin to have succeeded.
     bool WriteConfig(std::uint32_t listener_port, std::uint32_t skb_mark);
 
-    // Writes listener_map[0] = listener_fd. The fd must refer to a
-    // TCP socket in the LISTEN state at the moment of update; the
-    // kernel rejects sockmap inserts of non-listening sockets.
+    // Writes listener_map[0] = listener_fd via raw bpf_map_update_elem
+    // on listener_map_fd_. The fd must refer to a TCP socket in the
+    // LISTEN state at the moment of update; the kernel rejects
+    // sockmap inserts of non-listening sockets.
     bool WriteListenerFd(int listener_fd);
 
-    // Test-only: pin the loaded prog at `pin_dir/prog` (used by the
-    // tc_attach integration test in Chunk 1's task 1.5).
+    // Test-only: pin the loaded prog at <pin_dir>/prog. Used by the
+    // tc_attach integration test (no maps pinned, no tag check).
     bool PinProgForTesting(std::string_view pin_dir);
 ```
 
-- [ ] **Step 2.1.2: Add the private helpers**
+- [ ] **Step 2.1.2: Add the private helpers and members**
 
-Inside the `private:` section, add:
+Replace the existing `private:` section of `BpfLoader` with:
 
 ```cpp
-    bool OpenPinnedOrLoad(std::string_view pin_dir);
-    bool TagsMatch(int existing_prog_fd) const;
-    bool PinAll(std::string_view pin_dir);
-    bool UnpinAll(std::string_view pin_dir);
+private:
+    bool EnsureSkeletonLoaded();
 
-    // Once pinned, this is the directory we wrote into; preserved so
-    // WriteConfig / WriteListenerFd can repin maps if needed.
+    // Returns the prog tag for an open prog fd, or nullopt on syscall
+    // failure. The tag is bpf_prog_info::tag, an 8-byte SHA1 prefix
+    // over the program's verifier IR.
+    static std::optional<std::array<std::uint8_t, 8>> ProgTag(int prog_fd);
+
+    // Tag-match path: open existing pinned prog/maps, store map fds,
+    // close prog fd (the pin keeps prog alive). Returns true on
+    // tag-match success; false on any failure (caller falls back to
+    // load+pin).
+    bool TryReuseExistingPin(std::string_view pin_dir,
+                             const std::array<std::uint8_t, 8>& fresh_tag);
+
+    // Load+pin path: unlink any stale pins, pin the freshly-loaded
+    // skel.prog/skel.maps under pin_dir, store map fds.
+    bool PinFresh(std::string_view pin_dir);
+
+    // Best-effort unlink of <pin_dir>/{prog,config_map,listener_map}.
+    static void UnlinkAllPins(std::string_view pin_dir);
+
+    ScopedFd config_map_fd_;
+    ScopedFd listener_map_fd_;
     std::string pin_dir_;
+    struct ingress_redirect_skel* skel_ = nullptr;
+
+    // Legacy fields kept until Chunk 5 to preserve the old API:
+    std::set<std::string> attached_interfaces_;
+    std::optional<int> listener_socket_fd_;
+    std::uint32_t listener_port_ = 0;
+    IngressRedirectConfig runtime_config_{};
+};
 ```
+
+Add `#include <array>` and `#include <optional>` to the top of `loader.hpp` if not already present.
 
 - [ ] **Step 2.1.3: Verify the header still compiles**
 
@@ -561,55 +601,79 @@ Inside the `private:` section, add:
 bazel build //src/bpf:loader
 ```
 
-Expected: success.
+Expected: success — the bodies don't exist yet, but the declarations are syntactically valid (`ScopedFd` is in `<shared/scoped_fd.hpp>` which is already included).
 
 - [ ] **Step 2.1.4: Commit**
 
 ```bash
 git add src/bpf/loader.hpp
-git commit -m "BpfLoader: declare LoadAndPin/WriteConfig/WriteListenerFd"
+git commit -m "BpfLoader: declare LoadAndPin/WriteConfig/WriteListenerFd + tag-match helpers"
 ```
 
-### Task 2.2: Implement `LoadAndPin` (no tag-match path yet)
-
-This step does the simple flavor: always load fresh, always pin (replacing any existing pins). The tag-match reuse logic is added in Task 2.3.
+### Task 2.2: Implement the helpers — pin/unpin/tag
 
 **Files:**
 - Modify: `src/bpf/loader.cpp`
 
-- [ ] **Step 2.2.1: Add includes and the helper functions**
+- [ ] **Step 2.2.1: Add includes**
 
-Near the top of the anonymous namespace, after the existing `using` declarations, add:
+Near the top of `loader.cpp`, ensure these are present:
 
 ```cpp
+#include <array>
+#include <filesystem>
 #include <sys/stat.h>
 ```
 
-If `<sys/stat.h>` and `<filesystem>` are not present in the file, add them. Then add inside the anonymous namespace:
+- [ ] **Step 2.2.2: Add the pin/unpin/tag helpers inside the impl section**
+
+Append to `loader.cpp` (before the closing `}  // namespace inline_proxy`):
 
 ```cpp
+namespace {
+
 bool MakeDirRecursive(std::string_view path) {
     std::error_code ec;
     std::filesystem::create_directories(std::string(path), ec);
     return !ec;
 }
-```
 
-Add `#include <filesystem>` to the top-of-file includes.
+}  // namespace
 
-- [ ] **Step 2.2.2: Implement `LoadAndPin`**
+void BpfLoader::UnlinkAllPins(std::string_view pin_dir) {
+    const std::string dir(pin_dir);
+    for (const char* name : {"prog", "config_map", "listener_map"}) {
+        const std::string path = dir + "/" + name;
+        if (::unlink(path.c_str()) != 0 && errno != ENOENT) {
+            std::cerr << "BpfLoader::UnlinkAllPins unlink failed path=" << path
+                      << " errno=" << errno << '\n';
+        }
+    }
+}
 
-Append to the `BpfLoader` impl section (before the closing `}  // namespace inline_proxy`):
+std::optional<std::array<std::uint8_t, 8>> BpfLoader::ProgTag(int prog_fd) {
+    struct bpf_prog_info info{};
+    std::memset(&info, 0, sizeof(info));
+    std::uint32_t info_len = sizeof(info);
+    if (bpf_obj_get_info_by_fd(prog_fd, &info, &info_len) != 0) {
+        std::cerr << "bpf_obj_get_info_by_fd failed errno=" << errno << '\n';
+        return std::nullopt;
+    }
+    std::array<std::uint8_t, 8> tag{};
+    static_assert(sizeof(info.tag) == tag.size(),
+                  "bpf_prog_info::tag size mismatch");
+    std::memcpy(tag.data(), info.tag, tag.size());
+    return tag;
+}
 
-```cpp
-bool BpfLoader::PinAll(std::string_view pin_dir) {
+bool BpfLoader::PinFresh(std::string_view pin_dir) {
     if (skel_ == nullptr) return false;
     const std::string dir(pin_dir);
 
+    UnlinkAllPins(pin_dir);
+
     auto pin_one = [&](const std::string& name, int fd) -> bool {
         const std::string path = dir + "/" + name;
-        // Best-effort unlink in case a stale pin is present.
-        ::unlink(path.c_str());
         if (bpf_obj_pin(fd, path.c_str()) != 0) {
             std::cerr << "bpf_obj_pin failed path=" << path
                       << " errno=" << errno << '\n';
@@ -621,63 +685,196 @@ bool BpfLoader::PinAll(std::string_view pin_dir) {
     if (!pin_one("prog", bpf_program__fd(skel_->progs.ingress_redirect))) return false;
     if (!pin_one("config_map", bpf_map__fd(skel_->maps.config_map))) return false;
     if (!pin_one("listener_map", bpf_map__fd(skel_->maps.listener_map))) return false;
+
+    // Open the just-pinned maps as raw fds so future writes don't
+    // depend on skel staying alive.
+    const std::string config_path = dir + "/config_map";
+    const std::string listener_path = dir + "/listener_map";
+
+    int cfg_fd = static_cast<int>(::syscall(
+        SYS_bpf, BPF_OBJ_GET,
+        []() {
+            union bpf_attr a{};
+            return &a;
+        }(),  // placeholder; see real call below
+        sizeof(union bpf_attr)));
+    (void)cfg_fd;  // avoid unused-warning; real impl below
+
+    auto bpf_obj_get_path = [](const std::string& path) -> int {
+        union bpf_attr a{};
+        std::memset(&a, 0, sizeof(a));
+        a.pathname = reinterpret_cast<std::uint64_t>(path.c_str());
+        return static_cast<int>(::syscall(SYS_bpf, BPF_OBJ_GET, &a, sizeof(a)));
+    };
+
+    int new_cfg_fd = bpf_obj_get_path(config_path);
+    if (new_cfg_fd < 0) {
+        std::cerr << "bpf_obj_get(config_map) failed errno=" << errno << '\n';
+        return false;
+    }
+    int new_listener_fd = bpf_obj_get_path(listener_path);
+    if (new_listener_fd < 0) {
+        std::cerr << "bpf_obj_get(listener_map) failed errno=" << errno << '\n';
+        ::close(new_cfg_fd);
+        return false;
+    }
+
+    config_map_fd_ = ScopedFd(new_cfg_fd);
+    listener_map_fd_ = ScopedFd(new_listener_fd);
     return true;
 }
 
-bool BpfLoader::UnpinAll(std::string_view pin_dir) {
+bool BpfLoader::TryReuseExistingPin(
+    std::string_view pin_dir,
+    const std::array<std::uint8_t, 8>& fresh_tag) {
     const std::string dir(pin_dir);
-    bool ok = true;
-    for (const char* name : {"prog", "config_map", "listener_map"}) {
-        const std::string path = dir + "/" + name;
-        if (::unlink(path.c_str()) != 0 && errno != ENOENT) {
-            std::cerr << "unlink stale pin failed path=" << path
-                      << " errno=" << errno << '\n';
-            ok = false;
-        }
-    }
-    return ok;
-}
+    const std::string prog_path = dir + "/prog";
+    const std::string config_path = dir + "/config_map";
+    const std::string listener_path = dir + "/listener_map";
 
+    auto bpf_obj_get_path = [](const std::string& path) -> int {
+        union bpf_attr a{};
+        std::memset(&a, 0, sizeof(a));
+        a.pathname = reinterpret_cast<std::uint64_t>(path.c_str());
+        return static_cast<int>(::syscall(SYS_bpf, BPF_OBJ_GET, &a, sizeof(a)));
+    };
+
+    const int existing_prog_fd = bpf_obj_get_path(prog_path);
+    if (existing_prog_fd < 0) {
+        // No existing pin (ENOENT) is the common first-boot case.
+        return false;
+    }
+    auto existing_tag = ProgTag(existing_prog_fd);
+    ::close(existing_prog_fd);
+    if (!existing_tag) return false;
+    if (*existing_tag != fresh_tag) {
+        std::cerr << "BpfLoader: tag mismatch on existing pin; will replace\n";
+        return false;
+    }
+
+    int cfg_fd = bpf_obj_get_path(config_path);
+    if (cfg_fd < 0) return false;
+    int listener_fd = bpf_obj_get_path(listener_path);
+    if (listener_fd < 0) {
+        ::close(cfg_fd);
+        return false;
+    }
+
+    config_map_fd_ = ScopedFd(cfg_fd);
+    listener_map_fd_ = ScopedFd(listener_fd);
+    std::cerr << "BpfLoader: tag match; reusing existing pin at " << dir << '\n';
+    return true;
+}
+```
+
+- [ ] **Step 2.2.3: Build**
+
+```bash
+bazel build //src/bpf:loader
+```
+
+Expected: build succeeds. (The new helpers are unused in this step — `LoadAndPin` is implemented in the next task and exercises them.)
+
+- [ ] **Step 2.2.4: Commit**
+
+```bash
+git add src/bpf/loader.cpp
+git commit -m "BpfLoader: add pin/unpin/tag helpers (private)"
+```
+
+### Task 2.3: Implement `LoadAndPin` / `WriteConfig` / `WriteListenerFd` / `PinProgForTesting`
+
+**Files:**
+- Modify: `src/bpf/loader.cpp`
+
+- [ ] **Step 2.3.1: Implement the public API**
+
+Append to `loader.cpp`:
+
+```cpp
 bool BpfLoader::LoadAndPin(std::string_view pin_dir) {
     if (!MakeDirRecursive(pin_dir)) {
         std::cerr << "LoadAndPin: mkdir " << pin_dir << " failed errno=" << errno << '\n';
         return false;
     }
-    if (!EnsureSkeletonLoaded()) return false;
-    if (!PinAll(pin_dir)) return false;
     pin_dir_ = std::string(pin_dir);
+
+    // Always load the skeleton so we know the embedded program's tag.
+    // Loading is what assigns the tag (computed by the verifier).
+    if (!EnsureSkeletonLoaded()) return false;
+
+    const int fresh_prog_fd = bpf_program__fd(skel_->progs.ingress_redirect);
+    auto fresh_tag = ProgTag(fresh_prog_fd);
+    if (!fresh_tag) {
+        std::cerr << "LoadAndPin: failed to query freshly-loaded prog tag\n";
+        return false;
+    }
+
+    if (TryReuseExistingPin(pin_dir, *fresh_tag)) {
+        // Reuse path: pinned prog/maps stay alive thanks to pins +
+        // their kernel-side reference from already-attached TC filters.
+        // Discard the just-loaded fresh prog/maps by tearing down the
+        // skeleton; the kernel reclaims them since nothing else holds
+        // refs.
+        ingress_redirect_skel__destroy(skel_);
+        skel_ = nullptr;
+        return true;
+    }
+
+    // Either no existing pin, or tag mismatch: pin fresh.
+    if (!PinFresh(pin_dir)) {
+        ingress_redirect_skel__destroy(skel_);
+        skel_ = nullptr;
+        return false;
+    }
+    // Map fds are now held in config_map_fd_/listener_map_fd_; the
+    // pinned prog and the pinned maps keep the kernel objects alive.
+    // We can drop the skeleton.
+    ingress_redirect_skel__destroy(skel_);
+    skel_ = nullptr;
     return true;
 }
 
 bool BpfLoader::WriteConfig(std::uint32_t listener_port, std::uint32_t skb_mark) {
-    if (skel_ == nullptr) return false;
+    if (config_map_fd_.get() < 0) {
+        std::cerr << "WriteConfig: config_map_fd_ not initialised\n";
+        return false;
+    }
     IngressRedirectConfig cfg{};
     cfg.enabled = 1;
     cfg.listener_port = listener_port;
     cfg.skb_mark = skb_mark;
     runtime_config_ = cfg;
+
     const std::uint32_t key = 0;
-    if (int err = bpf_map__update_elem(skel_->maps.config_map,
-                                       &key, sizeof(key),
-                                       &cfg, sizeof(cfg),
-                                       BPF_ANY);
-        err != 0) {
-        std::cerr << "WriteConfig: bpf_map__update_elem failed err=" << err << '\n';
+    union bpf_attr a{};
+    std::memset(&a, 0, sizeof(a));
+    a.map_fd = static_cast<__u32>(config_map_fd_.get());
+    a.key = reinterpret_cast<std::uint64_t>(&key);
+    a.value = reinterpret_cast<std::uint64_t>(&cfg);
+    a.flags = BPF_ANY;
+    if (::syscall(SYS_bpf, BPF_MAP_UPDATE_ELEM, &a, sizeof(a)) != 0) {
+        std::cerr << "WriteConfig: BPF_MAP_UPDATE_ELEM failed errno=" << errno << '\n';
         return false;
     }
     return true;
 }
 
 bool BpfLoader::WriteListenerFd(int listener_fd) {
-    if (skel_ == nullptr || listener_fd < 0) return false;
+    if (listener_map_fd_.get() < 0 || listener_fd < 0) {
+        std::cerr << "WriteListenerFd: invalid map fd or listener fd\n";
+        return false;
+    }
     const std::uint32_t key = 0;
     const std::uint32_t fd_value = static_cast<std::uint32_t>(listener_fd);
-    if (int err = bpf_map__update_elem(skel_->maps.listener_map,
-                                       &key, sizeof(key),
-                                       &fd_value, sizeof(fd_value),
-                                       BPF_ANY);
-        err != 0) {
-        std::cerr << "WriteListenerFd: bpf_map__update_elem failed err=" << err << '\n';
+    union bpf_attr a{};
+    std::memset(&a, 0, sizeof(a));
+    a.map_fd = static_cast<__u32>(listener_map_fd_.get());
+    a.key = reinterpret_cast<std::uint64_t>(&key);
+    a.value = reinterpret_cast<std::uint64_t>(&fd_value);
+    a.flags = BPF_ANY;
+    if (::syscall(SYS_bpf, BPF_MAP_UPDATE_ELEM, &a, sizeof(a)) != 0) {
+        std::cerr << "WriteListenerFd: BPF_MAP_UPDATE_ELEM failed errno=" << errno << '\n';
         return false;
     }
     listener_socket_fd_ = listener_fd;
@@ -689,105 +886,27 @@ bool BpfLoader::PinProgForTesting(std::string_view pin_dir) {
     if (!MakeDirRecursive(pin_dir)) return false;
     const std::string path = std::string(pin_dir) + "/prog";
     ::unlink(path.c_str());
-    return bpf_obj_pin(bpf_program__fd(skel_->progs.ingress_redirect), path.c_str()) == 0;
+    return bpf_obj_pin(bpf_program__fd(skel_->progs.ingress_redirect),
+                       path.c_str()) == 0;
 }
 ```
 
-`OpenPinnedOrLoad` and `TagsMatch` are stubs that always return false for now — the tag-match path is added in Task 2.3.
+Add `#include <sys/syscall.h>` and `#include <linux/bpf.h>` to the top of `loader.cpp` if not already present.
 
-```cpp
-bool BpfLoader::OpenPinnedOrLoad(std::string_view /*pin_dir*/) {
-    return false;  // implemented in Task 2.3
-}
-
-bool BpfLoader::TagsMatch(int /*existing_prog_fd*/) const {
-    return false;  // implemented in Task 2.3
-}
-```
-
-- [ ] **Step 2.2.3: Build and run existing tests**
+- [ ] **Step 2.3.2: Build and run existing tests**
 
 ```bash
 bazel build //src/bpf:loader
 bazel test //tests:bpf_loader_test --test_output=errors
 ```
 
-Expected: build succeeds; all four old tests still pass / skip as before.
+Expected: build succeeds; the four pre-existing tests still pass / skip as before. (The old tests don't exercise the new API.)
 
-- [ ] **Step 2.2.4: Commit**
-
-```bash
-git add src/bpf/loader.cpp
-git commit -m "BpfLoader: implement LoadAndPin/WriteConfig/WriteListenerFd (no tag-match yet)"
-```
-
-### Task 2.3: Add tag-match reuse on existing pins
-
-**Files:**
-- Modify: `src/bpf/loader.cpp`
-
-When `LoadAndPin` runs against a pin_dir that already has a `prog` pin, it should:
-
-1. Open the existing pin via `bpf_obj_get`.
-2. Query its tag via `bpf_obj_get_info_by_fd`.
-3. Load the embedded skeleton.
-4. Compare its prog tag to the existing prog's tag.
-5. If equal: keep the existing pins, dispose of the freshly-loaded skeleton's prog (the kernel ref-counts; just close fds), and re-open the maps via `bpf_obj_get` so subsequent `WriteConfig / WriteListenerFd` writes go to the pinned maps.
-6. If different: unpin the old prog/maps and pin the freshly-loaded ones (current behavior).
-
-For step 5, the cleanest approach is to swap `skel_->maps.config_map` and `skel_->maps.listener_map` to point at the existing pinned map fds. Since the libbpf skeleton owns its map fds, we **don't** swap them in-place; instead we keep the freshly-loaded skeleton (it owns the kernel objects too via the loaded program), and rely on the fact that on tag-match, the existing pinned `prog` and the freshly-loaded prog reference the *same* program ID anyway — wait, actually they're different program IDs: the old pin holds the old kernel program object alive; the new skeleton loads a *new* kernel program object with the same instructions. They have the same tag (SHA1 of verifier IR) but different ids.
-
-Simpler implementation: on tag match, just **don't repin** — the existing pins keep working with the old prog (which TC filters reference by id), and we load+keep the new prog only for map writes (since we still want to write to the maps via the `skel_->maps.*` libbpf handles).
-
-Actually even simpler: **always reload, always repin** but only repin if the tags differ. If tags match, the old prog stays alive (refcounted by existing TC filters), and the new prog is what we now own; we replace the pin atomically (`bpf_obj_pin` → unlink old → rename, or just `bpf_obj_pin` after `unlink`). Since TC filters reference by id, old filters keep their old prog; new filters get the new prog. Tag match means binary unchanged, so this is observable as "prog id changed but program behavior is identical."
-
-That's substantively the same as no-tag-match-check: always load fresh, always replace pins, accept that prog id changes but tag stays the same. The "tag match → reuse" optimization only matters if we want filters to keep pointing at the *same* prog id across restarts — which is not a real requirement; the filters keep working either way because the kernel refcounts.
-
-So the simpler implementation: **always reload, always replace pins, no tag check.** The spec describes tag-match-reuse as the common path for crash-restart; the "reuse" detail is an optimization, not a correctness requirement. Let's keep the implementation simple: replace pins on every `LoadAndPin`. Old TC filters keep their old prog by id until their interfaces are deleted.
-
-If we later want to optimize to skip repinning when tags match, that's a one-line change. For now, simplicity wins.
-
-- [ ] **Step 2.3.1: Update the spec to match — add a note that the implementation always replaces pins**
+- [ ] **Step 2.3.3: Commit**
 
 ```bash
-# This is a documentation update, not a code change.
-```
-
-Open `docs/superpowers/specs/2026-04-27-cni-owned-bpf-attach-design.md`, locate Decisions §5 ("Restart reuses existing pins when the program tag matches"), and update it to:
-
-```markdown
-### 5. Restart replaces pins atomically
-
-When the proxy restarts and finds existing pins at `/sys/fs/bpf/inline-proxy/`, it does not attempt to reuse them. Instead, `LoadAndPin` loads a fresh skeleton (a new kernel program object with the same instructions), unlinks the existing pins, and pins the fresh program/maps in their place. Existing TC filters on `wan_*` interfaces still reference the *old* program by id and continue to fire it; the kernel keeps the old program alive while any filter references it. New TC attaches read the new pin and reference the new program by id. Eventually, as workload pods churn and old filters are removed, the old program is reclaimed.
-
-This trades a microscopic amount of kernel memory (one extra `bpf_prog` object per proxy restart, until the old filters are gone) for substantially simpler implementation: no `bpf_obj_get_info_by_fd` tag query, no conditional unpin/repin path, no two-mode logic in `LoadAndPin`. Tag-match-reuse can be added later if measurements show it matters.
-```
-
-- [ ] **Step 2.3.2: Remove the unused `OpenPinnedOrLoad` / `TagsMatch` stubs**
-
-In `src/bpf/loader.hpp`, remove:
-
-```cpp
-    bool OpenPinnedOrLoad(std::string_view pin_dir);
-    bool TagsMatch(int existing_prog_fd) const;
-```
-
-In `src/bpf/loader.cpp`, remove the two stub function bodies.
-
-- [ ] **Step 2.3.3: Build and re-run tests**
-
-```bash
-bazel build //src/bpf:loader
-bazel test //tests:bpf_loader_test --test_output=errors
-```
-
-Expected: green.
-
-- [ ] **Step 2.3.4: Commit**
-
-```bash
-git add docs/superpowers/specs/2026-04-27-cni-owned-bpf-attach-design.md src/bpf/loader.hpp src/bpf/loader.cpp
-git commit -m "Spec + impl: always-replace pins on restart (drop tag-match optimization)"
+git add src/bpf/loader.cpp src/bpf/loader.hpp
+git commit -m "BpfLoader: implement LoadAndPin (with tag-match reuse) + map writes"
 ```
 
 ### Task 2.4: Test new BpfLoader methods
@@ -836,9 +955,44 @@ TEST(BpfLoaderTest, LoadAndPinIsIdempotent) {
     }
     {
         inline_proxy::BpfLoader loader;
-        EXPECT_TRUE(loader.LoadAndPin(dir));  // pins replaced, not duplicated
+        EXPECT_TRUE(loader.LoadAndPin(dir));
         EXPECT_TRUE(std::filesystem::exists(dir + "/prog"));
     }
+    std::filesystem::remove_all(dir);
+}
+
+// Tag-match reuse: the second LoadAndPin should reuse the existing
+// pinned prog (same prog id) because the embedded program tag is
+// identical. Verified by reading bpf_prog_info::id before and after.
+TEST(BpfLoaderTest, LoadAndPinReusesPinOnTagMatch) {
+    if (::geteuid() != 0) GTEST_SKIP() << "Requires root / CAP_BPF";
+    const auto dir = MakeTempPinDir();
+    auto read_prog_id = [&](const std::string& prog_path) -> std::uint32_t {
+        union bpf_attr a{};
+        std::memset(&a, 0, sizeof(a));
+        a.pathname = reinterpret_cast<__u64>(prog_path.c_str());
+        int fd = static_cast<int>(::syscall(SYS_bpf, BPF_OBJ_GET, &a, sizeof(a)));
+        if (fd < 0) return 0;
+        struct bpf_prog_info info{};
+        std::memset(&info, 0, sizeof(info));
+        std::uint32_t info_len = sizeof(info);
+        if (bpf_obj_get_info_by_fd(fd, &info, &info_len) != 0) {
+            ::close(fd);
+            return 0;
+        }
+        ::close(fd);
+        return info.id;
+    };
+
+    inline_proxy::BpfLoader first;
+    ASSERT_TRUE(first.LoadAndPin(dir));
+    const std::uint32_t first_id = read_prog_id(dir + "/prog");
+    ASSERT_NE(first_id, 0u);
+
+    inline_proxy::BpfLoader second;
+    ASSERT_TRUE(second.LoadAndPin(dir));
+    const std::uint32_t second_id = read_prog_id(dir + "/prog");
+    EXPECT_EQ(first_id, second_id) << "tag-match reuse should keep prog id stable";
     std::filesystem::remove_all(dir);
 }
 
@@ -903,7 +1057,7 @@ Add these includes to the top of the file:
 bazel test //tests:bpf_loader_test --test_output=streamed
 ```
 
-Expected as root: 8 tests pass (4 old + 4 new). As non-root: the 4 new tests + the existing `LoadsSkeleton` test skip.
+Expected as root: 9 tests pass (4 old + 5 new). As non-root: the 5 new tests + the existing `LoadsSkeleton` test skip.
 
 - [ ] **Step 2.4.3: Commit**
 
@@ -1712,7 +1866,7 @@ End-of-chunk state: `BpfLoader` is `LoadAndPin / WriteConfig / WriteListenerFd /
 
 - [ ] **Step 5.1.1: Update `loader.hpp`**
 
-Replace the public API of `BpfLoader` so it reads:
+Replace the public API and private section of `BpfLoader` so it reads:
 
 ```cpp
 class BpfLoader {
@@ -1733,32 +1887,39 @@ public:
 
 private:
     bool EnsureSkeletonLoaded();
-    bool PinAll(std::string_view pin_dir);
-    bool UnpinAll(std::string_view pin_dir);
+    static std::optional<std::array<std::uint8_t, 8>> ProgTag(int prog_fd);
+    bool TryReuseExistingPin(std::string_view pin_dir,
+                             const std::array<std::uint8_t, 8>& fresh_tag);
+    bool PinFresh(std::string_view pin_dir);
+    static void UnlinkAllPins(std::string_view pin_dir);
 
-    std::optional<int> listener_socket_fd_;
-    IngressRedirectConfig runtime_config_{};
+    ScopedFd config_map_fd_;
+    ScopedFd listener_map_fd_;
     std::string pin_dir_;
+    IngressRedirectConfig runtime_config_{};
     struct ingress_redirect_skel* skel_ = nullptr;
 };
 ```
 
-Removed: `AttachIngress`, `DetachIngress`, `IsIngressAttached`, `ConfigureListenerSocket`, `listener_socket_fd()`, `listener_port()`, `attached_interfaces_`, `listener_port_`.
+Removed (relative to Chunk 2's transitional state):
+- Public: `AttachIngress`, `DetachIngress`, `IsIngressAttached`, `ConfigureListenerSocket`, `listener_socket_fd()`, `listener_port()`.
+- Private members: `attached_interfaces_`, `listener_socket_fd_`, `listener_port_`.
 
-The `set` of attached interfaces, the captured listener port, and the skb_mark are no longer carried as members; `WriteConfig` takes the port and mark as parameters.
+The `runtime_config_` member is retained because `WriteConfig` records the last-written config there for the destructor's benefit (no observable behavior change). If the destructor doesn't use it, it can also be removed — verify by reading the destructor body.
 
 - [ ] **Step 5.1.2: Update `loader.cpp`**
 
 Delete:
 
-- The anonymous-namespace netlink helpers (`MakeTcRequest`, `SendNetlinkRequest`, `FinalizeNetlinkMessage`, `EnsureClsactQdisc`, `RemoveIngressFilter`, `AttachIngressFilter`).
-- All includes that are no longer needed: `<linux/if_ether.h>`, `<linux/pkt_cls.h>`, `<linux/pkt_sched.h>`, `<linux/rtnetlink.h>`, `<netinet/in.h>`, `<sys/socket.h>`, `"shared/netlink.hpp"`, `"shared/netlink_builder.hpp"` (keep them only if some other code in the file still uses them; after the deletions, none of them should be needed).
+- The anonymous-namespace netlink helpers (`MakeTcRequest`, `SendNetlinkRequest`, `FinalizeNetlinkMessage`, `EnsureClsactQdisc`, `RemoveIngressFilter`, `AttachIngressFilter`) — these were only ever used by the removed `AttachIngress` / `DetachIngress` methods, and `tc_attach.cpp` carries its own copy for CNI use.
+- All includes that are no longer needed: `<linux/if_ether.h>`, `<linux/pkt_cls.h>`, `<linux/pkt_sched.h>`, `<linux/rtnetlink.h>`, `<netinet/in.h>`, `<sys/socket.h>`, `"shared/netlink.hpp"`, `"shared/netlink_builder.hpp"`. Keep `<sys/syscall.h>`, `<linux/bpf.h>`, `<filesystem>`, `<sys/stat.h>` — those are used by the new pin/map-write paths.
 - The function bodies of `AttachIngress`, `DetachIngress`, `ConfigureListenerSocket`, `listener_socket_fd`, `listener_port`, `IsIngressAttached`.
 
 Keep:
-- The `BpfLoader::~BpfLoader` destructor.
-- `EnsureSkeletonLoaded`.
-- The new `LoadAndPin` / `WriteConfig` / `WriteListenerFd` / `PinAll` / `UnpinAll` / `PinProgForTesting` / `LoadProgramForTesting` impls.
+- The `BpfLoader::~BpfLoader` destructor (verify it doesn't reference removed members; if it does, simplify to a `default` body since `ScopedFd` and `unique_ptr`-style state already self-clean).
+- `EnsureSkeletonLoaded` (still used by `LoadAndPin` and `PinProgForTesting`).
+- All Chunk 2 helpers: `ProgTag`, `TryReuseExistingPin`, `PinFresh`, `UnlinkAllPins`.
+- All Chunk 2 public methods: `LoadAndPin`, `WriteConfig`, `WriteListenerFd`, `PinProgForTesting`, `LoadProgramForTesting`.
 
 - [ ] **Step 5.1.3: Build**
 
