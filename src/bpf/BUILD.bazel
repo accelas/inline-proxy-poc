@@ -31,3 +31,13 @@ cc_library(
     ],
     include_prefix = "bpf",
 )
+
+cc_library(
+    name = "tc_attach",
+    srcs = ["tc_attach.cpp"],
+    hdrs = ["tc_attach.hpp"],
+    deps = [
+        "//src/shared:shared",
+    ],
+    include_prefix = "bpf",
+)
