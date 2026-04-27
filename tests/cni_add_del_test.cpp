@@ -2,6 +2,8 @@
 #include <fstream>
 #include <optional>
 #include <string>
+#include <string_view>
+#include <utility>
 #include <vector>
 
 #include <gtest/gtest.h>
@@ -207,7 +209,14 @@ TEST(CniAddDelTest, ProxyPodAddDoesNotWriteState) {
     std::error_code ec;
     std::filesystem::remove_all(state_root, ec);
 
-    inline_proxy::SpliceExecutor executor({.state_root = state_root});
+    bool pinner_called = false;
+    inline_proxy::CniExecutionOptions options;
+    options.state_root = state_root;
+    options.proxy_pod_pinner = [&](std::string_view) {
+        pinner_called = true;
+        return true;
+    };
+    inline_proxy::SpliceExecutor executor(std::move(options));
     const auto request = MakeRequest();
     const auto proxy_pod = MakeProxyPod();
     const inline_proxy::CniInvocation invocation{
@@ -218,6 +227,7 @@ TEST(CniAddDelTest, ProxyPodAddDoesNotWriteState) {
 
     const auto result = executor.HandleAdd(invocation, proxy_pod, std::nullopt);
     ASSERT_TRUE(result.success);
+    EXPECT_TRUE(pinner_called);
     EXPECT_EQ(result.stdout_json,
               R"({"dns":{"nameservers":["1.1.1.1"],"search":["svc.cluster.local"]},"interfaces":[{"name":"eth0","sandbox":"/var/run/netns/test"}],"routes":[{"dst":"10.0.0.0/8","gw":"10.42.0.1"}]})");
     EXPECT_FALSE(std::filesystem::exists(executor.StatePathForContainerId(invocation.container_id)));
@@ -230,7 +240,10 @@ TEST(CniAddDelTest, ProxyPodAddDoesNotRequireRunningPhase) {
     std::error_code ec;
     std::filesystem::remove_all(state_root, ec);
 
-    inline_proxy::SpliceExecutor executor({.state_root = state_root});
+    inline_proxy::CniExecutionOptions options;
+    options.state_root = state_root;
+    options.proxy_pod_pinner = [](std::string_view) { return true; };
+    inline_proxy::SpliceExecutor executor(std::move(options));
     const auto request = MakeRequest();
     const auto proxy_pod = MakePendingProxyPod();
     const inline_proxy::CniInvocation invocation{
@@ -241,6 +254,31 @@ TEST(CniAddDelTest, ProxyPodAddDoesNotRequireRunningPhase) {
 
     const auto result = executor.HandleAdd(invocation, proxy_pod, std::nullopt);
     ASSERT_TRUE(result.success);
+    EXPECT_FALSE(std::filesystem::exists(executor.StatePathForContainerId(invocation.container_id)));
+
+    std::filesystem::remove_all(state_root, ec);
+}
+
+TEST(CniAddDelTest, ProxyPodAddPropagatesPinnerFailure) {
+    const auto state_root = std::filesystem::temp_directory_path() / "inline_proxy_cni_proxy_pin_fail_test";
+    std::error_code ec;
+    std::filesystem::remove_all(state_root, ec);
+
+    inline_proxy::CniExecutionOptions options;
+    options.state_root = state_root;
+    options.proxy_pod_pinner = [](std::string_view) { return false; };
+    inline_proxy::SpliceExecutor executor(std::move(options));
+    const auto request = MakeRequest();
+    const auto proxy_pod = MakeProxyPod();
+    const inline_proxy::CniInvocation invocation{
+        .request = request,
+        .container_id = "1234567890abcdef",
+        .ifname = "eth0",
+    };
+
+    const auto result = executor.HandleAdd(invocation, proxy_pod, std::nullopt);
+    EXPECT_FALSE(result.success);
+    EXPECT_NE(result.stderr_text.find("LoadAndPin"), std::string::npos);
     EXPECT_FALSE(std::filesystem::exists(executor.StatePathForContainerId(invocation.container_id)));
 
     std::filesystem::remove_all(state_root, ec);
