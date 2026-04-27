@@ -1068,8 +1068,9 @@ int RunProxyDaemon(const ProxyConfig& cfg) {
 
     BpfLoader bpf_loader;
     constexpr const char* kPinDir = "/sys/fs/bpf/inline-proxy";
-    if (!bpf_loader.LoadAndPin(kPinDir)) {
-        std::cerr << "failed to load and pin BPF program at " << kPinDir << '\n';
+    if (!bpf_loader.OpenExistingPin(kPinDir)) {
+        std::cerr << "failed to open BPF pins at " << kPinDir
+                  << "; expected the CNI plugin to have load+pinned during this pod's CNI ADD\n";
         return 1;
     }
     const std::uint32_t intercept_port =
@@ -1082,7 +1083,7 @@ int RunProxyDaemon(const ProxyConfig& cfg) {
         std::cerr << "failed to write BPF listener_map\n";
         return 1;
     }
-    std::cerr << "bpf-pin loaded pin_dir=" << kPinDir
+    std::cerr << "bpf-pin opened pin_dir=" << kPinDir
               << " intercept_port=" << intercept_port
               << " listener_fd=" << transparent_listener.fd() << '\n';
 
