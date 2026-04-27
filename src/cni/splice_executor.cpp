@@ -556,9 +556,18 @@ bool SpliceExecutor::ExecuteSplice(const SplicePlan& plan,
             return false;
         }
         if (!AddInterfaceAddress(plan.wan_name, routed_link.proxy_wan_cidr) ||
-            !SetLinkUp(plan.wan_name) ||
-            !CreateVethPair(plan.lan_name, peer_name)) {
-            std::cerr << "routed-splice: proxy_wan addr/up or CreateVethPair(lan,peer) failed\n";
+            !SetLinkUp(plan.wan_name)) {
+            std::cerr << "routed-splice: proxy_wan addr/up failed\n";
+            cleanup();
+            return false;
+        }
+        if (!options_.tc_attacher->AttachToInterface(plan.wan_name)) {
+            std::cerr << "routed-splice: tc_attach to " << plan.wan_name << " failed\n";
+            cleanup();
+            return false;
+        }
+        if (!CreateVethPair(plan.lan_name, peer_name)) {
+            std::cerr << "routed-splice: CreateVethPair(lan,peer) failed\n";
             cleanup();
             return false;
         }
