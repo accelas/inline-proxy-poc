@@ -467,12 +467,11 @@ Insert into the public section of `BpfLoader` (between `LoadProgramForTesting` a
 
 - [ ] **Step 2.1.2: Add the private helpers and members**
 
-Replace the existing `private:` section of `BpfLoader` with:
+Add the following to the **existing** `private:` section of `BpfLoader`. Do not delete anything from it — the legacy methods (`AttachIngress`, `DetachIngress`, `ConfigureListenerSocket`) are kept until Chunk 5 and they call `UpdateConfigAndListenerMaps`, which must remain declared.
+
+Insert these declarations after the existing `EnsureSkeletonLoaded` / `UpdateConfigAndListenerMaps` block:
 
 ```cpp
-private:
-    bool EnsureSkeletonLoaded();
-
     // Returns the prog tag for an open prog fd, or nullopt on syscall
     // failure. The tag is bpf_prog_info::tag, an 8-byte SHA1 prefix
     // over the program's verifier IR.
@@ -491,21 +490,17 @@ private:
 
     // Best-effort unlink of <pin_dir>/{prog,config_map,listener_map}.
     static void UnlinkAllPins(std::string_view pin_dir);
+```
 
+Add these new member fields alongside the existing `attached_interfaces_` / `listener_socket_fd_` / `listener_port_` / `runtime_config_` / `skel_` members:
+
+```cpp
     ScopedFd config_map_fd_;
     ScopedFd listener_map_fd_;
     std::string pin_dir_;
-    struct ingress_redirect_skel* skel_ = nullptr;
-
-    // Legacy fields kept until Chunk 5 to preserve the old API:
-    std::set<std::string> attached_interfaces_;
-    std::optional<int> listener_socket_fd_;
-    std::uint32_t listener_port_ = 0;
-    IngressRedirectConfig runtime_config_{};
-};
 ```
 
-Add `#include <array>` and `#include <optional>` to the top of `loader.hpp` if not already present.
+Add `#include <array>` to the top of `loader.hpp`. (`<optional>` is already included.)
 
 - [ ] **Step 2.1.3: Verify the header still compiles**
 
@@ -1165,30 +1160,52 @@ In the current tree the splice tests are: `splice_executor_test.cpp` (uses `spli
 
 `TcAttacher`'s methods are non-virtual, so tests can't substitute a stub by inheritance. Tests that need a no-op attacher must either: (a) use `splice_runner` to replace `ExecuteSplice` entirely, or (b) feed a real `TcAttacher` pointed at a temp dir with a pre-pinned prog (via `BpfLoader::PinProgForTesting`).
 
-- [ ] **Step 3.4.2: Update `splice_executor_netns_test.cpp`**
+- [ ] **Step 3.4.2: Update `tests/netns_fixture.cpp`**
 
-If the test exercises `ExecuteSplice` directly (not via `splice_runner`), update its setup to:
+`splice_executor_netns_test.cpp` itself just calls `env->RunSpliceExecutorScenario()`. The actual `SpliceExecutor` construction is at `tests/netns_fixture.cpp:491` inside `NetnsFixture::RunSpliceExecutorScenario`. That's where the `tc_attacher` field needs to be filled in.
+
+In `tests/netns_fixture.cpp`, locate the existing `SpliceExecutor executor({...})` block (around line 491) and surround it with pin setup:
 
 ```cpp
-// In test setup (or per test):
-const std::string pin_dir = "/sys/fs/bpf/splice-test-" +
-                            std::to_string(::getpid());
-std::filesystem::create_directories(pin_dir);
+    const std::string pin_dir = "/sys/fs/bpf/netns-fixture-" +
+                                std::to_string(::getpid());
+    std::filesystem::create_directories(pin_dir);
 
-inline_proxy::BpfLoader loader;
-ASSERT_TRUE(loader.PinProgForTesting(pin_dir));
+    BpfLoader loader;
+    if (!loader.PinProgForTesting(pin_dir)) {
+        return false;
+    }
 
-inline_proxy::CniExecutionOptions options{
-    .state_root = ...,  // existing
-    .tc_attacher = std::make_shared<inline_proxy::TcAttacher>(pin_dir),
-};
-inline_proxy::SpliceExecutor executor(options);
-// ...
-// In teardown:
-std::filesystem::remove_all(pin_dir);
+    SpliceExecutor executor({
+        .state_root = state_root_,
+        .workload_netns_path = NamespacePath(workload_ns_),
+        .proxy_netns_path = NamespacePath(proxy_ns_),
+        .tc_attacher = std::make_shared<TcAttacher>(pin_dir),
+    });
+
+    // ... existing HandleAdd / assertions / cleanup ...
+
+    std::filesystem::remove_all(pin_dir);  // before return
 ```
 
-If the test is fully in-process and uses `splice_runner` to replace `ExecuteSplice`, no change is needed.
+Add includes near the top of `tests/netns_fixture.cpp`:
+
+```cpp
+#include <filesystem>
+#include "bpf/loader.hpp"
+#include "bpf/tc_attach.hpp"
+```
+
+Update `tests/BUILD.bazel`'s `netns_fixture` cc_library `deps` to include:
+
+```python
+        "//src/bpf:loader",
+        "//src/bpf:tc_attach",
+```
+
+(The existing `//src/cni:cni_splice` dep transitively pulls in the splice headers.)
+
+If a test in this category is fully in-process and uses `splice_runner` to replace `ExecuteSplice`, no change is needed; this fixture-level test reaches `ExecuteSplice` directly.
 
 - [ ] **Step 3.4.3: Run all tests**
 
