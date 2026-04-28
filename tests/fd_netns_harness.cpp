@@ -356,8 +356,7 @@ bool FdNetnsHarness::RunInterceptEchoScenario() {
         }
 
         TcAttacher attacher(pin_dir);
-        if (!attacher.WaitForPinnedProg(std::chrono::seconds(5)) ||
-            !attacher.AttachToInterface(wan_ifname_)) {
+        if (!attacher.AttachToInterface(wan_ifname_)) {
             proxy_ready.set_value(false);
             proxy_done.set_value(false);
             return;

@@ -111,16 +111,6 @@ cc_test(
 )
 
 cc_test(
-    name = "bpf_attacher_test",
-    srcs = ["bpf_attacher_test.cpp"],
-    deps = [
-        "@googletest//:gtest_main",
-        "//src/bpf:tc_attach",
-    ],
-)
-
-
-cc_test(
     name = "cni_yajl_parser_test",
     srcs = ["cni_yajl_parser_test.cpp"],
     deps = [

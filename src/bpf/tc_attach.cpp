@@ -1,12 +1,10 @@
 #include "bpf/tc_attach.hpp"
 
-#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <iostream>
 #include <string>
 #include <string_view>
-#include <thread>
 #include <vector>
 
 #include <fcntl.h>
@@ -17,7 +15,6 @@
 #include <linux/rtnetlink.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
-#include <sys/stat.h>
 #include <sys/syscall.h>
 #include <unistd.h>
 
@@ -71,23 +68,6 @@ int BpfObjGet(const std::string& path) {
 }  // namespace
 
 TcAttacher::TcAttacher(std::string pin_dir) : pin_dir_(std::move(pin_dir)) {}
-
-bool TcAttacher::WaitForPinnedProg(std::chrono::seconds timeout) {
-    const std::string prog_path = pin_dir_ + "/prog";
-    const auto deadline = std::chrono::steady_clock::now() + timeout;
-
-    while (true) {
-        struct stat st{};
-        if (::stat(prog_path.c_str(), &st) == 0) {
-            return true;
-        }
-        if (std::chrono::steady_clock::now() >= deadline) {
-            std::cerr << "tc_attach: WaitForPinnedProg timed out path=" << prog_path << '\n';
-            return false;
-        }
-        std::this_thread::sleep_for(std::chrono::milliseconds(200));
-    }
-}
 
 ScopedFd TcAttacher::OpenPinnedProg() const {
     const std::string prog_path = pin_dir_ + "/prog";

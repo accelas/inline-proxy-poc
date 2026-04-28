@@ -1,6 +1,5 @@
 #pragma once
 
-#include <chrono>
 #include <string>
 #include <string_view>
 
@@ -10,8 +9,8 @@ namespace inline_proxy {
 
 // CNI-side helper for attaching the inline-proxy TC ingress program to a
 // named network interface. The program is expected to be pinned at
-// `<pin_dir>/prog` by the proxy daemon at startup; this class only opens
-// the existing pin and runs the netlink TC dance.
+// `<pin_dir>/prog` by the CNI plugin's earlier proxy-DS-pod ADD; this
+// class only opens the existing pin and runs the netlink TC dance.
 //
 // Caller threading: AttachToInterface uses the *current* thread's netns
 // to resolve the interface and attach. Wan_<hash> lives in the proxy
@@ -19,10 +18,6 @@ namespace inline_proxy {
 class TcAttacher {
 public:
     explicit TcAttacher(std::string pin_dir);
-
-    // Polls <pin_dir>/prog every 200 ms (CLOCK_MONOTONIC) until it
-    // exists or `timeout` elapses. Returns true on success.
-    bool WaitForPinnedProg(std::chrono::seconds timeout);
 
     // Opens the pinned prog, ensures clsact qdisc on `ifname`, attaches
     // a TC ingress filter referencing the prog. Idempotent — uses
