@@ -82,15 +82,6 @@ cc_test(
 )
 
 cc_test(
-    name = "interface_registry_test",
-    srcs = ["interface_registry_test.cpp"],
-    deps = [
-        "@googletest//:gtest_main",
-        "//src/proxy:proxy",
-    ],
-)
-
-cc_test(
     name = "admin_connection_send_test",
     srcs = ["admin_connection_send_test.cpp"],
     deps = [
@@ -118,7 +109,6 @@ cc_test(
         "//src/bpf:loader",
     ],
 )
-
 
 cc_test(
     name = "cni_yajl_parser_test",
@@ -182,6 +172,8 @@ cc_library(
     srcs = ["netns_fixture.cpp"],
     hdrs = ["netns_fixture.hpp"],
     deps = [
+        "//src/bpf:loader",
+        "//src/bpf:tc_attach",
         "//src/cni:cni_parser",
         "//src/cni:cni_splice",
         "//src/proxy:proxy",
@@ -195,6 +187,7 @@ cc_library(
     hdrs = ["fd_netns_harness.hpp"],
     deps = [
         "//src/bpf:loader",
+        "//src/bpf:tc_attach",
         "//src/proxy:proxy",
         "//src/shared:shared",
     ],
@@ -229,16 +222,6 @@ cc_test(
     deps = [
         ":netns_fixture",
         "@googletest//:gtest_main",
-    ],
-)
-
-cc_test(
-    name = "state_reconciler_test",
-    srcs = ["state_reconciler_test.cpp"],
-    deps = [
-        "@googletest//:gtest_main",
-        "//src/proxy:proxy",
-        "//src/shared:shared",
     ],
 )
 

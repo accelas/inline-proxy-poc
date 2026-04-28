@@ -16,6 +16,8 @@
 #include <thread>
 #include <vector>
 
+#include "bpf/loader.hpp"
+#include "bpf/tc_attach.hpp"
 #include "proxy/config.hpp"
 #include "proxy/relay_session.hpp"
 #include "proxy/transparent_listener.hpp"
@@ -328,10 +330,33 @@ bool FdNetnsHarness::RunInterceptEchoScenario() {
             return;
         }
 
-        InterfaceRegistry registry;
+        // Pin BPF in this proxy netns; CNI side (TcAttacher) drives the
+        // TC attach, which we do inline here since the harness has no
+        // separate CNI process.
+        const std::string pin_dir = "/sys/fs/bpf/fd-netns-harness-" +
+                                    std::to_string(::getpid());
+        std::filesystem::create_directories(pin_dir);
+        struct PinDirCleanup {
+            std::string path;
+            ~PinDirCleanup() {
+                std::error_code ec;
+                std::filesystem::remove_all(path, ec);
+            }
+        } pin_dir_cleanup{pin_dir};
+
+        BpfLoader bpf_loader;
         auto listener = CreateTransparentListener("0.0.0.0", kListenerPort);
-        if (!listener || !registry.ConfigureIngressListener(listener.fd(), kDemoPort) ||
-            !registry.RecordInterface(wan_ifname_)) {
+        if (!listener ||
+            !bpf_loader.LoadAndPin(pin_dir) ||
+            !bpf_loader.WriteConfig(kDemoPort, 0x100) ||
+            !bpf_loader.WriteListenerFd(listener.fd())) {
+            proxy_ready.set_value(false);
+            proxy_done.set_value(false);
+            return;
+        }
+
+        TcAttacher attacher(pin_dir);
+        if (!attacher.AttachToInterface(wan_ifname_)) {
             proxy_ready.set_value(false);
             proxy_done.set_value(false);
             return;

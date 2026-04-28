@@ -14,6 +14,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include "bpf/loader.hpp"
 #include "cni/netns_resolver.hpp"
 #include "cni/yajl_parser.hpp"
 #include "shared/netlink.hpp"
@@ -316,7 +317,18 @@ StateFields BuildStateFields(const SplicePlan& plan,
 
 }  // namespace
 
-SpliceExecutor::SpliceExecutor(CniExecutionOptions options) : options_(std::move(options)) {}
+SpliceExecutor::SpliceExecutor(CniExecutionOptions options)
+    : options_(std::move(options)) {
+    if (!options_.tc_attacher) {
+        options_.tc_attacher = std::make_shared<TcAttacher>(options_.pin_dir);
+    }
+    if (!options_.proxy_pod_pinner) {
+        options_.proxy_pod_pinner = [](std::string_view pin_dir) {
+            BpfLoader loader;
+            return loader.LoadAndPin(pin_dir);
+        };
+    }
+}
 
 std::filesystem::path SpliceExecutor::StatePathForContainerId(std::string_view container_id) const {
     return BuildSplicePlan(container_id, "eth0", options_.state_root).state_path;
@@ -329,6 +341,10 @@ CniExecutionResult SpliceExecutor::HandleAdd(const CniInvocation& invocation,
     result.stdout_json = RenderPrevResultJson(invocation.request);
 
     if (IsProxyPod(workload_pod)) {
+        if (!options_.proxy_pod_pinner(options_.pin_dir)) {
+            result.stderr_text = "failed to LoadAndPin BPF program for proxy DS pod";
+            return result;
+        }
         result.success = true;
         return result;
     }
@@ -550,9 +566,18 @@ bool SpliceExecutor::ExecuteSplice(const SplicePlan& plan,
             return false;
         }
         if (!AddInterfaceAddress(plan.wan_name, routed_link.proxy_wan_cidr) ||
-            !SetLinkUp(plan.wan_name) ||
-            !CreateVethPair(plan.lan_name, peer_name)) {
-            std::cerr << "routed-splice: proxy_wan addr/up or CreateVethPair(lan,peer) failed\n";
+            !SetLinkUp(plan.wan_name)) {
+            std::cerr << "routed-splice: proxy_wan addr/up failed\n";
+            cleanup();
+            return false;
+        }
+        if (!options_.tc_attacher->AttachToInterface(plan.wan_name)) {
+            std::cerr << "routed-splice: tc_attach to " << plan.wan_name << " failed\n";
+            cleanup();
+            return false;
+        }
+        if (!CreateVethPair(plan.lan_name, peer_name)) {
+            std::cerr << "routed-splice: CreateVethPair(lan,peer) failed\n";
             cleanup();
             return false;
         }

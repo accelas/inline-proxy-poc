@@ -23,10 +23,9 @@
 #include <netinet/in.h>
 #include <unistd.h>
 
+#include "bpf/loader.hpp"
 #include "proxy/admin_http.hpp"
-#include "proxy/interface_registry.hpp"
 #include "proxy/relay_session.hpp"
-#include "proxy/state_reconciler.hpp"
 #include "proxy/transparent_listener.hpp"
 #include "proxy/transparent_socket.hpp"
 #include "shared/event_loop.hpp"
@@ -1055,8 +1054,6 @@ int RunProxyDaemon(const ProxyConfig& cfg) {
         return 1;
     }
 
-    InterfaceRegistry registry;
-    StateReconciler state_reconciler;
     auto admin_listener = CreatePlainListener(cfg.admin_address, cfg.admin_port);
     if (!admin_listener) {
         std::cerr << "failed to create admin listener on port " << cfg.admin_port << '\n';
@@ -1069,19 +1066,28 @@ int RunProxyDaemon(const ProxyConfig& cfg) {
         return 1;
     }
 
-    if (!registry.ConfigureIngressListener(transparent_listener.fd(), cfg.intercept_port)) {
-        std::cerr << "failed to configure ingress listener for transparent port " << cfg.transparent_port << '\n';
+    BpfLoader bpf_loader;
+    constexpr const char* kPinDir = "/sys/fs/bpf/inline-proxy";
+    if (!bpf_loader.OpenExistingPin(kPinDir)) {
+        std::cerr << "failed to open BPF pins at " << kPinDir
+                  << "; expected the CNI plugin to have load+pinned during this pod's CNI ADD\n";
         return 1;
     }
-
-    const std::string admin_interface_name = "lan_listener_" + std::to_string(cfg.admin_port);
-    if (!registry.RecordInterface(admin_interface_name)) {
-        std::cerr << "failed to record admin interface " << admin_interface_name << '\n';
+    const std::uint32_t intercept_port =
+        cfg.intercept_port != 0 ? cfg.intercept_port : cfg.transparent_port;
+    if (!bpf_loader.WriteConfig(intercept_port, 0x100)) {
+        std::cerr << "failed to write BPF config_map\n";
         return 1;
     }
+    if (!bpf_loader.WriteListenerFd(transparent_listener.fd())) {
+        std::cerr << "failed to write BPF listener_map\n";
+        return 1;
+    }
+    std::cerr << "bpf-pin opened pin_dir=" << kPinDir
+              << " intercept_port=" << intercept_port
+              << " listener_fd=" << transparent_listener.fd() << '\n';
 
-    auto admin_http = BuildAdminHttp(state, registry);
-    state_reconciler.Sync(registry);
+    auto admin_http = BuildAdminHttp(state);
 
     state.set_ready(true);
     auto& loop = state.loop();
@@ -1092,7 +1098,6 @@ int RunProxyDaemon(const ProxyConfig& cfg) {
 
     std::function<void()> sweep;
     sweep = [&] {
-        state_reconciler.Sync(registry);
         PruneClosedSessions(sessions);
         PruneClosedConnections(admin_connections);
         loop.Schedule(std::chrono::seconds(1), sweep);
@@ -1207,9 +1212,8 @@ int RunProxyDaemon(const ProxyConfig& cfg) {
                     loop,
                     std::move(accepted),
                     endpoints,
-                    [&loop, &sessions, &state, &registry] {
+                    [&loop, &sessions, &state] {
                         state.decrement_sessions();
-                        registry.DecrementSessions();
                         loop.Defer([&sessions] { PruneClosedSessions(sessions); });
                     });
                 if (!session) {
@@ -1217,7 +1221,6 @@ int RunProxyDaemon(const ProxyConfig& cfg) {
                 }
 
                 state.increment_sessions();
-                registry.IncrementSessions();
                 sessions.push_back(std::move(session));
             }
         },
@@ -1232,12 +1235,7 @@ int RunProxyDaemon(const ProxyConfig& cfg) {
         DebugReleaseLocalSource(ctx.local_source, ctx.interfaces);
     }
     state.set_ready(false);
-    bool cleanup_ok = true;
-    if (!registry.RemoveInterface(admin_interface_name)) {
-        std::cerr << "failed to remove admin interface " << admin_interface_name << '\n';
-        cleanup_ok = false;
-    }
-    return cleanup_ok ? 0 : 1;
+    return 0;
 }
 
 }  // namespace inline_proxy

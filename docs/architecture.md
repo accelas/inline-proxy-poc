@@ -106,12 +106,26 @@ the pod — leave through `wan_<hash>` back toward the node, exactly
 mirroring the ingress path. Return packets to the pod IP end up back
 on `lan_<hash>` and into the workload namespace.
 
-### 2.6 Attaches the TC-ingress BPF program on `wan_<hash>`
+### 2.6 Loads and pins the BPF program (proxy DS pod CNI), attaches it (service pod CNI)
 
-The proxy daemon already owns a transparent listener at
-`127.0.0.1:15001`. When it observes the new `wan_*` interface, its
-interface registry attaches the compiled skeleton program
-(`src/bpf/ingress_redirect.bpf.c`) on TC-ingress of that interface.
+The BPF program is loaded and pinned by the CNI plugin during the
+proxy DS pod's CNI ADD. Pins live at
+`/sys/fs/bpf/inline-proxy/{prog,config_map,listener_map}`.
+
+When the proxy daemon container subsequently boots inside that pod,
+it opens the already-pinned `config_map` and `listener_map` and
+writes `config_map[0]` (port, mark) and `listener_map[0]` (its
+listener fd). The proxy daemon never loads the skeleton, never pins,
+and never runs TC netlink calls.
+
+When a service pod is admitted, the same CNI plugin (running for that
+pod's ADD) creates the `wan_<hash>` interface, moves it into the
+proxy netns, and inside that netns attaches the pinned program as a
+TC ingress filter. The pin is guaranteed to exist because kubelet
+admits the proxy DS pod first (system-node-critical priority) and
+serialises CNI invocations per node, so the proxy DS pod's CNI ADD
+always completes before any service pod's CNI ADD begins.
+
 The BPF program redirects matching TCP flows to the listener via
 `bpf_sk_assign`, preserving the original dst via SO_ORIGINAL_DST.
 
@@ -254,20 +268,36 @@ delivers return packets back to the proxy.
 
 ## 8. Interface contract with the daemon
 
-The proxy daemon watches the proxy netns's `/sys/class/net` via
-`src/proxy/interface_registry.cpp`. Each time a new `wan_<hash>`
-appears it:
+The proxy daemon does not load BPF, pin maps, or watch interfaces.
+At startup it:
 
-1. Attaches the compiled BPF skeleton program on TC-ingress of that
-   interface (via `src/bpf/loader.cpp`).
-2. Populates the BPF maps (`config_map` and `listener_map` — two
-   maps total across the whole system, regardless of how many
-   annotated pods exist) so the program knows which flows to
-   intercept and which socket to hand them to.
-3. On CNI DEL the plugin removes the state file and links; the
-   registry sees the interface vanish and detaches.
+1. Binds and listens on the transparent listener.
+2. Opens the existing pinned `config_map` and `listener_map` at
+   `/sys/fs/bpf/inline-proxy/` (created by its own pod's CNI ADD).
+3. Writes `config_map[0] = {enabled, listener_port, skb_mark}`.
+4. Writes `listener_map[0] = listener_fd`.
+5. Marks `/readyz` green.
 
-The daemon does not otherwise care about the routed vs splice
-distinction — from its perspective it still owns `wan_*`
-interfaces, attaches BPF on each one, and runs a transparent
-listener. The topology rewrite is entirely in the CNI plugin.
+The CNI plugin owns the BPF lifecycle:
+
+- **Proxy DS pod ADD:** loads the embedded BPF skeleton and pins
+  prog/config_map/listener_map. On a binary upgrade (tag mismatch)
+  the existing pins are replaced; on a same-binary restart the
+  existing pins are reused so already-attached TC filters keep
+  reading from the same kernel maps the new proxy daemon will write
+  to.
+- **Service pod ADD:** opens the prog pin (guaranteed to exist),
+  creates `wan_<hash>`, moves it into the proxy netns, and runs
+  `tc filter add ingress` referencing the prog.
+- **CNI DEL:** no-op for BPF — removing `wan_<hash>` drops its
+  qdisc and filter automatically.
+
+If the proxy daemon container restarts inside an existing pod (no
+new CNI ADD), the pinned maps persist; the new container opens them
+and overwrites `listener_map[0]` with its new listener fd. Already-
+attached TC filters continue reading from the same maps, so existing
+pods see no interception gap.
+
+The pin path `/sys/fs/bpf/inline-proxy/` is on host bpffs (mounted
+into the proxy pod via hostPath with bidirectional propagation). CNI
+runs on the host directly and reaches the same bpffs natively.

@@ -103,6 +103,7 @@ int main() {
         invocation.request = *request;
 
         const auto proxy_pod = inline_proxy::FindNodeLocalProxyPod(workload_pod.node_name);
+
         const auto result = executor.HandleAdd(invocation, workload_pod, proxy_pod);
         if (!result.success) {
             std::cerr << result.stderr_text << "\n";

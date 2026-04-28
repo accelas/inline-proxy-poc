@@ -8,16 +8,20 @@
 
 #include <atomic>
 #include <chrono>
+#include <filesystem>
 #include <fstream>
 #include <cstdio>
 #include <cstdlib>
 #include <future>
 #include <functional>
+#include <memory>
 #include <optional>
 #include <string>
 #include <thread>
 #include <utility>
 
+#include "bpf/loader.hpp"
+#include "bpf/tc_attach.hpp"
 #include "cni/splice_executor.hpp"
 #include "cni/splice_plan.hpp"
 #include "cni/yajl_parser.hpp"
@@ -488,10 +492,28 @@ bool NetnsFixture::RunSpliceExecutorScenario() {
     proxy_pod.running = true;
     proxy_pod.labels["app"] = "inline-proxy";
 
+    const std::string pin_dir = "/sys/fs/bpf/netns-fixture-" +
+                                std::to_string(::getpid());
+    std::filesystem::create_directories(pin_dir);
+
+    struct PinDirGuard {
+        std::string path;
+        ~PinDirGuard() {
+            std::error_code ec;
+            std::filesystem::remove_all(path, ec);
+        }
+    } pin_dir_guard{pin_dir};
+
+    BpfLoader loader;
+    if (!loader.PinProgForTesting(pin_dir)) {
+        return false;
+    }
+
     SpliceExecutor executor({
         .state_root = state_root_,
         .workload_netns_path = NamespacePath(workload_ns_),
         .proxy_netns_path = NamespacePath(proxy_ns_),
+        .tc_attacher = std::make_shared<TcAttacher>(pin_dir),
     });
     const CniInvocation invocation{
         .request = *request,

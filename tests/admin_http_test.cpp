@@ -2,12 +2,10 @@
 #include <stdexcept>
 
 #include "proxy/admin_http.hpp"
-#include "proxy/interface_registry.hpp"
 
 TEST(AdminHttpTest, HealthAndReadinessEndpointsReturn200) {
     inline_proxy::ProxyState state;
-    inline_proxy::InterfaceRegistry registry;
-    auto app = inline_proxy::BuildAdminHttp(state, registry);
+    auto app = inline_proxy::BuildAdminHttp(state);
     const auto health = app.Handle("GET", "/healthz");
     const auto ready = app.Handle("GET", "/readyz");
 
@@ -22,8 +20,7 @@ TEST(AdminHttpTest, HealthAndReadinessEndpointsReturn200) {
 TEST(AdminHttpTest, MetricsAndSessionsEndpointsReturnText) {
     inline_proxy::ProxyState state;
     state.increment_sessions();
-    inline_proxy::InterfaceRegistry registry;
-    auto app = inline_proxy::BuildAdminHttp(state, registry);
+    auto app = inline_proxy::BuildAdminHttp(state);
 
     const auto metrics = app.Handle("GET", "/metrics");
     const auto sessions = app.Handle("GET", "/sessions");
@@ -42,26 +39,10 @@ TEST(AdminHttpTest, MetricsAndSessionsEndpointsReturnText) {
 
 TEST(AdminHttpTest, UnknownOrUnsupportedRequestsReturnExpectedStatus) {
     inline_proxy::ProxyState state;
-    inline_proxy::InterfaceRegistry registry;
-    auto app = inline_proxy::BuildAdminHttp(state, registry);
+    auto app = inline_proxy::BuildAdminHttp(state);
 
     EXPECT_EQ(app.Handle("GET", "/does-not-exist").status, 404);
     EXPECT_EQ(app.Handle("POST", "/healthz").status, 405);
-}
-
-TEST(AdminHttpTest, InterfacesEndpointReturnsRegistryStateAndIsGetOnly) {
-    inline_proxy::ProxyState state;
-    inline_proxy::InterfaceRegistry registry;
-    EXPECT_TRUE(registry.RecordInterface("lan_eth1"));
-
-    auto app = inline_proxy::BuildAdminHttp(state, registry);
-    const auto interfaces = app.Handle("GET", "/interfaces");
-
-    EXPECT_EQ(interfaces.status, 200);
-    EXPECT_EQ(interfaces.content_type, "text/plain; charset=utf-8");
-    EXPECT_NE(interfaces.body.find("lan_eth1"), std::string::npos);
-
-    EXPECT_EQ(app.Handle("POST", "/interfaces").status, 405);
 }
 
 

@@ -7,10 +7,8 @@ cc_library(
     srcs = [
         "admin_http.cpp",
         "config.cpp",
-        "interface_registry.cpp",
         "local_source.cpp",
         "proxy_state.cpp",
-        "state_reconciler.cpp",
         "relay_session.cpp",
         "transparent_listener.cpp",
         "transparent_socket.cpp",
@@ -18,10 +16,8 @@ cc_library(
     hdrs = [
         "admin_http.hpp",
         "config.hpp",
-        "interface_registry.hpp",
         "local_source.hpp",
         "proxy_state.hpp",
-        "state_reconciler.hpp",
         "relay_session.hpp",
         "transparent_listener.hpp",
         "transparent_socket.hpp",
