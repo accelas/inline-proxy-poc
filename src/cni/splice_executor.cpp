@@ -534,6 +534,21 @@ bool SpliceExecutor::ExecuteSplice(const SplicePlan& plan,
             }
             (void)FlushRouteTable(static_cast<std::uint32_t>(route_table));
         }
+        // Best-effort restore of the workload netns to its pre-splice state.
+        // Without this, a partial ADD that already flushed eth0 leaves the pod
+        // with /32 + no default route, and kubelet's retry sees half-mutated
+        // state and never converges.
+        if (auto workload_ns = ScopedNetns::Enter(netns_paths.workload)) {
+            (void)DeleteLink(peer_name);
+            (void)FlushInterfaceAddresses(plan.ifname);
+            for (const auto& address : network_config->addresses) {
+                (void)AddInterfaceAddress(plan.ifname, address);
+            }
+            (void)SetLinkUp(plan.ifname);
+            for (const auto& route : network_config->routes) {
+                (void)ReplaceRouteVia(route.dst, route.gw.value_or(""), plan.ifname);
+            }
+        }
     };
 
     if (!CreateVethPair(root_wan_name, plan.wan_name)) {
