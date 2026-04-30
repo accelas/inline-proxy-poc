@@ -68,6 +68,8 @@ public:
 
     CniExecutionResult HandleDel(const CniInvocation& invocation) const;
 
+    const CniExecutionOptions& options() const { return options_; }
+
 private:
     std::optional<ResolvedNetnsPaths> ResolveNetnsPaths(
         const CniInvocation& invocation,
