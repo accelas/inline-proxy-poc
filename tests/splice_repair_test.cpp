@@ -199,3 +199,32 @@ TEST_F(SpliceRepairTest, MalformedStateFileCountsAsFailed) {
     EXPECT_EQ(result.total_state_files, 1u);
     EXPECT_EQ(result.failed, 1u);
 }
+
+TEST_F(SpliceRepairTest, DeadlineExceededShortCircuitsScan) {
+    const auto current_path = state_root_ / "cur"; std::ofstream(current_path).put('c');
+    const auto stale = state_root_ / "old"; std::ofstream(stale).put('o');
+    const auto wl1 = state_root_ / "wl1"; std::ofstream(wl1).put('1');
+    const auto wl2 = state_root_ / "wl2"; std::ofstream(wl2).put('2');
+    WriteStateFile(state_root_, "dl1", wl1.string(), stale.string());
+    WriteStateFile(state_root_, "dl2", wl2.string(), stale.string());
+
+    int runner_calls = 0;
+    inline_proxy::CniExecutionOptions options;
+    options.state_root = state_root_;
+    options.splice_runner = [&](const auto&, const auto&, const auto&) {
+        ++runner_calls;
+        return true;
+    };
+    inline_proxy::SpliceExecutor executor(std::move(options));
+
+    // Zero-duration deadline: the per-iteration check at the top of the loop
+    // fires before any per-pod work runs.
+    const auto result = inline_proxy::RepairOrphanedSplices(
+        executor, current_path, std::chrono::seconds(0));
+
+    EXPECT_EQ(result.total_state_files, 2u);
+    EXPECT_EQ(result.skipped_deadline_exceeded, 2u);
+    EXPECT_EQ(result.repaired, 0u);
+    EXPECT_EQ(result.failed, 0u);
+    EXPECT_EQ(runner_calls, 0);
+}
