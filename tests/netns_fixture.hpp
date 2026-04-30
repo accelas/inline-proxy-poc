@@ -21,6 +21,7 @@ public:
 
     bool RunTransparentRelayScenario();
     bool RunSpliceExecutorScenario();
+    bool RunSpliceRepairScenario();
 
 private:
     NetnsFixture(std::string prefix,

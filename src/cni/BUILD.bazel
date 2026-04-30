@@ -44,11 +44,13 @@ cc_library(
         "netns_resolver.cpp",
         "splice_executor.cpp",
         "splice_plan.cpp",
+        "splice_repair.cpp",
     ],
     hdrs = [
         "netns_resolver.hpp",
         "splice_executor.hpp",
         "splice_plan.hpp",
+        "splice_repair.hpp",
     ],
     deps = [
         ":cni_parser",

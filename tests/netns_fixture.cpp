@@ -24,6 +24,7 @@
 #include "bpf/tc_attach.hpp"
 #include "cni/splice_executor.hpp"
 #include "cni/splice_plan.hpp"
+#include "cni/splice_repair.hpp"
 #include "cni/yajl_parser.hpp"
 #include "proxy/relay_session.hpp"
 #include "proxy/transparent_listener.hpp"
@@ -32,6 +33,7 @@
 #include "shared/netlink.hpp"
 #include "shared/netns.hpp"
 #include "shared/scoped_fd.hpp"
+#include "shared/state_store.hpp"
 
 namespace inline_proxy {
 namespace {
@@ -232,6 +234,13 @@ bool LinkExistsInNamespace(const std::string& netns_path, const std::string& ifn
     return LinkIndex(ifname).has_value();
 }
 
+bool IsLinkUpInNamespace(std::string_view netns_path, std::string_view ifname) {
+    std::string cmd = "/usr/bin/nsenter --net=" + std::string(netns_path) +
+                      " /usr/bin/ip link show dev " + std::string(ifname) +
+                      " 2>/dev/null | grep -q ' state UP '";
+    return std::system(cmd.c_str()) == 0;
+}
+
 std::atomic<unsigned int>& FixtureCounter() {
     static std::atomic<unsigned int> counter{0};
     return counter;
@@ -314,9 +323,15 @@ bool NetnsFixture::CreateNamespaces() {
 
 bool NetnsFixture::ResetNamespaces() {
     bool ok = true;
-    ok &= RunCommand("/usr/bin/ip netns delete " + Quote(client_ns_));
-    ok &= RunCommand("/usr/bin/ip netns delete " + Quote(proxy_ns_));
-    ok &= RunCommand("/usr/bin/ip netns delete " + Quote(workload_ns_));
+    if (!client_ns_.empty()) {
+        ok &= RunCommand("/usr/bin/ip netns delete " + Quote(client_ns_));
+    }
+    if (!proxy_ns_.empty()) {
+        ok &= RunCommand("/usr/bin/ip netns delete " + Quote(proxy_ns_));
+    }
+    if (!workload_ns_.empty()) {
+        ok &= RunCommand("/usr/bin/ip netns delete " + Quote(workload_ns_));
+    }
     namespaces_created_ = false;
     return ok;
 }
@@ -550,6 +565,140 @@ bool NetnsFixture::RunSpliceExecutorScenario() {
     }
     const auto del_result = executor.HandleDel(invocation);
     return client_ok && server_ok && reply == payload && del_result.success;
+}
+
+bool NetnsFixture::RunSpliceRepairScenario() {
+    const std::string workload_ip = "10.42.0.66/24";
+    const std::string client_ip = "10.42.0.13/24";
+    const std::string gateway_ip = "10.42.0.1";
+    const std::string new_proxy_ns = prefix_ + "-new-proxy";
+
+    if (!BuildBridgeBackedWorkloadTopology(workload_ip, client_ip, gateway_ip)) {
+        return false;
+    }
+    if (!RunCommand("/usr/bin/ip netns add " + Quote(new_proxy_ns))) {
+        return false;
+    }
+    struct NetnsCleanup {
+        std::string name;
+        ~NetnsCleanup() {
+            std::system(("/usr/bin/ip netns delete " + name + " >/dev/null 2>&1").c_str());
+        }
+    } new_proxy_cleanup{new_proxy_ns};
+    if (!RunCommand("/usr/bin/ip -n " + Quote(new_proxy_ns) + " link set lo up")) {
+        return false;
+    }
+
+    const std::string container_id = "repair-1234567890ab";
+    const std::string request_json =
+        R"({"cniVersion":"1.0.0","name":"k8s-pod-network","prevResult":{"interfaces":[{"name":"cni0"},{"name":"veth-root"},{"name":"eth0","sandbox":")" +
+        NamespacePath(workload_ns_) +
+        R"("}],"ips":[{"address":")" + workload_ip +
+        R"(","gateway":")" + gateway_ip +
+        R"(","interface":2}],"routes":[{"dst":"10.42.0.0/16"},{"dst":"0.0.0.0/0","gw":")" +
+        gateway_ip + R"("}]}})";
+    auto request = ParseCniRequest(request_json);
+    if (!request.has_value()) {
+        return false;
+    }
+
+    PodInfo workload_pod;
+    workload_pod.name = "backend";
+    workload_pod.namespace_name = "default";
+    workload_pod.node_name = "worker-1";
+    workload_pod.phase = "Running";
+    workload_pod.running = true;
+    workload_pod.annotations["inline-proxy.example.com/enabled"] = "true";
+
+    PodInfo proxy_pod;
+    proxy_pod.name = "inline-proxy-daemon";
+    proxy_pod.namespace_name = "inline-proxy-system";
+    proxy_pod.node_name = "worker-1";
+    proxy_pod.phase = "Running";
+    proxy_pod.running = true;
+    proxy_pod.labels["app"] = "inline-proxy";
+
+    const std::string pin_dir =
+        "/sys/fs/bpf/netns-fixture-repair-" + std::to_string(::getpid());
+    std::filesystem::create_directories(pin_dir);
+    struct PinDirGuard {
+        std::string path;
+        ~PinDirGuard() {
+            std::error_code ec;
+            std::filesystem::remove_all(path, ec);
+        }
+    } pin_dir_guard{pin_dir};
+
+    BpfLoader loader;
+    if (!loader.PinProgForTesting(pin_dir)) {
+        return false;
+    }
+
+    SpliceExecutor old_executor({
+        .state_root = state_root_,
+        .proxy_netns_path = NamespacePath(proxy_ns_),
+        .tc_attacher = std::make_shared<TcAttacher>(pin_dir),
+    });
+    const CniInvocation invocation{
+        .request = *request,
+        .container_id = container_id,
+        .ifname = "eth0",
+    };
+    const auto add_result = old_executor.HandleAdd(invocation, workload_pod, proxy_pod);
+    if (!add_result.success || !add_result.plan.has_value()) {
+        return false;
+    }
+    const std::string wan_name = add_result.plan->wan_name;
+    const std::string lan_name = add_result.plan->lan_name;
+
+    // Sanity: wan/lan should currently live in the OLD proxy netns.
+    if (!LinkExistsInNamespace(NamespacePath(proxy_ns_), wan_name) ||
+        !LinkExistsInNamespace(NamespacePath(proxy_ns_), lan_name)) {
+        return false;
+    }
+
+    // Destroy the old proxy netns. Kernel reaps wan_/lan_/peer_ inside it.
+    if (!RunCommand("/usr/bin/ip netns delete " + Quote(proxy_ns_))) {
+        return false;
+    }
+    // Mark proxy_ns_ as already-deleted so ResetNamespaces() skips it cleanly.
+    proxy_ns_.clear();
+
+    // Run the reconciler against the new proxy netns.
+    SpliceExecutor repair_executor({
+        .state_root = state_root_,
+        .proxy_netns_path = NamespacePath(new_proxy_ns),
+        .tc_attacher = std::make_shared<TcAttacher>(pin_dir),
+    });
+    const auto repair = RepairOrphanedSplices(repair_executor,
+                                              NamespacePath(new_proxy_ns));
+    if (repair.total_state_files != 1 || repair.repaired != 1 || repair.failed != 0 ||
+        repair.skipped_intact != 0 || repair.skipped_workload_gone != 0 ||
+        repair.skipped_deadline_exceeded != 0) {
+        return false;
+    }
+
+    // wan_/lan_ should now live in the NEW proxy netns.
+    if (!LinkExistsInNamespace(NamespacePath(new_proxy_ns), wan_name) ||
+        !LinkExistsInNamespace(NamespacePath(new_proxy_ns), lan_name)) {
+        return false;
+    }
+    if (!IsLinkUpInNamespace(NamespacePath(new_proxy_ns), wan_name) ||
+        !IsLinkUpInNamespace(NamespacePath(new_proxy_ns), lan_name)) {
+        return false;
+    }
+
+    // The state file's `proxy_netns_path` should have been rewritten.
+    StateStore store(state_root_ / ("container-" + container_id + ".json"));
+    const auto fields = store.Read();
+    if (!fields) {
+        return false;
+    }
+    const auto it = fields->find("proxy_netns_path");
+    if (it == fields->end() || it->second != NamespacePath(new_proxy_ns)) {
+        return false;
+    }
+    return true;
 }
 
 }  // namespace inline_proxy

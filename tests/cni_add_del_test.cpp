@@ -308,6 +308,86 @@ TEST(CniAddDelTest, UnannotatedAddPassesThroughWithoutState) {
     std::filesystem::remove_all(state_root, ec);
 }
 
+TEST(CniAddDelTest, ProxyPodAddTriggersRepairWithSelfNetns) {
+    namespace fs = std::filesystem;
+    const fs::path fixture_dir = fs::temp_directory_path() /
+        ("cni-add-del-repair-test-" + std::to_string(::getpid()));
+    fs::remove_all(fixture_dir);
+    fs::create_directories(fixture_dir / "netns");
+    struct DirGuard {
+        fs::path path;
+        ~DirGuard() { std::error_code ec; fs::remove_all(path, ec); }
+    } guard{fixture_dir};
+
+    // Stand-in files act as netns paths for inode comparison.
+    const auto self_netns_file = fixture_dir / "netns" / "self";
+    const auto stale_netns_file = fixture_dir / "netns" / "stale";
+    const auto workload_netns_file = fixture_dir / "netns" / "workload";
+    std::ofstream(self_netns_file).put('s');
+    std::ofstream(stale_netns_file).put('S');
+    std::ofstream(workload_netns_file).put('w');
+
+    // Write one state file pointing at the stale netns (orphaned splice).
+    inline_proxy::StateStore store(fixture_dir / "container-orph.json");
+    inline_proxy::StateFields fields = {
+        {"container_id", "orph"},
+        {"ifname", "eth0"},
+        {"pod_name", "caddy-1"},
+        {"pod_namespace", "default"},
+        {"prev_result",
+         std::string(R"({"interfaces":[{"name":"eth0","sandbox":")")
+            + workload_netns_file.string()
+            + R"("}],"ips":[{"address":"10.42.0.10/24","gateway":"10.42.0.1","interface":0}]})"},
+        {"proxy_netns_path", stale_netns_file.string()},
+        {"proxy_name", "inline-proxy-daemon-x"},
+        {"proxy_namespace", "inline-proxy-system"},
+        {"proxy_node_name", "worker-1"},
+        {"workload_netns_path", workload_netns_file.string()},
+    };
+    ASSERT_TRUE(store.Write(fields));
+
+    int repair_runner_calls = 0;
+    std::filesystem::path observed_proxy;
+    inline_proxy::CniExecutionOptions options;
+    options.state_root = fixture_dir;
+    options.proxy_pod_pinner = [](std::string_view) { return true; };
+    options.splice_runner = [&](const inline_proxy::SplicePlan&,
+                                const std::filesystem::path&,
+                                const std::filesystem::path& proxy) {
+        ++repair_runner_calls;
+        observed_proxy = proxy;
+        return true;
+    };
+    inline_proxy::SpliceExecutor executor(std::move(options));
+
+    // The proxy DS pod is the workload from CNI's perspective.
+    inline_proxy::PodInfo daemon_pod;
+    daemon_pod.name = "inline-proxy-daemon-y";
+    daemon_pod.namespace_name = "inline-proxy-system";
+    daemon_pod.node_name = "worker-1";
+    daemon_pod.running = true;
+    daemon_pod.labels["app"] = "inline-proxy";
+
+    // The invocation's prev_result.interfaces[].sandbox is the daemon's
+    // own (new) netns — that's what ResolveWorkloadNetnsPath returns.
+    const std::string daemon_request_json =
+        std::string(R"({"cniVersion":"1.0.0","name":"k8s","prevResult":{"interfaces":[{"name":"eth0","sandbox":")")
+        + self_netns_file.string() + R"("}]}})";
+    auto request = inline_proxy::ParseCniRequest(daemon_request_json);
+    ASSERT_TRUE(request.has_value());
+
+    inline_proxy::CniInvocation invocation{
+        .request = *request,
+        .container_id = "daemon-cid",
+        .ifname = "eth0",
+    };
+    const auto add_result = executor.HandleAdd(invocation, daemon_pod, std::nullopt);
+
+    EXPECT_TRUE(add_result.success);
+    EXPECT_EQ(repair_runner_calls, 1);
+    EXPECT_EQ(observed_proxy, self_netns_file);
+}
+
 TEST(CniAddDelTest, DelRemovesSavedState) {
     const auto state_root = std::filesystem::temp_directory_path() / "inline_proxy_cni_del_test";
     const auto fake_netns = state_root / "fake-netns";
