@@ -235,8 +235,8 @@ bool LinkExistsInNamespace(const std::string& netns_path, const std::string& ifn
 }
 
 bool IsLinkUpInNamespace(std::string_view netns_path, std::string_view ifname) {
-    std::string cmd = "/usr/bin/ip -n " + std::string(netns_path) +
-                      " link show dev " + std::string(ifname) +
+    std::string cmd = "/usr/bin/nsenter --net=" + std::string(netns_path) +
+                      " /usr/bin/ip link show dev " + std::string(ifname) +
                       " 2>/dev/null | grep -q ' state UP '";
     return std::system(cmd.c_str()) == 0;
 }
