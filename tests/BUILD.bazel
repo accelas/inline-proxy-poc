@@ -226,6 +226,17 @@ cc_test(
 )
 
 cc_test(
+    name = "splice_repair_test",
+    srcs = ["splice_repair_test.cpp"],
+    deps = [
+        "@googletest//:gtest_main",
+        "//src/cni:cni_parser",
+        "//src/cni:cni_splice",
+        "//src/shared:shared",
+    ],
+)
+
+cc_test(
     name = "deploy_manifest_test",
     srcs = ["deploy_manifest_test.cpp"],
     data = [
