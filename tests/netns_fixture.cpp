@@ -576,8 +576,7 @@ bool NetnsFixture::RunSpliceRepairScenario() {
     if (!BuildBridgeBackedWorkloadTopology(workload_ip, client_ip, gateway_ip)) {
         return false;
     }
-    if (!RunCommand("/usr/bin/ip netns add " + Quote(new_proxy_ns)) ||
-        !RunCommand("/usr/bin/ip -n " + Quote(new_proxy_ns) + " link set lo up")) {
+    if (!RunCommand("/usr/bin/ip netns add " + Quote(new_proxy_ns))) {
         return false;
     }
     struct NetnsCleanup {
@@ -586,6 +585,9 @@ bool NetnsFixture::RunSpliceRepairScenario() {
             std::system(("/usr/bin/ip netns delete " + name + " >/dev/null 2>&1").c_str());
         }
     } new_proxy_cleanup{new_proxy_ns};
+    if (!RunCommand("/usr/bin/ip -n " + Quote(new_proxy_ns) + " link set lo up")) {
+        return false;
+    }
 
     const std::string container_id = "repair-1234567890ab";
     const std::string request_json =
@@ -671,7 +673,8 @@ bool NetnsFixture::RunSpliceRepairScenario() {
     const auto repair = RepairOrphanedSplices(repair_executor,
                                               NamespacePath(new_proxy_ns));
     if (repair.total_state_files != 1 || repair.repaired != 1 || repair.failed != 0 ||
-        repair.skipped_intact != 0 || repair.skipped_workload_gone != 0) {
+        repair.skipped_intact != 0 || repair.skipped_workload_gone != 0 ||
+        repair.skipped_deadline_exceeded != 0) {
         return false;
     }
 
