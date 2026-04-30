@@ -133,3 +133,37 @@ TEST_F(SpliceRepairTest, MissingWorkloadNetnsIsSkippedAsGone) {
     EXPECT_EQ(result.repaired, 0u);
     EXPECT_EQ(result.failed, 0u);
 }
+
+TEST_F(SpliceRepairTest, OrphanedFileTriggersHandleAddWithCurrentNetns) {
+    const auto current_path = state_root_ / "current-proxy";
+    std::ofstream(current_path).put('c');
+    const auto stale_proxy = state_root_ / "stale-proxy";
+    std::ofstream(stale_proxy).put('s');
+    const auto workload_path = state_root_ / "workload";
+    std::ofstream(workload_path).put('w');
+
+    WriteStateFile(state_root_, "orph", workload_path.string(), stale_proxy.string());
+
+    bool called = false;
+    std::filesystem::path observed_workload, observed_proxy;
+    inline_proxy::CniExecutionOptions options;
+    options.state_root = state_root_;
+    options.splice_runner = [&](const inline_proxy::SplicePlan&,
+                                const std::filesystem::path& wl,
+                                const std::filesystem::path& px) {
+        called = true;
+        observed_workload = wl;
+        observed_proxy = px;
+        return true;
+    };
+    inline_proxy::SpliceExecutor executor(std::move(options));
+
+    const auto result = inline_proxy::RepairOrphanedSplices(executor, current_path);
+    EXPECT_EQ(result.total_state_files, 1u);
+    EXPECT_EQ(result.repaired, 1u);
+    EXPECT_EQ(result.failed, 0u);
+    EXPECT_EQ(result.skipped_intact, 0u);
+    EXPECT_TRUE(called);
+    EXPECT_EQ(observed_workload, workload_path);
+    EXPECT_EQ(observed_proxy, current_path);
+}

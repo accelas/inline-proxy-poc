@@ -7,6 +7,9 @@
 #include <string>
 #include <system_error>
 
+#include "cni/cni_types.hpp"
+#include "cni/k8s_client.hpp"  // for PodInfo
+#include "cni/yajl_parser.hpp"
 #include "shared/state_store.hpp"
 
 namespace inline_proxy {
@@ -103,9 +106,72 @@ SpliceRepairResult RepairOrphanedSplices(const SpliceExecutor& executor,
             continue;
         }
 
-        // Tasks 6-7 will add: fabricate Pods + invocation, call HandleAdd.
-        ++result.failed;
-        std::cerr << "splice-repair: not yet implemented for " << path << "\n";
+        const auto pod_name = get("pod_name");
+        const auto pod_namespace = get("pod_namespace");
+        const auto proxy_name = get("proxy_name");
+        const auto proxy_namespace = get("proxy_namespace");
+        const auto proxy_node_name = get("proxy_node_name");
+        const auto container_id = get("container_id");
+        const auto ifname = get("ifname");
+        const auto prev_result_raw = get("prev_result");
+        if (container_id.empty() || ifname.empty() ||
+            prev_result_raw.empty() || proxy_node_name.empty()) {
+            std::cerr << "splice-repair: incomplete state file " << path << "\n";
+            ++result.failed;
+            continue;
+        }
+
+        // HandleDel uses the same wrap-and-parse recipe at splice_executor.cpp:404-406.
+        const std::string envelope =
+            R"({"cniVersion":"1.0.0","name":"restore","prevResult":)" +
+            prev_result_raw + "}";
+        auto request_opt = ParseCniRequest(envelope);
+        if (!request_opt) {
+            std::cerr << "splice-repair: malformed prev_result in " << path << "\n";
+            ++result.failed;
+            continue;
+        }
+
+        PodInfo workload_pod;
+        workload_pod.name = pod_name;
+        workload_pod.namespace_name = pod_namespace;
+        workload_pod.node_name = proxy_node_name;
+        workload_pod.running = true;
+        workload_pod.annotations["inline-proxy.example.com/enabled"] = "true";
+
+        PodInfo proxy_pod;
+        proxy_pod.name = proxy_name;
+        proxy_pod.namespace_name =
+            proxy_namespace.empty() ? "inline-proxy-system" : proxy_namespace;
+        proxy_pod.node_name = proxy_node_name;
+        proxy_pod.running = true;
+        proxy_pod.labels["app"] = "inline-proxy";
+
+        // Per-call executor copy with proxy_netns_path overridden to the
+        // current proxy netns. Cheap — SpliceExecutor holds only an options
+        // struct. Do NOT set workload_netns_path: ResolveWorkloadNetnsPath
+        // derives it from prev_result.interfaces[].sandbox, which is what
+        // the state file already carries.
+        auto per_call_options = executor.options();
+        per_call_options.proxy_netns_path = current_proxy_netns;
+        SpliceExecutor per_call_executor(std::move(per_call_options));
+
+        CniInvocation invocation;
+        invocation.request = std::move(*request_opt);
+        invocation.container_id = container_id;
+        invocation.ifname = ifname;
+
+        // HandleAdd's third arg is `const std::optional<PodInfo>&`; PodInfo
+        // converts implicitly.
+        const auto handle_result =
+            per_call_executor.HandleAdd(invocation, workload_pod, proxy_pod);
+        if (handle_result.success) {
+            ++result.repaired;
+        } else {
+            std::cerr << "splice-repair: HandleAdd failed for " << path
+                      << ": " << handle_result.stderr_text << "\n";
+            ++result.failed;
+        }
     }
 
     return result;
