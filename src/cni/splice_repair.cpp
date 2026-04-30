@@ -82,7 +82,7 @@ SpliceRepairResult RepairOrphanedSplices(const SpliceExecutor& executor,
 
             if (std::chrono::steady_clock::now() >= deadline_at) {
                 ++result.skipped_deadline_exceeded;
-                continue;
+                break;
             }
 
             StateStore store(path);

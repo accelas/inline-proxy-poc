@@ -222,8 +222,8 @@ TEST_F(SpliceRepairTest, DeadlineExceededShortCircuitsScan) {
     const auto result = inline_proxy::RepairOrphanedSplices(
         executor, current_path, std::chrono::seconds(0));
 
-    EXPECT_EQ(result.total_state_files, 2u);
-    EXPECT_EQ(result.skipped_deadline_exceeded, 2u);
+    EXPECT_EQ(result.total_state_files, 1u);
+    EXPECT_EQ(result.skipped_deadline_exceeded, 1u);
     EXPECT_EQ(result.repaired, 0u);
     EXPECT_EQ(result.failed, 0u);
     EXPECT_EQ(runner_calls, 0);
