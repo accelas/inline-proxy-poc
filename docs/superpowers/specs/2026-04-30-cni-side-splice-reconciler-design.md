@@ -62,6 +62,16 @@ The CNI plugin runs as a host process. `CreateVethPair`, route adds,
 and rule installs all happen in root netns naturally; the architectural
 mismatch from the daemon-side approach disappears.
 
+The new daemon's netns path is obtained via
+`ResolveWorkloadNetnsPath(invocation)`, which reads
+`request.prev_result->interfaces[].sandbox`. This depends on the
+upstream CNI plugin in the chain (flannel, bridge, etc.) populating
+the `sandbox` field on the matching interface for the daemon DS pod.
+Standard plugins do this by convention. If the upstream plugin omits
+`sandbox`, the resolver returns `nullopt` and the silent-skip branch
+in Failure handling applies — repair is bypassed and the daemon
+still boots.
+
 ## Detection
 
 Per state file:
@@ -93,10 +103,26 @@ For each `${state_root}/container-*.json`:
    `{\"cniVersion\":\"1.0.0\",\"name\":\"restore\",\"prevResult\":<prev_result>}`
    and call `ParseCniRequest` (the same recipe `HandleDel` uses at
    `splice_executor.cpp:404-406`).
-6. **Fabricate `PodInfo workload_pod` and `PodInfo proxy_pod`.**
-   Annotations and labels hardcoded to satisfy `IsAnnotationEnabled`
-   and `MatchesNodeLocalProxy`. State file's `proxy_namespace` field
-   is used; missing field defaults to `inline-proxy-system`.
+6. **Fabricate `PodInfo workload_pod` and `PodInfo proxy_pod`** so
+   `HandleAdd` admits the orphan to its full splice path. The
+   downstream predicates that need to pass are `IsAnnotationEnabled`
+   (workload-side) and `MatchesNodeLocalProxy` (proxy-side: requires
+   `running == true` + `namespace_name == "inline-proxy-system"` +
+   `labels["app"] == "inline-proxy"` + `proxy.node_name ==
+   workload.node_name`). Field mapping:
+
+   | Field | Source |
+   |-------|--------|
+   | `workload_pod.name` | state file `pod_name` |
+   | `workload_pod.namespace_name` | state file `pod_namespace` |
+   | `workload_pod.node_name` | state file `proxy_node_name` (the recorded node ID; same node executed both the original splice and this repair) |
+   | `workload_pod.running` | hardcoded `true` |
+   | `workload_pod.annotations["inline-proxy.example.com/enabled"]` | hardcoded `"true"` |
+   | `proxy_pod.name` | state file `proxy_name` |
+   | `proxy_pod.namespace_name` | state file `proxy_namespace`, defaulting to `"inline-proxy-system"` if missing |
+   | `proxy_pod.node_name` | matches `workload_pod.node_name` |
+   | `proxy_pod.running` | hardcoded `true` |
+   | `proxy_pod.labels["app"]` | hardcoded `"inline-proxy"` |
 7. **Construct `CniInvocation`** from container_id, ifname, request.
 8. **Call `executor.HandleAdd(invocation, workload_pod, proxy_pod)`**
    with `options.proxy_netns_path = current_proxy_netns`. On success
@@ -131,8 +157,10 @@ broken.
 The state file is treated as authoritative for what was admitted:
 
 - If the file exists, the workload pod was at some point successfully
-  admitted as an annotated proxy workload, so we synthesise a
-  `PodInfo` whose annotations make `IsAnnotationEnabled` pass.
+  admitted as an annotated proxy workload, so we synthesise a workload
+  `PodInfo` whose `annotations` map satisfies `IsAnnotationEnabled`
+  and a proxy `PodInfo` whose `running`/`namespace_name`/`labels`/
+  `node_name` satisfy `MatchesNodeLocalProxy`.
 - If the workload's annotation has since been removed, kubelet has
   not yet called CNI DEL (otherwise the state file would be gone), so
   re-splicing is still semantically correct: the pod is in a
@@ -169,6 +197,19 @@ The function takes the executor by reference so callers can stub
 `splice_runner` for unit testing. `current_proxy_netns` is the new
 proxy netns path (resolved from the invocation in the CNI hookup; an
 explicit parameter for testability). Default deadline is 30s.
+
+`RepairOrphanedSplices` reads `state_root` from the executor's
+options. `SpliceExecutor` does not currently expose `options_`
+publicly; this spec assumes a one-line addition of a const accessor:
+
+```cpp
+const CniExecutionOptions& options() const { return options_; }
+```
+
+That accessor in `splice_executor.hpp`'s public section is a small
+prerequisite for the implementation. (The unmerged daemon-side
+branch already added it; carrying the change forward is essentially
+free.)
 
 ## Hookup in `HandleAdd`
 
@@ -222,8 +263,18 @@ retries, repair is idempotent:
 ## BUILD wiring
 
 `src/cni/BUILD.bazel`'s `cni_splice` cc_library adds
-`splice_repair.cpp` to `srcs` and `splice_repair.hpp` to `hdrs`. No
-new Bazel target. The CNI binary `inline_proxy_cni` already depends on
+`splice_repair.cpp` to `srcs` and `splice_repair.hpp` to `hdrs`. The
+existing `cni_splice` deps (`cni_parser`, `cni_types`, `k8s_client`,
+`//src/bpf:loader`, `//src/bpf:tc_attach`, `//src/shared:shared`)
+already cover everything `splice_repair.cpp` needs:
+
+- `cni_types`: `CniRequest`, `PrevResult`, `PodInfo`, `CniInvocation`
+- `cni_parser`: `ParseCniRequest`
+- `k8s_client`: `PodInfo` (transitively included in headers)
+- `//src/shared:shared`: `StateStore`, `StateFields`
+
+No additional `deps` entries are needed and no new Bazel target is
+created. The CNI binary `inline_proxy_cni` already depends on
 `cni_splice` and so transitively links the reconciler.
 
 The unmerged daemon-side `src/proxy/splice_repair.{hpp,cpp}` and its
