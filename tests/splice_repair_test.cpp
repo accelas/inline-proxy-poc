@@ -167,3 +167,35 @@ TEST_F(SpliceRepairTest, OrphanedFileTriggersHandleAddWithCurrentNetns) {
     EXPECT_EQ(observed_workload, workload_path);
     EXPECT_EQ(observed_proxy, current_path);
 }
+
+TEST_F(SpliceRepairTest, RunnerFailureCountsAsFailed) {
+    const auto current_path = state_root_ / "cur"; std::ofstream(current_path).put('c');
+    const auto stale = state_root_ / "old"; std::ofstream(stale).put('o');
+    const auto workload = state_root_ / "wl"; std::ofstream(workload).put('w');
+    WriteStateFile(state_root_, "fail1", workload.string(), stale.string());
+
+    inline_proxy::CniExecutionOptions options;
+    options.state_root = state_root_;
+    options.splice_runner = [](const auto&, const auto&, const auto&) { return false; };
+    inline_proxy::SpliceExecutor executor(std::move(options));
+
+    const auto result = inline_proxy::RepairOrphanedSplices(executor, current_path);
+    EXPECT_EQ(result.failed, 1u);
+    EXPECT_EQ(result.repaired, 0u);
+}
+
+TEST_F(SpliceRepairTest, MalformedStateFileCountsAsFailed) {
+    {
+        std::ofstream f(state_root_ / "container-bad.json");
+        f << "{not json";
+    }
+
+    inline_proxy::CniExecutionOptions options;
+    options.state_root = state_root_;
+    options.splice_runner = [](const auto&, const auto&, const auto&) { return true; };
+    inline_proxy::SpliceExecutor executor(std::move(options));
+
+    const auto result = inline_proxy::RepairOrphanedSplices(executor, "/proc/self/ns/net");
+    EXPECT_EQ(result.total_state_files, 1u);
+    EXPECT_EQ(result.failed, 1u);
+}
