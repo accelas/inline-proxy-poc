@@ -16,6 +16,7 @@
 
 #include "bpf/loader.hpp"
 #include "cni/netns_resolver.hpp"
+#include "cni/splice_repair.hpp"
 #include "cni/yajl_parser.hpp"
 #include "shared/netlink.hpp"
 #include "shared/netns.hpp"
@@ -344,6 +345,18 @@ CniExecutionResult SpliceExecutor::HandleAdd(const CniInvocation& invocation,
         if (!options_.proxy_pod_pinner(options_.pin_dir)) {
             result.stderr_text = "failed to LoadAndPin BPF program for proxy DS pod";
             return result;
+        }
+        if (const auto self_netns = ResolveWorkloadNetnsPath(invocation);
+            self_netns.has_value()) {
+            const auto repair = RepairOrphanedSplices(*this, *self_netns);
+            std::cerr << "splice-repair total=" << repair.total_state_files
+                      << " repaired=" << repair.repaired
+                      << " skipped_intact=" << repair.skipped_intact
+                      << " skipped_workload_gone=" << repair.skipped_workload_gone
+                      << " skipped_deadline_exceeded=" << repair.skipped_deadline_exceeded
+                      << " failed=" << repair.failed << "\n";
+        } else {
+            std::cerr << "splice-repair skipped: cannot resolve daemon DS pod netns from prev_result\n";
         }
         result.success = true;
         return result;
