@@ -96,7 +96,14 @@ SpliceRepairResult RepairOrphanedSplices(const SpliceExecutor& executor,
             }
         }
 
-        // Tasks 5-7 will add: workload-gone check, fabricate Pods + invocation, call HandleAdd.
+        const auto workload_path = get("workload_netns_path");
+        if (workload_path.empty() ||
+            !std::filesystem::exists(workload_path, ec)) {
+            ++result.skipped_workload_gone;
+            continue;
+        }
+
+        // Tasks 6-7 will add: fabricate Pods + invocation, call HandleAdd.
         ++result.failed;
         std::cerr << "splice-repair: not yet implemented for " << path << "\n";
     }

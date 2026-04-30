@@ -110,3 +110,26 @@ TEST_F(SpliceRepairTest, MatchingProxyInodeIsSkippedIntact) {
     EXPECT_EQ(result.repaired, 0u);
     EXPECT_FALSE(runner_called);
 }
+
+TEST_F(SpliceRepairTest, MissingWorkloadNetnsIsSkippedAsGone) {
+    const auto current_path = state_root_ / "current";
+    std::ofstream(current_path).put('x');
+    const auto stale_proxy = state_root_ / "stale-proxy";
+    std::ofstream(stale_proxy).put('y');
+
+    WriteStateFile(state_root_, "wlgone",
+                   /*workload_netns_path=*/(state_root_ / "definitely-missing").string(),
+                   stale_proxy.string());
+
+    inline_proxy::CniExecutionOptions options;
+    options.state_root = state_root_;
+    options.splice_runner = [](const auto&, const auto&, const auto&) { return true; };
+    inline_proxy::SpliceExecutor executor(std::move(options));
+
+    const auto result = inline_proxy::RepairOrphanedSplices(executor, current_path);
+    EXPECT_EQ(result.total_state_files, 1u);
+    EXPECT_EQ(result.skipped_workload_gone, 1u);
+    EXPECT_EQ(result.skipped_intact, 0u);
+    EXPECT_EQ(result.repaired, 0u);
+    EXPECT_EQ(result.failed, 0u);
+}
