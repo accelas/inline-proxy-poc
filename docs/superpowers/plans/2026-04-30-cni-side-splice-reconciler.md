@@ -124,7 +124,7 @@ struct SpliceRepairResult {
 // `skipped_deadline_exceeded` and the function returns. Default budget is
 // 30 seconds — well under kubelet's CNI ADD timeout.
 SpliceRepairResult RepairOrphanedSplices(
-    SpliceExecutor& executor,
+    const SpliceExecutor& executor,
     std::filesystem::path current_proxy_netns,
     std::chrono::steady_clock::duration deadline = std::chrono::seconds(30));
 
@@ -140,7 +140,7 @@ Write `src/cni/splice_repair.cpp`:
 
 namespace inline_proxy {
 
-SpliceRepairResult RepairOrphanedSplices(SpliceExecutor& /*executor*/,
+SpliceRepairResult RepairOrphanedSplices(const SpliceExecutor& /*executor*/,
                                          std::filesystem::path /*current_proxy_netns*/,
                                          std::chrono::steady_clock::duration /*deadline*/) {
     return SpliceRepairResult{};
@@ -395,7 +395,7 @@ bool SameInode(const InodeId& a, const InodeId& b) {
 
 }  // namespace
 
-SpliceRepairResult RepairOrphanedSplices(SpliceExecutor& executor,
+SpliceRepairResult RepairOrphanedSplices(const SpliceExecutor& executor,
                                          std::filesystem::path current_proxy_netns,
                                          std::chrono::steady_clock::duration deadline) {
     SpliceRepairResult result;
@@ -673,7 +673,10 @@ Replace the placeholder block (the `++result.failed; std::cerr << "...not yet im
                       << ": " << handle_result.stderr_text << "\n";
             ++result.failed;
         }
+    }  // end of for-loop body — closes the per-state-file iteration
 ```
+
+(Note: the surrounding `for (const auto& entry : dir_it) { ... }` loop ends here. The previous placeholder `++result.failed;` was the loop body's last statement, so the closing brace was implicitly the loop's. Replacing the placeholder block in this step does not change that — the closing `}` for the for-loop still appears below the new block, where it was before. Make sure the loop's closing `}` is preserved when you make the edit.)
 
 - [ ] **Step 6.4: Run — expect PASS**
 
@@ -851,8 +854,7 @@ with:
         }
         if (const auto self_netns = ResolveWorkloadNetnsPath(invocation);
             self_netns.has_value()) {
-            const auto repair = RepairOrphanedSplices(
-                const_cast<SpliceExecutor&>(*this), *self_netns);
+            const auto repair = RepairOrphanedSplices(*this, *self_netns);
             std::cerr << "splice-repair total=" << repair.total_state_files
                       << " repaired=" << repair.repaired
                       << " skipped_intact=" << repair.skipped_intact
@@ -867,38 +869,41 @@ with:
     }
 ```
 
-The `const_cast` is necessary because `HandleAdd` is a `const` method but `RepairOrphanedSplices` takes a non-const `SpliceExecutor&` (so callers can mutate `splice_runner` etc. for tests). The CNI hookup doesn't actually mutate the executor — it builds a per-call copy internally via `executor.options()` — but the signature requires non-const. This is the cleanest tradeoff; alternative is making the entire HandleAdd non-const which is a bigger blast radius.
+`RepairOrphanedSplices` takes `const SpliceExecutor&` so `*this` (a `const SpliceExecutor&` inside this `const` method) binds directly without `const_cast`. The reconciler does not mutate the executor; it builds a per-call copy internally via `executor.options()`.
 
 - [ ] **Step 9.3: Add the unit test**
 
-In `tests/cni_add_del_test.cpp`, find the existing tests that exercise the IsProxyPod branch (search for `MakeProxyPod` or `proxy_pod_pinner`). Add a new test alongside them:
+In `tests/cni_add_del_test.cpp`, find the existing tests that exercise the IsProxyPod branch (search for `MakeProxyPod` or `proxy_pod_pinner`). Add a new test alongside them. This test follows the existing `cni_add_del_test.cpp` style: manual `std::filesystem::temp_directory_path()` setup with `remove_all` cleanup, no external `ScopedTempDir` helper.
 
 ```cpp
 TEST(CniAddDelTest, ProxyPodAddTriggersRepairWithSelfNetns) {
-    auto fixture_dir = inline_proxy::test::ScopedTempDir::Create();
-    ASSERT_TRUE(fixture_dir.has_value());
+    namespace fs = std::filesystem;
+    const fs::path fixture_dir = fs::temp_directory_path() /
+        ("cni-add-del-repair-test-" + std::to_string(::getpid()));
+    fs::remove_all(fixture_dir);
+    fs::create_directories(fixture_dir / "netns");
+    struct DirGuard {
+        fs::path path;
+        ~DirGuard() { std::error_code ec; fs::remove_all(path, ec); }
+    } guard{fixture_dir};
 
-    const std::string self_netns = "/var/run/netns/cni-self";
-    const std::string stale_netns = "/var/run/netns/cni-stale";
-
-    // Need self_netns to be stat()-able; create a stand-in file.
-    std::filesystem::create_directories(fixture_dir->path() / "netns");
-    const auto self_netns_file = fixture_dir->path() / "netns" / "self";
-    const auto stale_netns_file = fixture_dir->path() / "netns" / "stale";
+    // Stand-in files act as netns paths for inode comparison.
+    const auto self_netns_file = fixture_dir / "netns" / "self";
+    const auto stale_netns_file = fixture_dir / "netns" / "stale";
+    const auto workload_netns_file = fixture_dir / "netns" / "workload";
     std::ofstream(self_netns_file).put('s');
     std::ofstream(stale_netns_file).put('S');
-    const auto workload_netns_file = fixture_dir->path() / "netns" / "workload";
     std::ofstream(workload_netns_file).put('w');
 
-    // Write one state file pointing at the stale netns.
-    inline_proxy::StateStore store(
-        fixture_dir->path() / "container-orph.json");
+    // Write one state file pointing at the stale netns (orphaned splice).
+    inline_proxy::StateStore store(fixture_dir / "container-orph.json");
     inline_proxy::StateFields fields = {
         {"container_id", "orph"},
         {"ifname", "eth0"},
         {"pod_name", "caddy-1"},
         {"pod_namespace", "default"},
-        {"prev_result", R"({"interfaces":[{"name":"eth0","sandbox":")"
+        {"prev_result",
+         std::string(R"({"interfaces":[{"name":"eth0","sandbox":")")
             + workload_netns_file.string()
             + R"("}],"ips":[{"address":"10.42.0.10/24","gateway":"10.42.0.1","interface":0}]})"},
         {"proxy_netns_path", stale_netns_file.string()},
@@ -912,7 +917,7 @@ TEST(CniAddDelTest, ProxyPodAddTriggersRepairWithSelfNetns) {
     int repair_runner_calls = 0;
     std::filesystem::path observed_proxy;
     inline_proxy::CniExecutionOptions options;
-    options.state_root = fixture_dir->path();
+    options.state_root = fixture_dir;
     options.proxy_pod_pinner = [](std::string_view) { return true; };
     options.splice_runner = [&](const inline_proxy::SplicePlan&,
                                 const std::filesystem::path&,
@@ -934,7 +939,7 @@ TEST(CniAddDelTest, ProxyPodAddTriggersRepairWithSelfNetns) {
     // The invocation's prev_result.interfaces[].sandbox is the daemon's
     // own (new) netns — that's what ResolveWorkloadNetnsPath returns.
     const std::string daemon_request_json =
-        R"({"cniVersion":"1.0.0","name":"k8s","prevResult":{"interfaces":[{"name":"eth0","sandbox":")"
+        std::string(R"({"cniVersion":"1.0.0","name":"k8s","prevResult":{"interfaces":[{"name":"eth0","sandbox":")")
         + self_netns_file.string() + R"("}]}})";
     auto request = inline_proxy::ParseCniRequest(daemon_request_json);
     ASSERT_TRUE(request.has_value());
@@ -952,7 +957,7 @@ TEST(CniAddDelTest, ProxyPodAddTriggersRepairWithSelfNetns) {
 }
 ```
 
-If `inline_proxy::test::ScopedTempDir` doesn't exist, use a manual `fs::temp_directory_path()` setup similar to the unit test fixture. Read the existing helpers in `tests/cni_add_del_test.cpp` first to match the style.
+Make sure the file's existing includes cover `<filesystem>`, `<fstream>`, `shared/state_store.hpp`, and `cni/yajl_parser.hpp` (for `ParseCniRequest`). Add any missing ones at the top.
 
 - [ ] **Step 9.4: Build and run**
 
@@ -1008,7 +1013,37 @@ into `tests/netns_fixture.cpp` (append after `RunSpliceExecutorScenario`'s closi
 
 The body uses `Quote`, `NamespacePath`, `LinkExistsInNamespace`, `RunCommand`, and `BuildBridgeBackedWorkloadTopology` — all already present in the current `netns_fixture.cpp`. The body also uses `IsLinkUpInNamespace` — port that file-local helper too (from the same source file).
 
-The unmerged file also has a tightening commit that guards each `RunCommand` in `ResetNamespaces` against an empty member name; port that change as well so the destructor doesn't print noise after the scenario clears `proxy_ns_`.
+Also port the tightening change to `ResetNamespaces` so the destructor doesn't print noise after the scenario clears `proxy_ns_`. In `tests/netns_fixture.cpp`, the existing body looks like:
+
+```cpp
+bool NetnsFixture::ResetNamespaces() {
+    bool ok = true;
+    ok &= RunCommand("/usr/bin/ip netns delete " + Quote(client_ns_));
+    ok &= RunCommand("/usr/bin/ip netns delete " + Quote(proxy_ns_));
+    ok &= RunCommand("/usr/bin/ip netns delete " + Quote(workload_ns_));
+    namespaces_created_ = false;
+    return ok;
+}
+```
+
+Change it to skip empty names:
+
+```cpp
+bool NetnsFixture::ResetNamespaces() {
+    bool ok = true;
+    if (!client_ns_.empty()) {
+        ok &= RunCommand("/usr/bin/ip netns delete " + Quote(client_ns_));
+    }
+    if (!proxy_ns_.empty()) {
+        ok &= RunCommand("/usr/bin/ip netns delete " + Quote(proxy_ns_));
+    }
+    if (!workload_ns_.empty()) {
+        ok &= RunCommand("/usr/bin/ip netns delete " + Quote(workload_ns_));
+    }
+    namespaces_created_ = false;
+    return ok;
+}
+```
 
 - [ ] **Step 10.3: Update the `netns_fixture` BUILD dep**
 
