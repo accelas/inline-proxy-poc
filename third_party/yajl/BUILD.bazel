@@ -6,3 +6,15 @@ cc_library(
     hdrs = ["yajl_tree.h"],
     include_prefix = "yajl",
 )
+
+cc_library(
+    name = "real_yajl",
+    srcs = glob([
+        "real/src/*.c",
+        "real/src/*.h",
+    ]),
+    hdrs = glob(["real/src/api/*.h"]),
+    includes = ["real/src"],
+    strip_include_prefix = "real/src/api",
+    include_prefix = "yajl",
+)
