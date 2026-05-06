@@ -22,7 +22,7 @@ cc_library(
     hdrs = ["yajl_parser.hpp"],
     deps = [
         ":cni_types",
-        "@yajl//:yajl",
+        "//src/json:yajl_helpers",
     ],
     include_prefix = "cni",
 )
