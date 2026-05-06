@@ -2,7 +2,12 @@ package(default_visibility = ["//visibility:public"])
 
 cc_library(
     name = "yajl",
-    srcs = ["yajl_tree.cpp"],
-    hdrs = ["yajl_tree.h"],
+    srcs = glob([
+        "src/*.c",
+        "src/*.h",
+    ]),
+    hdrs = glob(["src/api/*.h"]),
+    includes = ["src"],
+    strip_include_prefix = "src/api",
     include_prefix = "yajl",
 )

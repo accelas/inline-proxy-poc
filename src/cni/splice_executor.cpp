@@ -12,12 +12,11 @@
 #include <utility>
 #include <vector>
 
-#include <nlohmann/json.hpp>
-
 #include "bpf/loader.hpp"
 #include "cni/netns_resolver.hpp"
 #include "cni/splice_repair.hpp"
 #include "cni/yajl_parser.hpp"
+#include "json/yajl_helpers.hpp"
 #include "shared/netlink.hpp"
 #include "shared/netns.hpp"
 #include "shared/scoped_fd.hpp"
@@ -25,8 +24,6 @@
 
 namespace inline_proxy {
 namespace {
-
-using Json = nlohmann::json;
 
 ScopedFd OpenNetnsFd(const std::filesystem::path& path) {
     return ScopedFd(::open(path.c_str(), O_RDONLY | O_CLOEXEC));
@@ -70,55 +67,58 @@ std::optional<unsigned int> WorkloadInterfaceIndex(const CniInvocation& invocati
     return WorkloadInterfaceIndex(*invocation.request.prev_result, invocation.ifname);
 }
 
-std::optional<WorkloadNetworkConfig> ParseWorkloadNetworkConfig(std::string_view prev_result_json,
-                                                                std::optional<unsigned int> interface_index) {
-    const auto parsed = Json::parse(prev_result_json, nullptr, false);
-    if (parsed.is_discarded() || !parsed.is_object()) {
+std::optional<WorkloadNetworkConfig> ParseWorkloadNetworkConfig(
+    std::string_view prev_result_json,
+    std::optional<unsigned int> interface_index) {
+    namespace ip = inline_proxy::json;
+    auto doc = ip::Document::Parse(prev_result_json);
+    if (!doc.has_value() || !ip::IsObject(doc->root())) {
         return std::nullopt;
     }
 
     WorkloadNetworkConfig config;
 
-    if (const auto ips_it = parsed.find("ips"); ips_it != parsed.end() && ips_it->is_array()) {
-        for (const auto& entry : *ips_it) {
-            if (!entry.is_object()) {
+    if (yajl_val ips = ip::ObjectGet(doc->root(), "ips"); ip::IsArray(ips)) {
+        for (std::size_t i = 0; i < ip::ArrayLength(ips); ++i) {
+            yajl_val entry = ip::ArrayAt(ips, i);
+            if (!ip::IsObject(entry)) {
                 continue;
             }
             if (interface_index.has_value()) {
-                const auto iface_it = entry.find("interface");
-                if (iface_it != entry.end() && iface_it->is_number_unsigned() &&
-                    iface_it->get<unsigned int>() != *interface_index) {
+                auto idx = ip::AsInteger(ip::ObjectGet(entry, "interface"));
+                if (!idx.has_value() || *idx < 0 ||
+                    static_cast<unsigned int>(*idx) != *interface_index) {
                     continue;
                 }
             }
-
-            const auto address_it = entry.find("address");
-            if (address_it == entry.end() || !address_it->is_string()) {
+            auto address = ip::AsString(ip::ObjectGet(entry, "address"));
+            if (!address.has_value()) {
                 continue;
             }
-
-            const auto address = address_it->get<std::string>();
-            config.addresses.push_back(address);
-            const auto slash = address.find('/');
-            config.pod_ips.push_back(
-                slash == std::string::npos ? address : address.substr(0, slash));
+            std::string addr_str(*address);
+            config.addresses.push_back(addr_str);
+            const auto slash = addr_str.find('/');
+            config.pod_ips.push_back(slash == std::string::npos
+                                         ? addr_str
+                                         : addr_str.substr(0, slash));
         }
     }
 
-    if (const auto routes_it = parsed.find("routes");
-        routes_it != parsed.end() && routes_it->is_array()) {
-        for (const auto& entry : *routes_it) {
-            if (!entry.is_object()) {
+    if (yajl_val routes = ip::ObjectGet(doc->root(), "routes");
+        ip::IsArray(routes)) {
+        for (std::size_t i = 0; i < ip::ArrayLength(routes); ++i) {
+            yajl_val entry = ip::ArrayAt(routes, i);
+            if (!ip::IsObject(entry)) {
                 continue;
             }
-            const auto dst_it = entry.find("dst");
-            if (dst_it == entry.end() || !dst_it->is_string()) {
+            auto dst = ip::AsString(ip::ObjectGet(entry, "dst"));
+            if (!dst.has_value()) {
                 continue;
             }
-            WorkloadRoute route{.dst = dst_it->get<std::string>()};
-            if (const auto gw_it = entry.find("gw");
-                gw_it != entry.end() && gw_it->is_string()) {
-                route.gw = gw_it->get<std::string>();
+            WorkloadRoute route{.dst = std::string(*dst)};
+            if (auto gw = ip::AsString(ip::ObjectGet(entry, "gw"));
+                gw.has_value()) {
+                route.gw = std::string(*gw);
             }
             config.routes.push_back(std::move(route));
         }
@@ -127,7 +127,6 @@ std::optional<WorkloadNetworkConfig> ParseWorkloadNetworkConfig(std::string_view
     if (config.addresses.empty()) {
         return std::nullopt;
     }
-
     return config;
 }
 

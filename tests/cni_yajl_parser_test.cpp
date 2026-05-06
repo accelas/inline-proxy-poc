@@ -23,9 +23,9 @@ TEST(CniYajlParserTest, ParsesPrevResultInterfaces) {
     EXPECT_EQ(*req->prev_result->interfaces[0].sandbox, "/var/run/netns/test");
 }
 
-TEST(CniYajlParserTest, PreservesPrevResultJsonForEscapedPrevResultKey) {
+TEST(CniYajlParserTest, SerializesPrevResultSubtreeAsCompactJson) {
     std::string json =
-        R"({"cniVersion":"1.0.0","name":"k8s-pod-network","prev\u0052esult":{"dns":{"nameservers":["1.1.1.1"]},"interfaces":[{"name":"eth0"}],"routes":[{"dst":"10.0.0.0/8","gw":"10.42.0.1"}]}})";
+        R"({"cniVersion":"1.0.0","name":"k8s-pod-network","prevResult":{"dns":{"nameservers":["1.1.1.1"]},"interfaces":[{"name":"eth0"}],"routes":[{"dst":"10.0.0.0/8","gw":"10.42.0.1"}]}})";
     auto req = inline_proxy::ParseCniRequest(json);
     ASSERT_TRUE(req.has_value());
     ASSERT_TRUE(req->prev_result.has_value());

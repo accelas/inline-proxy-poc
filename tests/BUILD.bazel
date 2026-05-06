@@ -120,6 +120,15 @@ cc_test(
 )
 
 cc_test(
+    name = "json_yajl_helpers_test",
+    srcs = ["json_yajl_helpers_test.cpp"],
+    deps = [
+        "//src/json:yajl_helpers",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_test(
     name = "cni_netns_resolver_test",
     srcs = ["cni_netns_resolver_test.cpp"],
     deps = [

@@ -23,7 +23,7 @@
 #include <thread>
 #include <vector>
 
-#include <nlohmann/json.hpp>
+#include "json/yajl_helpers.hpp"
 
 #include <openssl/err.h>
 #include <openssl/evp.h>
@@ -31,8 +31,6 @@
 
 namespace inline_proxy {
 namespace {
-
-using Json = nlohmann::json;
 
 std::mutex& FetcherMutex() {
     static std::mutex mutex;
@@ -838,30 +836,68 @@ std::optional<std::string> FetchPodListJson(const K8sClientOptions& options, con
     return ExtractBody(response);
 }
 
-std::optional<std::string> ReadString(const Json& object, const char* key) {
-    if (!object.contains(key)) {
+std::optional<std::string> ReadString(yajl_val obj, const char* key) {
+    namespace ip = inline_proxy::json;
+    auto sv = ip::AsString(ip::ObjectGet(obj, key));
+    if (!sv.has_value()) {
         return std::nullopt;
     }
-    const auto& value = object.at(key);
-    if (!value.is_string()) {
-        return std::nullopt;
-    }
-    return value.get<std::string>();
+    return std::string(*sv);
 }
 
-void ReadStringMap(const Json& object, const char* key, std::map<std::string, std::string>& output) {
-    if (!object.contains(key)) {
+void ReadStringMap(yajl_val obj, const char* key,
+                   std::map<std::string, std::string>& output) {
+    namespace ip = inline_proxy::json;
+    yajl_val map = ip::ObjectGet(obj, key);
+    if (!ip::IsObject(map)) {
         return;
     }
-    const auto& value = object.at(key);
-    if (!value.is_object()) {
-        return;
-    }
-    for (const auto& [name, item] : value.items()) {
-        if (item.is_string()) {
-            output.emplace(name, item.get<std::string>());
+    for (const auto& entry : ip::ObjectEntries(map)) {
+        if (auto value = ip::AsString(entry.value); value.has_value()) {
+            output.emplace(std::string(entry.key), std::string(*value));
         }
     }
+}
+
+std::optional<PodInfo> ParsePodInfoFromValue(yajl_val pod) {
+    namespace ip = inline_proxy::json;
+    if (!ip::IsObject(pod)) {
+        return std::nullopt;
+    }
+
+    yajl_val metadata = ip::ObjectGet(pod, "metadata");
+    if (!ip::IsObject(metadata)) {
+        return std::nullopt;
+    }
+
+    PodInfo info;
+    auto name = ReadString(metadata, "name");
+    auto namespace_name = ReadString(metadata, "namespace");
+    if (!name || !namespace_name) {
+        return std::nullopt;
+    }
+    info.name = std::move(*name);
+    info.namespace_name = std::move(*namespace_name);
+
+    if (yajl_val spec = ip::ObjectGet(pod, "spec"); ip::IsObject(spec)) {
+        if (auto node_name = ReadString(spec, "nodeName")) {
+            info.node_name = std::move(*node_name);
+        }
+    }
+
+    if (yajl_val status = ip::ObjectGet(pod, "status"); ip::IsObject(status)) {
+        if (auto phase = ReadString(status, "phase")) {
+            info.phase = std::move(*phase);
+            info.running = (info.phase == "Running");
+        }
+        if (auto pod_ip = ReadString(status, "podIP")) {
+            info.pod_ip = std::move(*pod_ip);
+        }
+    }
+
+    ReadStringMap(metadata, "labels", info.labels);
+    ReadStringMap(metadata, "annotations", info.annotations);
+    return info;
 }
 
 }  // namespace
@@ -885,67 +921,30 @@ std::string BuildK8sApiEndpoint(std::string_view host, std::uint16_t port) {
 }
 
 std::optional<PodInfo> ParsePodInfo(std::string_view json) {
-    const auto parsed = Json::parse(std::string(json), nullptr, false);
-    if (parsed.is_discarded() || !parsed.is_object()) {
+    namespace ip = inline_proxy::json;
+    auto doc = ip::Document::Parse(json);
+    if (!doc.has_value()) {
         return std::nullopt;
     }
-
-    const auto metadata_it = parsed.find("metadata");
-    const auto spec_it = parsed.find("spec");
-    const auto status_it = parsed.find("status");
-    if (metadata_it == parsed.end() || !metadata_it->is_object()) {
-        return std::nullopt;
-    }
-
-    PodInfo info;
-    auto name = ReadString(*metadata_it, "name");
-    auto namespace_name = ReadString(*metadata_it, "namespace");
-    if (!name || !namespace_name) {
-        return std::nullopt;
-    }
-    info.name = std::move(*name);
-    info.namespace_name = std::move(*namespace_name);
-
-    if (spec_it != parsed.end() && spec_it->is_object()) {
-        if (auto node_name = ReadString(*spec_it, "nodeName")) {
-            info.node_name = std::move(*node_name);
-        }
-    }
-
-    if (status_it != parsed.end() && status_it->is_object()) {
-        if (auto phase = ReadString(*status_it, "phase")) {
-            info.phase = std::move(*phase);
-            info.running = (info.phase == "Running");
-        }
-        if (auto pod_ip = ReadString(*status_it, "podIP")) {
-            info.pod_ip = std::move(*pod_ip);
-        }
-    }
-
-    ReadStringMap(*metadata_it, "labels", info.labels);
-    ReadStringMap(*metadata_it, "annotations", info.annotations);
-    return info;
+    return ParsePodInfoFromValue(doc->root());
 }
 
 std::vector<PodInfo> ParsePodList(std::string_view json) {
-    const auto parsed = Json::parse(std::string(json), nullptr, false);
-    if (parsed.is_discarded() || !parsed.is_object()) {
+    namespace ip = inline_proxy::json;
+    auto doc = ip::Document::Parse(json);
+    if (!doc.has_value() || !ip::IsObject(doc->root())) {
         return {};
     }
-
-    const auto items_it = parsed.find("items");
-    if (items_it == parsed.end() || !items_it->is_array()) {
+    yajl_val items = ip::ObjectGet(doc->root(), "items");
+    if (!ip::IsArray(items)) {
         return {};
     }
-
     std::vector<PodInfo> pods;
-    for (const auto& item : *items_it) {
-        if (!item.is_object()) {
-            continue;
-        }
-        const auto pod = ParsePodInfo(item.dump());
-        if (pod.has_value()) {
-            pods.push_back(*pod);
+    pods.reserve(ip::ArrayLength(items));
+    for (std::size_t i = 0; i < ip::ArrayLength(items); ++i) {
+        if (auto pod = ParsePodInfoFromValue(ip::ArrayAt(items, i));
+            pod.has_value()) {
+            pods.push_back(*std::move(pod));
         }
     }
     return pods;

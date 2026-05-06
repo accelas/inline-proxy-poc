@@ -1,0 +1,9 @@
+package(default_visibility = ["//visibility:public"])
+
+cc_library(
+    name = "yajl_helpers",
+    srcs = ["yajl_helpers.cpp"],
+    hdrs = ["yajl_helpers.hpp"],
+    deps = ["@yajl//:yajl"],
+    include_prefix = "json",
+)

@@ -22,7 +22,7 @@ cc_library(
     hdrs = ["yajl_parser.hpp"],
     deps = [
         ":cni_types",
-        "@yajl//:yajl",
+        "//src/json:yajl_helpers",
     ],
     include_prefix = "cni",
 )
@@ -33,6 +33,7 @@ cc_library(
     hdrs = ["k8s_client.hpp"],
     deps = [
         ":cni_types",
+        "//src/json:yajl_helpers",
     ],
     linkopts = ["-lssl", "-lcrypto"],
     include_prefix = "cni",
@@ -58,6 +59,7 @@ cc_library(
         ":k8s_client",
         "//src/bpf:loader",
         "//src/bpf:tc_attach",
+        "//src/json:yajl_helpers",
         "//src/shared:shared",
     ],
     include_prefix = "cni",
