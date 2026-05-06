@@ -15,7 +15,11 @@ void Document::Deleter::operator()(yajl_val v) const noexcept {
 }
 
 std::optional<Document> Document::Parse(std::string_view input) {
-    // yajl_tree_parse needs a NUL-terminated string; copy into a std::string.
+    // yajl_tree_parse calls strlen() internally; reject embedded NULs to
+    // prevent silent truncation. Copy into std::string for NUL-termination.
+    if (input.find('\0') != std::string_view::npos) {
+        return std::nullopt;
+    }
     const std::string buffer(input);
     yajl_val root = yajl_tree_parse(buffer.c_str(), nullptr, 0);
     if (root == nullptr) {
@@ -81,10 +85,16 @@ std::optional<std::string_view> AsString(yajl_val v) {
 }
 
 std::optional<double> AsNumber(yajl_val v) {
-    if (v == nullptr || !YAJL_IS_NUMBER(v)) {
+    if (v == nullptr) {
         return std::nullopt;
     }
-    return YAJL_GET_DOUBLE(v);
+    if (YAJL_IS_DOUBLE(v)) {
+        return YAJL_GET_DOUBLE(v);
+    }
+    if (YAJL_IS_INTEGER(v)) {
+        return static_cast<double>(YAJL_GET_INTEGER(v));
+    }
+    return std::nullopt;
 }
 
 std::optional<long long> AsInteger(yajl_val v) {

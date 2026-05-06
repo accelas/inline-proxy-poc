@@ -98,3 +98,19 @@ TEST(JsonYajlHelpersTest, SerializeSubtreeOnly) {
     ASSERT_TRUE(doc.has_value());
     EXPECT_EQ(ip::Serialize(ip::ObjectGet(doc->root(), "sub")), R"({"x":"y"})");
 }
+
+TEST(JsonYajlHelpersTest, AsNumberHandlesIntegerOnlyInputs) {
+    // Large integer that round-trips through double, plus a small one.
+    auto doc = ip::Document::Parse(R"({"big":9223372036854775000,"small":42})");
+    ASSERT_TRUE(doc.has_value());
+    EXPECT_EQ(*ip::AsNumber(ip::ObjectGet(doc->root(), "small")), 42.0);
+    // Big-int as double is approximate — just check we got a number, not garbage.
+    auto big = ip::AsNumber(ip::ObjectGet(doc->root(), "big"));
+    ASSERT_TRUE(big.has_value());
+    EXPECT_GT(*big, 9.0e18);
+}
+
+TEST(JsonYajlHelpersTest, ParseRejectsEmbeddedNuls) {
+    using namespace std::string_view_literals;
+    EXPECT_FALSE(ip::Document::Parse("{\"a\":1}\0extra"sv).has_value());
+}
