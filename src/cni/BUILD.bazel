@@ -33,6 +33,7 @@ cc_library(
     hdrs = ["k8s_client.hpp"],
     deps = [
         ":cni_types",
+        "//src/json:yajl_helpers",
     ],
     linkopts = ["-lssl", "-lcrypto"],
     include_prefix = "cni",
