@@ -167,7 +167,13 @@ helper module:
 - Every `yajl_tree_free(child)` call disappears — children are views.
 - The hand-rolled tokenizer (Half B above, ~230 lines) is **deleted**.
   `request.prev_result_json` is populated by
-  `json::Serialize(prev_result_value)`.
+  `json::Serialize(prev_result_value)` — i.e., serialize the
+  `yajl_val` view returned by `ObjectGet(root, "prevResult")` while
+  `Document` still owns the root. After the rewrite,
+  `prev_result.has_value()` and `prev_result_json.has_value()` are
+  populated from a single parse pass, preserving the invariant
+  asserted by `splice_plan.cpp` (which currently throws
+  `std::logic_error` if one is set without the other).
 - The file shrinks from 386 lines to roughly the size of the
   consumer half (~150 lines).
 
@@ -228,7 +234,18 @@ helper module:
   semantics.
 - New `tests/json_yajl_helpers_test.cpp`: parse / missing key /
   wrong-type accessor / array iteration / object iteration /
-  Serialize round-trip / parse-error path. Wired into `tests/BUILD.bazel`.
+  Serialize round-trip / parse-error path. Wired into `tests/BUILD.bazel` as:
+
+  ```python
+  cc_test(
+      name = "json_yajl_helpers_test",
+      srcs = ["json_yajl_helpers_test.cpp"],
+      deps = [
+          "//src/json:yajl_helpers",
+          "@googletest//:gtest_main",
+      ],
+  )
+  ```
 - All other CNI tests unchanged; they test behavior, not internals.
 
 ### Semantic change to `prev_result_json`
