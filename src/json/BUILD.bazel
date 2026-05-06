@@ -4,6 +4,6 @@ cc_library(
     name = "yajl_helpers",
     srcs = ["yajl_helpers.cpp"],
     hdrs = ["yajl_helpers.hpp"],
-    deps = ["@yajl//:real_yajl"],
+    deps = ["@yajl//:yajl"],
     include_prefix = "json",
 )
